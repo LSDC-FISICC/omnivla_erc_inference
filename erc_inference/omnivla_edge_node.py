@@ -90,10 +90,10 @@ class OmniVLAEdgeNode(Node):
         self.declare_parameter("len_traj_pred", 8)
         self.declare_parameter("learn_angle", True)
 
-        self.declare_parameter("image_topic", "/camera/image_raw")
-        self.declare_parameter("gps_topic", "/gps/fix")
-        self.declare_parameter("compass_topic", "/compass")
-        self.declare_parameter("cmd_vel_topic", "/cmd_vel")
+        self.declare_parameter("image_topic", "/erc/front_camera")
+        self.declare_parameter("gps_topic", "/erc/gps")
+        self.declare_parameter("compass_topic", "/erc/orientation")
+        self.declare_parameter("cmd_vel_topic", "/omnivla/cmd_vel")
         self.declare_parameter("tick_rate", 3.0)
 
         # Velocity limits stay as parameters: they're safety bounds for
@@ -186,12 +186,12 @@ class OmniVLAEdgeNode(Node):
         # Live robot state
         self.create_subscription(Image, self.get_parameter("image_topic").value, self.image_callback, 10)
         self.create_subscription(NavSatFix, self.get_parameter("gps_topic").value, self.gps_callback, 10)
-        self.create_subscription(Float32, self.get_parameter("compass_topic").value, self.compass_callback, 10)
+        self.create_subscription(Int32, self.get_parameter("compass_topic").value, self.compass_callback, 10)
 
         # Goal / inference request (test these live with `ros2 topic pub`)
         self.create_subscription(Image, self.get_parameter("goal_image_topic").value, self.goal_image_callback, 10)
         self.create_subscription(NavSatFix, self.get_parameter("goal_gps_topic").value, self.goal_gps_callback, 10)
-        self.create_subscription(Float32, self.get_parameter("goal_compass_topic").value, self.goal_compass_callback, 10)
+        self.create_subscription(Int32, self.get_parameter("goal_compass_topic").value, self.goal_compass_callback, 10)
         self.create_subscription(String, self.get_parameter("lan_prompt_topic").value, self.lan_prompt_callback, 10)
         self.create_subscription(Bool, self.get_parameter("use_pose_goal_topic").value, self.use_pose_goal_callback, 10)
         self.create_subscription(Bool, self.get_parameter("use_satellite_topic").value, self.use_satellite_callback, 10)
@@ -223,7 +223,7 @@ class OmniVLAEdgeNode(Node):
             self.current_lat = msg.latitude
             self.current_lon = msg.longitude
 
-    def compass_callback(self, msg: Float32):
+    def compass_callback(self, msg: Int32):
         with self.lock:
             self.current_compass_deg = msg.data
 
@@ -244,7 +244,7 @@ class OmniVLAEdgeNode(Node):
             self.goal_lon = msg.longitude
         self.get_logger().info(f"Goal GPS updated: lat={msg.latitude}, lon={msg.longitude}")
 
-    def goal_compass_callback(self, msg: Float32):
+    def goal_compass_callback(self, msg: Int32):
         with self.lock:
             self.goal_compass_deg = msg.data
 
@@ -325,13 +325,18 @@ class OmniVLAEdgeNode(Node):
                 self.enable_inference
                 and len(self.context_queue) == self.context_size + 1
                 and self.latest_frame_full is not None
-                and self.current_lat is not None
                 and self.current_lon is not None
                 and self.current_compass_deg is not None
             )
             if not ready:
                 self.publish_cmd(0.0, 0.0)
+                self.get_logger().info("Inference not ready: waiting for context, latest frame, and current pose.")
+                #info who is not ready
+                if self.enable_inference:
+                    self.get_logger().info(f"enable_inference={self.enable_inference}, context_queue={len(self.context_queue)}/{self.context_size + 1}, latest_frame_full={self.latest_frame_full is not None}, current_lat={self.current_lat is not None}, current_lon={self.current_lon is not None}, current_compass_deg={self.current_compass_deg is not None}")
+                
                 return
+
 
             # Snapshot everything we need under the lock, then release it
             # before running the (potentially slow) forward pass.

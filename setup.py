@@ -27,6 +27,7 @@ setup(
         'console_scripts': [
             'omni_vla_edge_node = erc_inference.omni_vla_edge_node:main',
             'omnivla_edge_node = erc_inference.omnivla_edge_node:main',
+            'checkpoint_controller_node = erc_inference.checkpoint_controller_node:main',
         ],
     },
 )
