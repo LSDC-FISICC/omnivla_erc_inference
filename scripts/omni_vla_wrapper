@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+
+source /home/jabes/anaconda3/etc/profile.d/conda.sh
+conda activate omnivla_py312
+
+# 3. Incluir la carpeta OmniVLA en el PATH de Python
+export PYTHONPATH=$PYTHONPATH:/home/jabes/erc_test_ws/OmniVLA
+
+# 4. Ejecutar el nodo en Python
+exec python3 -c "from erc_inference.omnivla_edge_node import main; main()" "$@"
