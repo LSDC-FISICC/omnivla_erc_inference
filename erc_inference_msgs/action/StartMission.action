@@ -1,0 +1,10 @@
+bool resume_from_latest_scanned
+---
+bool success
+bool mission_completed
+uint32 last_checkpoint_sequence
+string message
+---
+uint32 current_checkpoint_sequence
+float64 distance_m
+string state

@@ -1,19 +1,29 @@
 #!/usr/bin/env python3
 """High-level checkpoint mission controller for the OmniVLA edge node.
 
-Waypoints are generated using A* path planning on the static costmap if available,
-falling back to linear GPS interpolation if no costmap is present. This avoids
-untraversable terrain (buildings, obstacles) when planning routes to checkpoints.
+Waypoints are generated using A* path planning on a static costmap if the
+costmap/planner services are available, falling back to linear GPS
+interpolation otherwise. This avoids untraversable terrain (buildings,
+obstacles) when planning routes to checkpoints.
+
+Costmap generation and A* planning are now ROS services
+(erc_static_map_msgs/srv/GenerateCostmap and .../PlanPath), served by
+erc_static_map_node and erc_astar_planner_node respectively, instead of a
+one-shot topic/parameter pipeline. This node calls GenerateCostmap once per
+leg with that leg's own start/goal GPS, then PlanPath with the response --
+so a multi-checkpoint mission gets a correctly-scoped costmap per leg
+without needing a separate process per leg, and without ever having to
+guess or separately latch a UTM zone/origin: GenerateCostmap's response
+carries utm_crs/origin_utm_x/origin_utm_y and those are passed straight
+through to PlanPath.
 """
 
-import heapq
 import json
 import math
 import threading
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
 
-import numpy as np
 import requests
 
 import rclpy
@@ -21,12 +31,11 @@ from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
-from nav_msgs.msg import OccupancyGrid, Path
 from sensor_msgs.msg import NavSatFix
 from std_msgs.msg import Bool, Float32
 
 from erc_inference_msgs.action import StartMission
-from erc_static_map.erc_static_map_node import utm_crs_for, project_point_to_utm
+from erc_static_map_msgs.srv import GenerateCostmap, PlanPath
 
 
 @dataclass(frozen=True)
@@ -38,13 +47,6 @@ class Checkpoint:
 
 
 class CheckpointControllerNode(Node):
-    # 8-connected A* neighbor offsets (dcol, drow, step_cost)
-    _SQRT2 = math.sqrt(2.0)
-    _NEIGHBORS = [
-        (-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0),
-        (-1, -1, _SQRT2), (-1, 1, _SQRT2), (1, -1, _SQRT2), (1, 1, _SQRT2),
-    ]
-    LETHAL_COST = 100  # Building/obstacle cost from OccupancyGrid
 
     def __init__(self):
         super().__init__('checkpoint_controller_node')
@@ -65,37 +67,30 @@ class CheckpointControllerNode(Node):
         self.declare_parameter('control_rate_hz', 10.0)
         self.declare_parameter('http_timeout_s', 15.0)
         self.declare_parameter('verification_retry_s', 1.0)
+        # Costmap/planner service call tuning. Costmap generation involves a
+        # network-bound OSM query and can be slow; give it a generous
+        # timeout and treat a timeout/failure the same as "service
+        # unavailable" -- fall back to linear interpolation rather than
+        # blocking the mission indefinitely on one leg's map.
+        self.declare_parameter('costmap_service_timeout_s', 60.0)
+        self.declare_parameter('planner_service_timeout_s', 15.0)
 
         self._lock = threading.RLock()
         self._gps_condition = threading.Condition(self._lock)
         self._current_lat: Optional[float] = None
         self._current_lon: Optional[float] = None
-        # Latched from the first /erc/gps fix. This must be the SAME point
-        # used as origin_lat/origin_lon when erc_static_map_node was launched
-        # for this leg -- that call is what the published costmap's local-ENU
-        # frame and UTM zone are anchored to, and the OccupancyGrid message
-        # carries no CRS/absolute-position metadata to recover it from later.
-        # Latching on first fix (rather than re-reading self._current_lat at
-        # planning time) keeps it fixed for the whole leg even if the rover
-        # has since moved, matching erc_static_map_node's fixed-A convention.
-        self._map_origin: Optional[Tuple[float, float]] = None
         self._last_model_cmd = Twist()
         self._mission_active = False
         self._motion_allowed = False
         self._stop_requested = True
         self._current_sequence = 0
         self._current_distance_m = float('inf')
-        self._costmap: Optional[OccupancyGrid] = None
-        self._costmap_lock = threading.Lock()
 
         self._model_cmd_sub = self.create_subscription(
             Twist, self._param('model_cmd_vel_topic'), self._model_cmd_callback, 10
         )
         self._gps_sub = self.create_subscription(
             NavSatFix, self._param('gps_topic'), self._gps_callback, 10
-        )
-        self._costmap_sub = self.create_subscription(
-            OccupancyGrid, 'erc_static_map/costmap', self._costmap_callback, 10
         )
 
         self._cmd_pub = self.create_publisher(Twist, self._param('cmd_vel_topic'), 10)
@@ -106,6 +101,9 @@ class CheckpointControllerNode(Node):
         self._use_image_pub = self.create_publisher(Bool, self._param('use_image_goal_topic'), 10)
         self._use_lan_pub = self.create_publisher(Bool, self._param('use_lan_prompt_topic'), 10)
         self._enable_pub = self.create_publisher(Bool, self._param('enable_inference_topic'), 10)
+
+        self._costmap_client = self.create_client(GenerateCostmap, 'erc_static_map/generate_costmap')
+        self._planner_client = self.create_client(PlanPath, 'erc_static_map/plan_path')
 
         self._action_server = ActionServer(
             self,
@@ -136,26 +134,7 @@ class CheckpointControllerNode(Node):
         with self._gps_condition:
             self._current_lat = msg.latitude
             self._current_lon = msg.longitude
-            if self._map_origin is None:
-                # Reject the SDK's "no lock yet" placeholder (0, 0) -- same
-                # check used for the declination bootstrap fix in
-                # erc_localization/launch/localization_global.launch.py.
-                # Latching here means this node's map origin is whatever the
-                # rover's actual first fix was; erc_static_map_node must be
-                # launched with that SAME lat/lon as its origin_lat/origin_lon
-                # for the costmap frame to line up.
-                if abs(msg.latitude) > 1e-6 or abs(msg.longitude) > 1e-6:
-                    self._map_origin = (msg.latitude, msg.longitude)
-                    self.get_logger().info(
-                        f'Latched map origin from first GPS fix: '
-                        f'({msg.latitude:.8f}, {msg.longitude:.8f})')
             self._gps_condition.notify_all()
-
-    def _costmap_callback(self, msg: OccupancyGrid):
-        """Store the latest costmap for A* waypoint generation."""
-        with self._costmap_lock:
-            self._costmap = msg
-            self.get_logger().debug(f'Updated static costmap: {msg.info.width}x{msg.info.height} @ {msg.info.resolution}m/cell')
 
     def _publish_output(self):
         with self._lock:
@@ -229,177 +208,116 @@ class CheckpointControllerNode(Node):
             lon1 + (lon2 - lon1) * fraction,
         )
 
-    @staticmethod
-    def _octile_heuristic(a: Tuple[int, int], b: Tuple[int, int]) -> float:
-        """Octile distance heuristic for A* (allows 8-connected movement)."""
-        dx = abs(a[0] - b[0])
-        dy = abs(a[1] - b[1])
-        return (dx + dy) + (CheckpointControllerNode._SQRT2 - 2.0) * min(dx, dy)
-
-    @staticmethod
-    def _astar_grid(occupied: np.ndarray, start: Tuple[int, int], goal: Tuple[int, int]) -> Optional[List[Tuple[int, int]]]:
-        """8-connected A* on a 2D grid. occupied: True = blocked, indexed [row, col].
-        start/goal: (col, row). Returns list of (col, row) from start to goal, or None if no path."""
-        height, width = occupied.shape
-
-        def in_bounds(c: int, r: int) -> bool:
-            return 0 <= c < width and 0 <= r < height
-
-        if not in_bounds(*start) or not in_bounds(*goal):
+    def _call_service_sync(self, client, request, timeout_s: float):
+        """Call a service and block the calling thread until it completes or
+        times out. _execute_callback runs on a MultiThreadedExecutor worker
+        thread (not the main spin thread), so blocking here is fine -- it
+        does not stall other callbacks, unlike call_async().result() from a
+        single-threaded context."""
+        if not client.wait_for_service(timeout_sec=timeout_s):
             return None
-        if occupied[start[1], start[0]] or occupied[goal[1], goal[0]]:
+        future = client.call_async(request)
+        event = threading.Event()
+        future.add_done_callback(lambda _f: event.set())
+        if not event.wait(timeout=timeout_s):
+            return None
+        try:
+            return future.result()
+        except Exception as e:
+            self.get_logger().warn(f'Service call raised: {e}')
             return None
 
-        open_heap = [(0.0, start)]
-        came_from = {}
-        g_score = {start: 0.0}
-        closed = set()
+    def _generate_waypoints(self, start_lat: float, start_lon: float, target_lat: float, target_lon: float) -> list:
+        """Generate GPS waypoints for one leg (start -> target).
 
-        while open_heap:
-            _, current = heapq.heappop(open_heap)
-            if current in closed:
-                continue
-            if current == goal:
-                path = [current]
-                while current in came_from:
-                    current = came_from[current]
-                    path.append(current)
-                path.reverse()
-                return path
-            closed.add(current)
+        Calls erc_static_map/generate_costmap for this leg's own A (start)
+        and B (target), then erc_static_map/plan_path with the response --
+        passing utm_crs/origin_utm straight through, so this node never
+        guesses or separately derives either one (see module docstring).
+        Falls back to linear GPS interpolation if either service is
+        unavailable, times out, or fails, or if planning finds no path.
+        """
+        log = self.get_logger()
 
-            cc, cr = current
-            for dc, dr, step_cost in CheckpointControllerNode._NEIGHBORS:
-                nc, nr = cc + dc, cr + dr
-                if not in_bounds(nc, nr) or occupied[nr, nc]:
-                    continue
-                # Prevent diagonal cuts through lethal corners
-                if dc != 0 and dr != 0:
-                    if occupied[cr, cc + dc] or occupied[cr + dr, cc]:
-                        continue
-                neighbor = (nc, nr)
-                tentative_g = g_score[current] + step_cost
-                if tentative_g < g_score.get(neighbor, math.inf):
-                    came_from[neighbor] = current
-                    g_score[neighbor] = tentative_g
-                    f_score = tentative_g + CheckpointControllerNode._octile_heuristic(neighbor, goal)
-                    heapq.heappush(open_heap, (f_score, neighbor))
-        return None
+        costmap_req = GenerateCostmap.Request()
+        costmap_req.origin_lat = start_lat
+        costmap_req.origin_lon = start_lon
+        costmap_req.checkpoint_lat = target_lat
+        costmap_req.checkpoint_lon = target_lon
 
-    def _generate_waypoints_from_path(self, cell_path: List[Tuple[int, int]],
-                                       utm_crs: str, origin_utm: Tuple[float, float]) -> List[Tuple[float, float]]:
-        """Sample 10 waypoints evenly along a cell path and convert to GPS.
+        costmap_resp = self._call_service_sync(
+            self._costmap_client, costmap_req, float(self._param('costmap_service_timeout_s'))
+        )
+        if costmap_resp is None:
+            log.warn('generate_costmap service unavailable or timed out; using linear interpolation')
+            return self._linear_waypoints(start_lat, start_lon, target_lat, target_lon)
+        if not costmap_resp.success:
+            log.warn(f'generate_costmap failed ({costmap_resp.message}); using linear interpolation')
+            return self._linear_waypoints(start_lat, start_lon, target_lat, target_lon)
 
-        utm_crs / origin_utm are the SAME values used to build the grid this
-        cell_path was planned over (see _generate_waypoints), so this is a
-        straight inverse of erc_static_map_node's cell_to_world -> local-ENU
-        -> UTM -> GPS chain rather than a guess.
+        plan_req = PlanPath.Request()
+        plan_req.origin_lat = start_lat
+        plan_req.origin_lon = start_lon
+        plan_req.checkpoint_lat = target_lat
+        plan_req.checkpoint_lon = target_lon
+        plan_req.costmap = costmap_resp.costmap
+        plan_req.utm_crs = costmap_resp.utm_crs
+        plan_req.origin_utm_x = costmap_resp.origin_utm_x
+        plan_req.origin_utm_y = costmap_resp.origin_utm_y
+
+        plan_resp = self._call_service_sync(
+            self._planner_client, plan_req, float(self._param('planner_service_timeout_s'))
+        )
+        if plan_resp is None:
+            log.warn('plan_path service unavailable or timed out; using linear interpolation')
+            return self._linear_waypoints(start_lat, start_lon, target_lat, target_lon)
+        if not plan_resp.success or len(plan_resp.path.poses) < 2:
+            log.warn(f'plan_path failed ({plan_resp.message}); using linear interpolation')
+            return self._linear_waypoints(start_lat, start_lon, target_lat, target_lon)
+
+        waypoints = self._path_to_waypoints(
+            plan_resp.path, costmap_resp.utm_crs,
+            (costmap_resp.origin_utm_x, costmap_resp.origin_utm_y),
+        )
+        if waypoints:
+            log.info(f'Generated {len(waypoints)} A* waypoints to avoid obstacles')
+            return waypoints
+        return self._linear_waypoints(start_lat, start_lon, target_lat, target_lon)
+
+    @staticmethod
+    def _path_to_waypoints(path, utm_crs: str, origin_utm: Tuple[float, float]) -> List[Tuple[float, float]]:
+        """Sample 10 waypoints evenly along a planned Path and convert each
+        pose (local-ENU, relative to origin_utm) back to GPS.
+
+        utm_crs / origin_utm are the SAME values erc_static_map_node used to
+        build the costmap this path was planned over (passed straight
+        through from the GenerateCostmap response -- see _generate_waypoints),
+        so this is a direct inverse of that node's local-ENU -> UTM -> GPS
+        chain rather than a guess.
         """
         import pyproj
 
-        if not cell_path or len(cell_path) < 2:
+        poses = path.poses
+        if len(poses) < 2:
             return []
 
-        grid = self._costmap
-        ox = grid.info.origin.position.x
-        oy = grid.info.origin.position.y
-        resolution = grid.info.resolution
         origin_x, origin_y = origin_utm
         transformer = pyproj.Transformer.from_crs(utm_crs, "EPSG:4326", always_xy=True)
 
-        def cell_to_world(cell: Tuple[int, int]) -> Tuple[float, float]:
-            c, r = cell
-            return (ox + (c + 0.5) * resolution, oy + (r + 0.5) * resolution)
-
-        def world_to_gps(wx: float, wy: float) -> Tuple[float, float]:
-            """Convert local ENU (m, relative to origin_utm) back to GPS.
-
-            erc_static_map_node publishes grid.info.origin as
-            (min_utm - origin_utm), i.e. the grid is already in a frame
-            relative to origin_utm -- so recovering an absolute UTM position
-            means ADDING origin_utm back, not treating (wx, wy) as if it were
-            already absolute UTM.
-            """
-            utm_x = wx + origin_x
-            utm_y = wy + origin_y
-            lon, lat = transformer.transform(utm_x, utm_y)
+        def local_to_gps(x: float, y: float) -> Tuple[float, float]:
+            lon, lat = transformer.transform(x + origin_x, y + origin_y)
             return lat, lon
 
-        # Sample 10 waypoints evenly spaced along the path
-        waypoints_gps = []
+        waypoints = []
         for i in range(1, 11):
-            idx = int(len(cell_path) * i / 10.0)
-            idx = min(idx, len(cell_path) - 1)
-            cell = cell_path[idx]
-            wx, wy = cell_to_world(cell)
-            waypoints_gps.append(world_to_gps(wx, wy))
-        return waypoints_gps
+            idx = min(int(len(poses) * i / 10.0), len(poses) - 1)
+            pos = poses[idx].pose.position
+            waypoints.append(local_to_gps(pos.x, pos.y))
+        return waypoints
 
-    def _generate_waypoints(self, start_lat: float, start_lon: float, target_lat: float, target_lon: float) -> list:
-        """Generate 10 GPS waypoints using A* if costmap available, else linear interpolation.
-        Avoids untraversable terrain (buildings/obstacles) when costmap is present.
-
-        The costmap's local-ENU frame and UTM zone are anchored to
-        self._map_origin (latched from the first /erc/gps fix -- see
-        _gps_callback). erc_static_map_node must have been launched with that
-        SAME lat/lon as its origin_lat/origin_lon for this leg. All GPS<->grid
-        conversions here go through that same UTM projection, mirroring
-        erc_astar_planner_node, instead of assuming the rover is at the grid
-        origin or using a flat degrees-to-meters scale that ignores the
-        cos(latitude) correction on longitude.
-        """
-        with self._lock:
-            map_origin = self._map_origin
-
-        with self._costmap_lock:
-            if self._costmap is not None and map_origin is not None:
-                try:
-                    map_origin_lat, map_origin_lon = map_origin
-                    grid = self._costmap
-                    ox = grid.info.origin.position.x
-                    oy = grid.info.origin.position.y
-                    resolution = grid.info.resolution
-                    width = grid.info.width
-                    height = grid.info.height
-
-                    # Parse occupancy grid
-                    occupied = (np.array(grid.data, dtype=np.int16).reshape((height, width)) >= self.LETHAL_COST)
-
-                    def world_to_cell(x: float, y: float) -> Tuple[int, int]:
-                        return (int(math.floor((x - ox) / resolution)),
-                                int(math.floor((y - oy) / resolution)))
-
-                    # Same UTM zone/projection erc_static_map_node used to build
-                    # this grid, derived from the same latched map origin -- not
-                    # a hardcoded zone and not the rover's current position.
-                    utm_crs = utm_crs_for(map_origin_lat, map_origin_lon)
-                    origin_utm = project_point_to_utm(map_origin_lat, map_origin_lon, utm_crs)
-                    start_utm = project_point_to_utm(start_lat, start_lon, utm_crs)
-                    goal_utm = project_point_to_utm(target_lat, target_lon, utm_crs)
-
-                    # Local ENU relative to the map origin, matching
-                    # erc_static_map_node's costmap_to_occupancy_grid convention.
-                    start_local = (start_utm[0] - origin_utm[0], start_utm[1] - origin_utm[1])
-                    goal_local = (goal_utm[0] - origin_utm[0], goal_utm[1] - origin_utm[1])
-
-                    start_cell = world_to_cell(*start_local)
-                    goal_cell = world_to_cell(*goal_local)
-
-                    # Run A* on the grid
-                    cell_path = self._astar_grid(occupied, start_cell, goal_cell)
-                    if cell_path and len(cell_path) > 1:
-                        waypoints = self._generate_waypoints_from_path(cell_path, utm_crs, origin_utm)
-                        if waypoints:
-                            self.get_logger().info(f'Generated {len(waypoints)} A* waypoints to avoid obstacles')
-                            return waypoints
-                except Exception as e:
-                    self.get_logger().warn(f'A* waypoint generation failed ({e}); using linear interpolation')
-            elif self._costmap is not None:
-                self.get_logger().warn(
-                    'Costmap available but no GPS fix has been latched as map origin yet; '
-                    'skipping A* and using linear interpolation instead of guessing the UTM zone.')
-
-        # Fallback: linear GPS interpolation at 10% intervals
+    def _linear_waypoints(self, start_lat: float, start_lon: float, target_lat: float, target_lon: float) -> list:
+        """Fallback: 10 GPS waypoints at even fractions of the straight-line
+        geodesic (equirectangular approximation) from start to target."""
         waypoints = []
         for i in range(1, 11):
             fraction = i / 10.0
