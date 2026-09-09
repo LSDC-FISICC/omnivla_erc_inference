@@ -16,6 +16,14 @@ without needing a separate process per leg, and without ever having to
 guess or separately latch a UTM zone/origin: GenerateCostmap's response
 carries utm_crs/origin_utm_x/origin_utm_y and those are passed straight
 through to PlanPath.
+
+The planned path is reduced to waypoints by line-of-sight shortcutting against
+the same costmap it was planned over, so every straight segment the controller
+actually drives is guaranteed free of lethal cells. It used to keep 10 evenly
+indexed poses regardless of path length, which silently undid the planning:
+replaying that indexing over real A* output put 27-47 lethal cells back under
+the straight lines between waypoints in three separate test scenarios (see
+erc_static_map/test/test_waypoint_subsampling.py).
 """
 
 import json
@@ -24,6 +32,7 @@ import threading
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
 
+import numpy as np
 import requests
 
 import rclpy
@@ -36,6 +45,15 @@ from std_msgs.msg import Bool, Float32
 
 from erc_inference_msgs.action import StartMission
 from erc_static_map_msgs.srv import GenerateCostmap, PlanPath
+
+
+# nav_msgs/OccupancyGrid convention: 0-100 is a probability of occupancy and
+# -1 is unknown, so >= 100 means "definitely blocked". erc_static_map_node
+# writes exactly 100 for building footprints (its LETHAL_COST) and leaves
+# unmapped-but-traversable terrain at 0; unknown (-1) is never emitted, and
+# would be treated as traversable here, which matches that node's stated
+# "unmapped, open, traversable" reading.
+LETHAL_COST = 100
 
 
 @dataclass(frozen=True)
@@ -74,6 +92,12 @@ class CheckpointControllerNode(Node):
         # blocking the mission indefinitely on one leg's map.
         self.declare_parameter('costmap_service_timeout_s', 60.0)
         self.declare_parameter('planner_service_timeout_s', 15.0)
+        # Longest straight segment the controller will be asked to drive
+        # between two waypoints. Line-of-sight shortcutting already guarantees
+        # a segment is obstacle-free; this cap is about not committing to a
+        # long straight run while GPS error accumulates, and about giving the
+        # controller a steady cadence of goals on open ground.
+        self.declare_parameter('max_waypoint_spacing_m', 15.0)
 
         self._lock = threading.RLock()
         self._gps_condition = threading.Condition(self._lock)
@@ -278,6 +302,7 @@ class CheckpointControllerNode(Node):
         waypoints = self._path_to_waypoints(
             plan_resp.path, costmap_resp.utm_crs,
             (costmap_resp.origin_utm_x, costmap_resp.origin_utm_y),
+            costmap=costmap_resp.costmap,
         )
         if waypoints:
             log.info(f'Generated {len(waypoints)} A* waypoints to avoid obstacles')
@@ -285,9 +310,89 @@ class CheckpointControllerNode(Node):
         return self._linear_waypoints(start_lat, start_lon, target_lat, target_lon)
 
     @staticmethod
-    def _path_to_waypoints(path, utm_crs: str, origin_utm: Tuple[float, float]) -> List[Tuple[float, float]]:
-        """Sample 10 waypoints evenly along a planned Path and convert each
-        pose (local-ENU, relative to origin_utm) back to GPS.
+    def _grid_occupancy(grid):
+        """(occupied[row, col], resolution, origin_x, origin_y) from an OccupancyGrid."""
+        h, w = grid.info.height, grid.info.width
+        if h == 0 or w == 0 or grid.info.resolution <= 0.0:
+            return None
+        data = np.asarray(grid.data, dtype=np.int16).reshape((h, w))
+        return (data >= LETHAL_COST,
+                float(grid.info.resolution),
+                float(grid.info.origin.position.x),
+                float(grid.info.origin.position.y))
+
+    @staticmethod
+    def _segment_is_clear(occ, res, ox, oy, p, q, step_ratio=0.4):
+        """Is the straight segment p->q free of lethal cells?
+
+        Sampled at 0.4 of a cell, which cannot skip over a cell whose width is
+        one full cell. A leaving-the-grid segment counts as blocked: off-map is
+        exactly the terrain nothing has checked.
+        """
+        h, w = occ.shape
+        dx, dy = q[0] - p[0], q[1] - p[1]
+        length = math.hypot(dx, dy)
+        n = max(1, int(math.ceil(length / (step_ratio * res))))
+        for i in range(n + 1):
+            t = i / n
+            c = int(math.floor((p[0] + dx * t - ox) / res))
+            r = int(math.floor((p[1] + dy * t - oy) / res))
+            if not (0 <= c < w and 0 <= r < h) or occ[r, c]:
+                return False
+        return True
+
+    @classmethod
+    def _shortcut_path(cls, points, grid, max_spacing_m):
+        """Greedy line-of-sight shortcutting: the fewest waypoints such that every
+        straight segment between consecutive ones is obstacle-free.
+
+        This replaces "keep 10 evenly indexed poses", which discarded exactly the
+        detail the planner existed to produce -- every detour finer than the
+        sampling interval became a straight line nobody had checked.
+
+        Look-ahead is capped at max_spacing_m, which both bounds the segment
+        length and keeps this O(n * cap) instead of O(n^2) on a long open run.
+        """
+        occupancy = cls._grid_occupancy(grid)
+        if occupancy is None or len(points) < 2:
+            return list(points)
+        occ, res, ox, oy = occupancy
+
+        out = [points[0]]
+        anchor = 0
+        while anchor < len(points) - 1:
+            best = anchor + 1
+            for j in range(anchor + 1, len(points)):
+                if math.dist(points[anchor], points[j]) > max_spacing_m:
+                    break
+                # Stop extending at the first blocked segment rather than
+                # scanning past it: a farther point being visible again does not
+                # make the segment through the obstacle safe.
+                if not cls._segment_is_clear(occ, res, ox, oy, points[anchor], points[j]):
+                    break
+                best = j
+            out.append(points[best])
+            anchor = best
+        return out
+
+    @staticmethod
+    def _resample_by_distance(points, spacing_m):
+        """Fallback when no usable costmap is available: keep the endpoints and one
+        point roughly every spacing_m. Still follows the planned path -- unlike a
+        fixed count, the sampling interval does not grow with the leg length."""
+        if len(points) < 2:
+            return list(points)
+        out = [points[0]]
+        for pt in points[1:]:
+            if math.dist(out[-1], pt) >= spacing_m:
+                out.append(pt)
+        if out[-1] != points[-1]:
+            out.append(points[-1])
+        return out
+
+    def _path_to_waypoints(self, path, utm_crs: str, origin_utm: Tuple[float, float],
+                            costmap=None) -> List[Tuple[float, float]]:
+        """Reduce a planned Path to GPS waypoints, preserving obstacle avoidance.
 
         utm_crs / origin_utm are the SAME values erc_static_map_node used to
         build the costmap this path was planned over (passed straight
@@ -301,18 +406,28 @@ class CheckpointControllerNode(Node):
         if len(poses) < 2:
             return []
 
+        max_spacing = float(self._param('max_waypoint_spacing_m'))
+        points = [(ps.pose.position.x, ps.pose.position.y) for ps in poses]
+
+        if costmap is not None:
+            kept = self._shortcut_path(points, costmap, max_spacing)
+            self.get_logger().info(
+                f'Path reduced {len(points)} -> {len(kept)} waypoints by line-of-sight '
+                f'shortcutting (max spacing {max_spacing:.0f} m)')
+        else:
+            kept = self._resample_by_distance(points, max_spacing)
+            self.get_logger().warn(
+                f'No costmap available to verify waypoint segments; falling back to '
+                f'distance resampling ({len(points)} -> {len(kept)} waypoints). Straight '
+                f'lines between these are NOT checked against obstacles.')
+
         origin_x, origin_y = origin_utm
         transformer = pyproj.Transformer.from_crs(utm_crs, "EPSG:4326", always_xy=True)
 
-        def local_to_gps(x: float, y: float) -> Tuple[float, float]:
-            lon, lat = transformer.transform(x + origin_x, y + origin_y)
-            return lat, lon
-
         waypoints = []
-        for i in range(1, 11):
-            idx = min(int(len(poses) * i / 10.0), len(poses) - 1)
-            pos = poses[idx].pose.position
-            waypoints.append(local_to_gps(pos.x, pos.y))
+        for x, y in kept[1:]:          # drop the first: it is where the rover already is
+            lon, lat = transformer.transform(x + origin_x, y + origin_y)
+            waypoints.append((lat, lon))
         return waypoints
 
     def _linear_waypoints(self, start_lat: float, start_lon: float, target_lat: float, target_lon: float) -> list:

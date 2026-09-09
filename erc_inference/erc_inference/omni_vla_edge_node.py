@@ -87,7 +87,11 @@ class OmniVLAEdgeNode(Node):
 
         self.declare_parameter("image_topic", "/camera/image_raw")
         self.declare_parameter("gps_topic", "/gps/fix")
-        self.declare_parameter("compass_topic", "/compass")
+        # Unified heading topic from erc_localization's heading_node.py (see
+        # config/heading.yaml for the magnetometer-vs-SDK-compass selector).
+        # Degrees in the SDK convention (0 = North, clockwise-positive), which
+        # is what cur_compass below expects and what OmniVLA was trained on.
+        self.declare_parameter("compass_topic", "/erc/heading_deg")
         self.declare_parameter("cmd_vel_topic", "/cmd_vel")
         self.declare_parameter("tick_rate", 3.0)
 

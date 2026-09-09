@@ -17,6 +17,10 @@
 #     ros2 topic pub /goal_img sensor_msgs/msg/Image ...
 #     ros2 topic pub /goal_gps sensor_msgs/msg/NavSatFix "{latitude: 37.8739, longitude: -122.2675}"
 #     ros2 topic pub /goal_compass std_msgs/msg/Float32 "{data: 0.0}"
+#     # (this command was always right -- the subscription below used to
+#     # declare Int32, which meant it silently never connected to a Float32
+#     # publisher. Fixed 2026-09-09. Match /erc/heading_deg's type, same
+#     # reasoning as the comment on compass_topic above.)
 #     ros2 topic pub /lan_prompt std_msgs/msg/String "{data: 'blue trash bin'}"
 #     ros2 topic pub /use_lan_prompt std_msgs/msg/Bool "{data: true}"
 #     ros2 topic pub /enable_inference std_msgs/msg/Bool "{data: true}"
@@ -92,7 +96,14 @@ class OmniVLAEdgeNode(Node):
 
         self.declare_parameter("image_topic", "/erc/front_camera")
         self.declare_parameter("gps_topic", "/erc/gps")
-        self.declare_parameter("compass_topic", "/erc/orientation")
+        # Unified heading topic from erc_localization's heading_node.py, which
+        # owns the magnetometer-vs-SDK-compass choice (config/heading.yaml).
+        # Float32 rather than the Int32 /erc/orientation used to be: the
+        # magnetometer path resolves finer than a whole degree, and the value
+        # keeps the SDK's own convention (0 = North, clockwise-positive), which
+        # is what the cur_compass arithmetic below was written against and what
+        # OmniVLA was trained on. Do not "fix" that to ENU here.
+        self.declare_parameter("compass_topic", "/erc/heading_deg")
         self.declare_parameter("cmd_vel_topic", "/omnivla/cmd_vel")
         self.declare_parameter("tick_rate", 3.0)
 
@@ -186,12 +197,12 @@ class OmniVLAEdgeNode(Node):
         # Live robot state
         self.create_subscription(Image, self.get_parameter("image_topic").value, self.image_callback, 10)
         self.create_subscription(NavSatFix, self.get_parameter("gps_topic").value, self.gps_callback, 10)
-        self.create_subscription(Int32, self.get_parameter("compass_topic").value, self.compass_callback, 10)
+        self.create_subscription(Float32, self.get_parameter("compass_topic").value, self.compass_callback, 10)
 
         # Goal / inference request (test these live with `ros2 topic pub`)
         self.create_subscription(Image, self.get_parameter("goal_image_topic").value, self.goal_image_callback, 10)
         self.create_subscription(NavSatFix, self.get_parameter("goal_gps_topic").value, self.goal_gps_callback, 10)
-        self.create_subscription(Int32, self.get_parameter("goal_compass_topic").value, self.goal_compass_callback, 10)
+        self.create_subscription(Float32, self.get_parameter("goal_compass_topic").value, self.goal_compass_callback, 10)
         self.create_subscription(String, self.get_parameter("lan_prompt_topic").value, self.lan_prompt_callback, 10)
         self.create_subscription(Bool, self.get_parameter("use_pose_goal_topic").value, self.use_pose_goal_callback, 10)
         self.create_subscription(Bool, self.get_parameter("use_satellite_topic").value, self.use_satellite_callback, 10)
@@ -223,7 +234,7 @@ class OmniVLAEdgeNode(Node):
             self.current_lat = msg.latitude
             self.current_lon = msg.longitude
 
-    def compass_callback(self, msg: Int32):
+    def compass_callback(self, msg: Float32):
         with self.lock:
             self.current_compass_deg = msg.data
 
@@ -244,7 +255,7 @@ class OmniVLAEdgeNode(Node):
             self.goal_lon = msg.longitude
         self.get_logger().info(f"Goal GPS updated: lat={msg.latitude}, lon={msg.longitude}")
 
-    def goal_compass_callback(self, msg: Int32):
+    def goal_compass_callback(self, msg: Float32):
         with self.lock:
             self.goal_compass_deg = msg.data
 
