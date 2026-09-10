@@ -95,9 +95,109 @@ LATCHED_QOS = QoSProfile(
 )
 
 
+# Seconds between consecutive waypoints inside the model's predicted chunk.
+# LogoNav trains with action_spacing=3 on 10 Hz data, so the 8 waypoints of the
+# chunk sit at +0.3 s ... +2.4 s. This is NOT the controller tick period: the
+# old control law divided by 1/tick_rate (0.333 s) as if the selected waypoint
+# had to be reached within one tick, which over-commanded both channels by
+# (waypoint_select + 1) * 0.3 / 0.333 -- 4.5x at waypoint_select=4.
+WAYPOINT_DT = 0.3
+
+
 def clip_angle(angle: float) -> float:
     """Wrap an angle (rad) to [-pi, pi]."""
     return (angle + math.pi) % (2 * math.pi) - math.pi
+
+
+class HeadingPID:
+    """PID on the bearing error to the selected waypoint.
+
+    Tuned against mission9sept, where the previous law (`arctan(dy/dx) / DT`
+    with DT = 1/3 s) multiplied the bearing by 3 and therefore saturated the
+    angular command at a bearing of only 5.73 deg. 80.6% of the ticks in that
+    run asked for more than max_angular_vel, which made the output effectively
+    three-valued -- hard left, hard right, straight. The default kp of 0.4
+    instead saturates at ~43 deg, leaving a real proportional band. See the
+    pid_kp parameter for how the gains were chosen.
+
+    Anti-windup matters more than usual here: the rover does not always execute
+    what it is told (the ratio of achieved to commanded yaw rate measured 0.98
+    on gentle turns at cruise but 0.29 while slowed mid-turn), so a naive
+    integrator would wind up against a deficit no amount of integral can fix.
+    Integration is therefore frozen whenever the output is saturated and the
+    error would push it further into the stop.
+
+    Not thread-safe, and does not need to be: this node runs on a plain
+    rclpy.spin() single-threaded executor, so step() (timer) and reset()
+    (subscription callbacks) never overlap. That stops being true if anyone
+    moves it to a MultiThreadedExecutor, as checkpoint_controller_node uses.
+    """
+
+    # The timer does not tick evenly. Measured on mission9sept: 7% of the 396
+    # real ticks arrived less than 10 ms after the previous one (minimum 2 us,
+    # the timer catching up after a slow forward pass) and one gap reached
+    # 1.68 s. Dividing by a 2 us dt amplifies the derivative by ~500,000x --
+    # in an early version of this class that produced a D term of 75 rad/s
+    # against an output limit of 0.3. Both ends are clamped: a burst tick
+    # reuses roughly the nominal period rather than exploding, and a long
+    # stall does not dump a huge slab into the integral.
+    DT_MIN = 0.05
+    DT_MAX = 1.0
+
+    def __init__(self, kp, ki, kd, out_limit, integral_limit, derivative_alpha):
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.out_limit = out_limit
+        self.integral_limit = integral_limit
+        self.derivative_alpha = derivative_alpha
+        self.reset()
+
+    def reset(self):
+        """Clear history. Call on enable/disable edges and on a new goal.
+
+        Without this, the integral accumulated chasing the previous waypoint is
+        applied to the next one, and the step in bearing when a new goal
+        arrives produces a derivative kick.
+        """
+        self._integral = 0.0
+        self._prev_error = None
+        self._deriv = 0.0
+
+    def step(self, error, dt):
+        """error: bearing to the waypoint (rad). dt: measured tick period (s)."""
+        dt = float(np.clip(dt, self.DT_MIN, self.DT_MAX))
+
+        proportional = self.kp * error
+
+        if self._prev_error is None:
+            raw_deriv = 0.0
+        else:
+            raw_deriv = (error - self._prev_error) / dt
+        # The bearing comes from a fresh forward pass every tick and jitters, so
+        # an unfiltered derivative at ~3 Hz is mostly noise.
+        self._deriv += self.derivative_alpha * (raw_deriv - self._deriv)
+        self._prev_error = error
+        # Belt and braces on top of DT_MIN: however the derivative was arrived
+        # at, it may not on its own command more than the output limit.
+        derivative = float(np.clip(self.kd * self._deriv,
+                                   -self.out_limit, self.out_limit))
+
+        unsaturated = proportional + self.ki * self._integral + derivative
+        # Conditional integration: only accumulate when that would not drive an
+        # already-saturated output further into its limit.
+        saturated_high = unsaturated >= self.out_limit and error > 0.0
+        saturated_low = unsaturated <= -self.out_limit and error < 0.0
+        if not (saturated_high or saturated_low):
+            self._integral = float(
+                np.clip(self._integral + error * dt,
+                        -self.integral_limit, self.integral_limit)
+            )
+
+        output = proportional + self.ki * self._integral + derivative
+        return (float(np.clip(output, -self.out_limit, self.out_limit)),
+                float(proportional), float(self.ki * self._integral),
+                float(derivative))
 
 
 class OmniVLAEdgeNode(Node):
@@ -140,6 +240,54 @@ class OmniVLAEdgeNode(Node):
         # the robot, not part of the "goal" you're testing/iterating on.
         self.declare_parameter("max_linear_vel", 0.3)
         self.declare_parameter("max_angular_vel", 0.3)
+
+        # --- Heading PID (see HeadingPID) -----------------------------------
+        # kp 0.4 puts the angular command at the 0.3 rad/s limit for a bearing
+        # error of ~43 deg, against 5.73 deg under the old arctan/DT law: the
+        # output stops being effectively three-valued and gets a real
+        # proportional band.
+        #
+        # These were picked for ROBUSTNESS TO THE LOOP DELAY, which is only
+        # known to within a factor of two -- mission9sept measured cmd_delay at
+        # 0.246 s but the best cmd->gyro correlation sat at a lag of 1.15 s.
+        # Simulated against a delay+first-order plant at both measured
+        # actuation ratios (0.98 and 0.50), worst-case overshoot over 30/90/180
+        # deg steps:
+        #
+        #   kp    ki    kd  | delay 0.6s | 0.9s        | 1.2s
+        #   0.5   0.15  0.08|  9.3 (24x) | 13.0 (35x)  | 18.1 (32x)
+        #   0.6   0.03  0.10|  1.6 ( 1x) |  5.4 ( 3x)  | 10.9 ( 5x)
+        #   0.6   0.00  0.10|  0.0 ( 0x) |  4.6 (24x)  | 10.1 (39x)
+        #   0.4   0.03  0.10|  2.4 ( 4x) |  2.5 ( 4x)  |  4.7 ( 4x)  <- chosen
+        #
+        # (parenthesis = zero crossings, i.e. weaving). The gains that win at
+        # the nominal delay are close to unstable at the pessimistic one; 0.4
+        # is barely slower to settle (6.0 s vs 5.3 s on a 90 deg step) and
+        # holds its behaviour across the whole band.
+        #
+        # ki is small on purpose: the rover does not always execute what it is
+        # told, and a large integral winds up against a deficit it cannot fix.
+        # Set ki to 0 if the rover still weaves on real terrain -- that costs
+        # steady-state bias rejection but cannot ring.
+        self.declare_parameter("pid_kp", 0.4)
+        self.declare_parameter("pid_ki", 0.03)
+        self.declare_parameter("pid_kd", 0.10)
+        # Cap on the integral STATE (rad*s). At ki=0.03 this bounds the
+        # integral's contribution to ~0.02 rad/s.
+        self.declare_parameter("pid_integral_limit", 0.67)
+        self.declare_parameter("pid_derivative_alpha", 0.4)
+
+        # --- Linear speed shaping -------------------------------------------
+        # Deliberately gentle. Measured on mission9sept: the achieved/commanded
+        # yaw-rate ratio was 0.98 on gentle turns at 0.3 m/s but only 0.29 when
+        # the old limiter had slowed the rover mid-turn, and 0.50 at cruise
+        # within that same leg -- i.e. slowing down made the rover turn WORSE,
+        # then it stayed saturated, which slowed it further. Speed is therefore
+        # only reduced once the goal is far enough off-axis that driving
+        # forward stops closing the distance at all (past 90 deg it opens it).
+        self.declare_parameter("turn_slowdown_start_deg", 60.0)
+        self.declare_parameter("turn_slowdown_end_deg", 120.0)
+        self.declare_parameter("turn_speed_floor", 0.4)
 
         # ---------------------------------------------------------
         # Topic names for the goal / inference request. The VALUES
@@ -222,6 +370,20 @@ class OmniVLAEdgeNode(Node):
         self.waypoint_select = 4
         self.enable_inference = True
 
+        self.heading_pid = HeadingPID(
+            kp=self.get_parameter("pid_kp").value,
+            ki=self.get_parameter("pid_ki").value,
+            kd=self.get_parameter("pid_kd").value,
+            out_limit=self.get_parameter("max_angular_vel").value,
+            integral_limit=self.get_parameter("pid_integral_limit").value,
+            derivative_alpha=self.get_parameter("pid_derivative_alpha").value,
+        )
+        # Real elapsed time between ticks: the forward pass took 168 ms in
+        # profiling and the timer is not guaranteed to fire on schedule, so
+        # feeding the PID a nominal 1/tick_rate would misstate both the
+        # integral and the derivative.
+        self._last_tick_time = None
+
         # ---------------------------------------------------------
         # Pub / Sub
         # ---------------------------------------------------------
@@ -285,8 +447,14 @@ class OmniVLAEdgeNode(Node):
 
     def goal_gps_callback(self, msg: NavSatFix):
         with self.lock:
+            changed = (self.goal_lat != msg.latitude or self.goal_lon != msg.longitude)
             self.goal_lat = msg.latitude
             self.goal_lon = msg.longitude
+            # A new waypoint steps the bearing error, which would otherwise
+            # show up as a derivative kick and carry the previous waypoint's
+            # integral into a leg it has nothing to do with.
+            if changed:
+                self.heading_pid.reset()
         self.get_logger().info(f"Goal GPS updated: lat={msg.latitude}, lon={msg.longitude}")
 
     def goal_compass_callback(self, msg: Float32):
@@ -320,7 +488,14 @@ class OmniVLAEdgeNode(Node):
 
     def enable_inference_callback(self, msg: Bool):
         with self.lock:
+            was_enabled = self.enable_inference
             self.enable_inference = msg.data
+            # The rover is stopped while disabled (checkpoint verification, and
+            # the gaps between legs lasted 1.4 s in mission9sept). Resuming with
+            # the integral from before the stop would kick on the first tick.
+            if was_enabled != msg.data:
+                self.heading_pid.reset()
+                self._last_tick_time = None
         self.get_logger().info(f"enable_inference set to {msg.data}")
 
     # ---------------------------------------------------------
@@ -536,47 +711,74 @@ class OmniVLAEdgeNode(Node):
             f"waypoint_select={waypoint_select} all_waypoints_shape={waypoints.shape}"
         )
 
-        # --- PD controller -> (linear, angular) ---
+        # --- PID controller -> (linear, angular) ---
         EPS = 1e-8
-        DT = 1.0 / self.get_parameter("tick_rate").value
+        maxv = max_linear
+
+        # Refresh gains from parameters every tick so they can be tuned live
+        # with `ros2 param set` while the rover drives, which is the only
+        # practical way to tune this on real terrain. Cheap next to the
+        # forward pass that just ran.
+        self.heading_pid.kp = self.get_parameter("pid_kp").value
+        self.heading_pid.ki = self.get_parameter("pid_ki").value
+        self.heading_pid.kd = self.get_parameter("pid_kd").value
+        self.heading_pid.integral_limit = self.get_parameter("pid_integral_limit").value
+        self.heading_pid.derivative_alpha = self.get_parameter("pid_derivative_alpha").value
+        self.heading_pid.out_limit = max_angular
+
+        # Measured tick period, not the nominal one (see _last_tick_time).
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if self._last_tick_time is None:
+            dt = 1.0 / self.get_parameter("tick_rate").value
+        else:
+            dt = now - self._last_tick_time
+        self._last_tick_time = now
+
+        # Bearing to the selected waypoint, and how far away it is. atan2 (not
+        # atan(dy/dx)) so a waypoint behind the rover gives an error near +-pi
+        # instead of folding into the forward half-plane -- the old law could
+        # not express "the goal is behind you" at all, which is exactly the
+        # case it failed on in leg 3 of mission9sept.
         if abs(dx) < EPS and abs(dy) < EPS:
-            linear_vel_value = 0.0
-            angular_vel_value = 1.0 * clip_angle(np.arctan2(hy, hx)) / DT
-        elif abs(dx) < EPS:
-            linear_vel_value = 0.0
-            angular_vel_value = 1.0 * np.sign(dy) * np.pi / (2 * DT)
+            # Degenerate chunk: no displacement predicted. Fall back to the
+            # predicted heading versor and do not drive forward.
+            heading_error = clip_angle(np.arctan2(hy, hx))
+            distance = 0.0
         else:
-            linear_vel_value = dx / DT
-            angular_vel_value = np.arctan(dy / dx) / DT
+            heading_error = clip_angle(np.arctan2(dy, dx))
+            distance = float(np.hypot(dx, dy))
 
-        linear_vel_value = np.clip(linear_vel_value, 0, 0.5)
-        angular_vel_value = np.clip(angular_vel_value, -1.0, 1.0)
+        angular_vel_limit, p_term, i_term, d_term = self.heading_pid.step(heading_error, dt)
 
-        # --- Velocity limiting (preserves turning radius) ---
-        maxv, maxw = max_linear, max_angular
-        if abs(linear_vel_value) <= maxv:
-            if abs(angular_vel_value) <= maxw:
-                linear_vel_limit = linear_vel_value
-                angular_vel_limit = angular_vel_value
-            else:
-                rd = linear_vel_value / angular_vel_value
-                linear_vel_limit = maxw * np.sign(linear_vel_value) * abs(rd)
-                angular_vel_limit = maxw * np.sign(angular_vel_value)
+        # Linear: the chunk says where the rover should be at
+        # +(waypoint_select + 1) * WAYPOINT_DT seconds, so the speed it implies
+        # is distance / that horizon.
+        horizon_s = (waypoint_select + 1) * WAYPOINT_DT
+        linear_vel_value = distance / horizon_s
+
+        # Gentle off-axis slowdown -- full speed while the goal is roughly
+        # ahead, tapering to turn_speed_floor once it is far enough off-axis
+        # that driving forward no longer closes the distance. Deliberately NOT
+        # proportional to the angular command: on this rover, slowing mid-turn
+        # measured worse yaw tracking, not better (see turn_slowdown_start_deg).
+        slow_start = math.radians(self.get_parameter("turn_slowdown_start_deg").value)
+        slow_end = math.radians(self.get_parameter("turn_slowdown_end_deg").value)
+        floor = self.get_parameter("turn_speed_floor").value
+        abs_err = abs(heading_error)
+        if abs_err <= slow_start:
+            speed_scale = 1.0
+        elif abs_err >= slow_end:
+            speed_scale = floor
         else:
-            if abs(angular_vel_value) <= 0.001:
-                linear_vel_limit = maxv * np.sign(linear_vel_value)
-                angular_vel_limit = 0.0
-            else:
-                rd = linear_vel_value / angular_vel_value
-                if abs(rd) >= maxv / maxw:
-                    linear_vel_limit = maxv * np.sign(linear_vel_value)
-                    angular_vel_limit = maxv * np.sign(angular_vel_value) / abs(rd)
-                else:
-                    linear_vel_limit = maxw * np.sign(linear_vel_value) * abs(rd)
-                    angular_vel_limit = maxw * np.sign(angular_vel_value)
+            t = (abs_err - slow_start) / max(slow_end - slow_start, EPS)
+            speed_scale = 1.0 + t * (floor - 1.0)
+
+        linear_vel_limit = float(np.clip(linear_vel_value * speed_scale, 0.0, maxv))
 
         debug_msg = (
-            f"linear_raw={linear_vel_value:.4f} angular_raw={angular_vel_value:.4f} | "
+            f"heading_err={math.degrees(heading_error):+.1f}deg dist={distance:.3f}m "
+            f"dt={dt:.3f}s | P={p_term:+.4f} I={i_term:+.4f} D={d_term:+.4f} | "
+            f"linear_raw={linear_vel_value:.4f} scale={speed_scale:.2f} | "
             f"linear_cmd={linear_vel_limit:.4f} angular_cmd={angular_vel_limit:.4f} | "
             f"modality={modality_id} lan_prompt='{lan_inst}'"
         )
