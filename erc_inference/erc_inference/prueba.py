@@ -53,6 +53,18 @@ from PIL import Image as PILImage
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+
+# Must match omnivla_edge_node.LATCHED_QOS: that node subscribes to the goal
+# and modality topics as TRANSIENT_LOCAL, and a volatile publisher does not
+# connect to a transient-local subscriber at all. Publishing these with the
+# default QoS makes this script appear to work while the node receives nothing.
+LATCHED_QOS = QoSProfile(
+    depth=1,
+    history=HistoryPolicy.KEEP_LAST,
+    reliability=ReliabilityPolicy.RELIABLE,
+    durability=DurabilityPolicy.TRANSIENT_LOCAL,
+)
 from sensor_msgs.msg import Image, NavSatFix
 from std_msgs.msg import Float32, String, Bool, Int32
 from cv_bridge import CvBridge
@@ -97,15 +109,15 @@ class OmniVLATestPublisher(Node):
 
         # --- Goal / inference-request publishers ---
         self.goal_image_pub = self.create_publisher(Image, args.goal_image_topic, 10)
-        self.goal_gps_pub = self.create_publisher(NavSatFix, args.goal_gps_topic, 10)
-        self.goal_compass_pub = self.create_publisher(Float32, args.goal_compass_topic, 10)
+        self.goal_gps_pub = self.create_publisher(NavSatFix, args.goal_gps_topic, LATCHED_QOS)
+        self.goal_compass_pub = self.create_publisher(Float32, args.goal_compass_topic, LATCHED_QOS)
         self.lan_prompt_pub = self.create_publisher(String, args.lan_prompt_topic, 10)
-        self.use_pose_goal_pub = self.create_publisher(Bool, args.use_pose_goal_topic, 10)
-        self.use_satellite_pub = self.create_publisher(Bool, args.use_satellite_topic, 10)
-        self.use_image_goal_pub = self.create_publisher(Bool, args.use_image_goal_topic, 10)
-        self.use_lan_prompt_pub = self.create_publisher(Bool, args.use_lan_prompt_topic, 10)
+        self.use_pose_goal_pub = self.create_publisher(Bool, args.use_pose_goal_topic, LATCHED_QOS)
+        self.use_satellite_pub = self.create_publisher(Bool, args.use_satellite_topic, LATCHED_QOS)
+        self.use_image_goal_pub = self.create_publisher(Bool, args.use_image_goal_topic, LATCHED_QOS)
+        self.use_lan_prompt_pub = self.create_publisher(Bool, args.use_lan_prompt_topic, LATCHED_QOS)
         self.waypoint_select_pub = self.create_publisher(Int32, args.waypoint_select_topic, 10)
-        self.enable_inference_pub = self.create_publisher(Bool, args.enable_inference_topic, 10)
+        self.enable_inference_pub = self.create_publisher(Bool, args.enable_inference_topic, LATCHED_QOS)
 
         # --- Pre-load / pre-generate images once ---
         self.camera_img_static = self._load_image(args.image) if args.image else None

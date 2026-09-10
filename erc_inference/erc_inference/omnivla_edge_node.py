@@ -15,15 +15,28 @@
 #   running:
 #
 #     ros2 topic pub /goal_img sensor_msgs/msg/Image ...
-#     ros2 topic pub /goal_gps sensor_msgs/msg/NavSatFix "{latitude: 37.8739, longitude: -122.2675}"
-#     ros2 topic pub /goal_compass std_msgs/msg/Float32 "{data: 0.0}"
-#     # (this command was always right -- the subscription below used to
-#     # declare Int32, which meant it silently never connected to a Float32
-#     # publisher. Fixed 2026-09-09. Match /erc/heading_deg's type, same
-#     # reasoning as the comment on compass_topic above.)
 #     ros2 topic pub /lan_prompt std_msgs/msg/String "{data: 'blue trash bin'}"
-#     ros2 topic pub /use_lan_prompt std_msgs/msg/Bool "{data: true}"
-#     ros2 topic pub /enable_inference std_msgs/msg/Bool "{data: true}"
+#
+#   The goal and modality topics are LATCHED (see LATCHED_QOS below), so
+#   `ros2 topic pub` needs --qos-durability transient_local on them or it
+#   will not connect to this node at all -- QoS mismatches fail silently,
+#   with no publisher-side error:
+#
+#     Q="--qos-durability transient_local --qos-reliability reliable"
+#     ros2 topic pub $Q /goal_gps sensor_msgs/msg/NavSatFix "{latitude: 37.8739, longitude: -122.2675}"
+#     ros2 topic pub $Q /goal_compass std_msgs/msg/Float32 "{data: 0.0}"
+#     # (the Float32 type here was always right -- the subscription below
+#     # used to declare Int32, which meant it silently never connected to a
+#     # Float32 publisher. Fixed 2026-09-09. Match /erc/heading_deg's type,
+#     # same reasoning as the comment on compass_topic above.)
+#     ros2 topic pub $Q /use_lan_prompt std_msgs/msg/Bool "{data: true}"
+#     ros2 topic pub $Q /enable_inference std_msgs/msg/Bool "{data: true}"
+#
+#   To navigate by GPS you must also select the pose modality, or this node
+#   stays on its defaults (satellite), where the model masks the GPS goal:
+#
+#     ros2 topic pub $Q /use_pose_goal std_msgs/msg/Bool "{data: true}"
+#     ros2 topic pub $Q /use_satellite std_msgs/msg/Bool "{data: false}"
 #
 #   The topic names themselves are still configurable via parameters
 #   (so you can remap without touching code), only their *values* are
@@ -49,6 +62,7 @@ from PIL import Image as PILImage
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Image, NavSatFix
 from std_msgs.msg import Float32, String, Bool, Int32
 from geometry_msgs.msg import Twist
@@ -64,6 +78,21 @@ IMG_SIZE = (96, 96)
 IMG_SIZE_CLIP = (224, 224)
 METRIC_WAYPOINT_SPACING = 0.1
 THRES_DIST = 30.0
+
+# Latched state, not events -- the goal and the modality flags are published
+# once per waypoint by checkpoint_controller_node. With volatile QoS this node
+# receives nothing if it starts (or restarts) between waypoints and silently
+# falls back to the defaults below, which select modality 0 (satellite): the
+# model then masks the GPS goal out entirely and the rover drives blind.
+# TRANSIENT_LOCAL delivers the current value to a late joiner. Both ends must
+# agree -- a volatile publisher never connects to a transient-local subscriber
+# -- so checkpoint_controller_node.py and prueba.py declare the same profile.
+LATCHED_QOS = QoSProfile(
+    depth=1,
+    history=HistoryPolicy.KEEP_LAST,
+    reliability=ReliabilityPolicy.RELIABLE,
+    durability=DurabilityPolicy.TRANSIENT_LOCAL,
+)
 
 
 def clip_angle(angle: float) -> float:
@@ -177,8 +206,13 @@ class OmniVLAEdgeNode(Node):
         # "just runs" as soon as sensing + a goal image are available,
         # which is convenient for testing.
         self.goal_image_pil = PILImage.new("RGB", IMG_SIZE, color=(0, 0, 0))
-        self.goal_lat = 0.0
-        self.goal_lon = 0.0
+        # None, not 0.0: (0.0, 0.0) is a real coordinate in the Gulf of Guinea,
+        # so a 0.0 default is indistinguishable from a goal that was actually
+        # received and would aim the rover at a bearing ~12,700 km away (clamped
+        # to THRES_DIST, so it looks like a plausible 30 m goal rather than
+        # failing loudly). None makes "no goal yet" detectable in timer_callback.
+        self.goal_lat = None
+        self.goal_lon = None
         self.goal_compass_deg = 0.0
         self.lan_inst_prompt = ""
         self.use_pose_goal = False
@@ -201,15 +235,15 @@ class OmniVLAEdgeNode(Node):
 
         # Goal / inference request (test these live with `ros2 topic pub`)
         self.create_subscription(Image, self.get_parameter("goal_image_topic").value, self.goal_image_callback, 10)
-        self.create_subscription(NavSatFix, self.get_parameter("goal_gps_topic").value, self.goal_gps_callback, 10)
-        self.create_subscription(Float32, self.get_parameter("goal_compass_topic").value, self.goal_compass_callback, 10)
+        self.create_subscription(NavSatFix, self.get_parameter("goal_gps_topic").value, self.goal_gps_callback, LATCHED_QOS)
+        self.create_subscription(Float32, self.get_parameter("goal_compass_topic").value, self.goal_compass_callback, LATCHED_QOS)
         self.create_subscription(String, self.get_parameter("lan_prompt_topic").value, self.lan_prompt_callback, 10)
-        self.create_subscription(Bool, self.get_parameter("use_pose_goal_topic").value, self.use_pose_goal_callback, 10)
-        self.create_subscription(Bool, self.get_parameter("use_satellite_topic").value, self.use_satellite_callback, 10)
-        self.create_subscription(Bool, self.get_parameter("use_image_goal_topic").value, self.use_image_goal_callback, 10)
-        self.create_subscription(Bool, self.get_parameter("use_lan_prompt_topic").value, self.use_lan_prompt_callback, 10)
+        self.create_subscription(Bool, self.get_parameter("use_pose_goal_topic").value, self.use_pose_goal_callback, LATCHED_QOS)
+        self.create_subscription(Bool, self.get_parameter("use_satellite_topic").value, self.use_satellite_callback, LATCHED_QOS)
+        self.create_subscription(Bool, self.get_parameter("use_image_goal_topic").value, self.use_image_goal_callback, LATCHED_QOS)
+        self.create_subscription(Bool, self.get_parameter("use_lan_prompt_topic").value, self.use_lan_prompt_callback, LATCHED_QOS)
         self.create_subscription(Int32, self.get_parameter("waypoint_select_topic").value, self.waypoint_select_callback, 10)
-        self.create_subscription(Bool, self.get_parameter("enable_inference_topic").value, self.enable_inference_callback, 10)
+        self.create_subscription(Bool, self.get_parameter("enable_inference_topic").value, self.enable_inference_callback, LATCHED_QOS)
 
         tick_rate = self.get_parameter("tick_rate").value
         self.timer = self.create_timer(1.0 / tick_rate, self.timer_callback)
@@ -332,20 +366,26 @@ class OmniVLAEdgeNode(Node):
     # ---------------------------------------------------------
     def timer_callback(self):
         with self.lock:
+            # A pose goal is only required by the modalities that actually read
+            # the goal_pose token (use_pose_goal); the satellite/image/language
+            # modalities have it masked out inside the model, so gating them on
+            # a GPS goal would stall them for no reason.
+            have_pose_goal = self.goal_lat is not None and self.goal_lon is not None
             ready = (
                 self.enable_inference
                 and len(self.context_queue) == self.context_size + 1
                 and self.latest_frame_full is not None
                 and self.current_lon is not None
                 and self.current_compass_deg is not None
+                and (have_pose_goal or not self.use_pose_goal)
             )
             if not ready:
                 self.publish_cmd(0.0, 0.0)
                 self.get_logger().info("Inference not ready: waiting for context, latest frame, and current pose.")
                 #info who is not ready
                 if self.enable_inference:
-                    self.get_logger().info(f"enable_inference={self.enable_inference}, context_queue={len(self.context_queue)}/{self.context_size + 1}, latest_frame_full={self.latest_frame_full is not None}, current_lat={self.current_lat is not None}, current_lon={self.current_lon is not None}, current_compass_deg={self.current_compass_deg is not None}")
-                
+                    self.get_logger().info(f"enable_inference={self.enable_inference}, context_queue={len(self.context_queue)}/{self.context_size + 1}, latest_frame_full={self.latest_frame_full is not None}, current_lat={self.current_lat is not None}, current_lon={self.current_lon is not None}, current_compass_deg={self.current_compass_deg is not None}, goal_gps={have_pose_goal} (required={self.use_pose_goal})")
+
                 return
 
 
@@ -357,8 +397,11 @@ class OmniVLAEdgeNode(Node):
             current_lon = self.current_lon
             current_compass_deg = self.current_compass_deg
 
-            goal_lat = self.goal_lat
-            goal_lon = self.goal_lon
+            # Reachable with no goal only when use_pose_goal is False, i.e. the
+            # model masks this token anyway. Fall back to the current position so
+            # the goal vector is (0, 0) instead of feeding NaN/None into UTM.
+            goal_lat = self.goal_lat if self.goal_lat is not None else self.current_lat
+            goal_lon = self.goal_lon if self.goal_lon is not None else self.current_lon
             goal_compass_deg = self.goal_compass_deg
             lan_inst_prompt = self.lan_inst_prompt
             goal_image_pil = self.goal_image_pil

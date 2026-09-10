@@ -39,6 +39,7 @@ import rclpy
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import NavSatFix
 from std_msgs.msg import Bool, Float32
@@ -54,6 +55,28 @@ from erc_static_map_msgs.srv import GenerateCostmap, PlanPath
 # would be treated as traversable here, which matches that node's stated
 # "unmapped, open, traversable" reading.
 LETHAL_COST = 100
+
+
+# The goal and modality topics carry LATCHED STATE, not events: "the goal is
+# here", "read the pose token, ignore the satellite one". They are published
+# once per waypoint, so with the default volatile QoS an inference node that
+# starts (or restarts) between waypoints receives nothing and silently falls
+# back to its own defaults -- which select modality 0 (satellite), where the
+# model masks the GPS goal out entirely. The rover then drives on visual habit
+# with no goal and nothing reports it.
+#
+# TRANSIENT_LOCAL with depth 1 makes a late joiner receive the current value
+# immediately. Both ends must declare it: a volatile publisher and a
+# transient-local subscriber are INCOMPATIBLE and never connect at all, which
+# is why omnivla_edge_node.py and prueba.py carry the same profile. It is also
+# why manual `ros2 topic pub` on these topics now needs
+# `--qos-durability transient_local` (see omnivla_edge_node.py's header).
+LATCHED_QOS = QoSProfile(
+    depth=1,
+    history=HistoryPolicy.KEEP_LAST,
+    reliability=ReliabilityPolicy.RELIABLE,
+    durability=DurabilityPolicy.TRANSIENT_LOCAL,
+)
 
 
 @dataclass(frozen=True)
@@ -117,14 +140,16 @@ class CheckpointControllerNode(Node):
             NavSatFix, self._param('gps_topic'), self._gps_callback, 10
         )
 
+        # cmd_vel is streaming data and stays volatile; everything below it is
+        # latched state (see LATCHED_QOS).
         self._cmd_pub = self.create_publisher(Twist, self._param('cmd_vel_topic'), 10)
-        self._goal_gps_pub = self.create_publisher(NavSatFix, self._param('goal_gps_topic'), 10)
-        self._goal_compass_pub = self.create_publisher(Float32, self._param('goal_compass_topic'), 10)
-        self._use_pose_pub = self.create_publisher(Bool, self._param('use_pose_goal_topic'), 10)
-        self._use_satellite_pub = self.create_publisher(Bool, self._param('use_satellite_topic'), 10)
-        self._use_image_pub = self.create_publisher(Bool, self._param('use_image_goal_topic'), 10)
-        self._use_lan_pub = self.create_publisher(Bool, self._param('use_lan_prompt_topic'), 10)
-        self._enable_pub = self.create_publisher(Bool, self._param('enable_inference_topic'), 10)
+        self._goal_gps_pub = self.create_publisher(NavSatFix, self._param('goal_gps_topic'), LATCHED_QOS)
+        self._goal_compass_pub = self.create_publisher(Float32, self._param('goal_compass_topic'), LATCHED_QOS)
+        self._use_pose_pub = self.create_publisher(Bool, self._param('use_pose_goal_topic'), LATCHED_QOS)
+        self._use_satellite_pub = self.create_publisher(Bool, self._param('use_satellite_topic'), LATCHED_QOS)
+        self._use_image_pub = self.create_publisher(Bool, self._param('use_image_goal_topic'), LATCHED_QOS)
+        self._use_lan_pub = self.create_publisher(Bool, self._param('use_lan_prompt_topic'), LATCHED_QOS)
+        self._enable_pub = self.create_publisher(Bool, self._param('enable_inference_topic'), LATCHED_QOS)
 
         self._costmap_client = self.create_client(GenerateCostmap, 'erc_static_map/generate_costmap')
         self._planner_client = self.create_client(PlanPath, 'erc_static_map/plan_path')
@@ -167,6 +192,20 @@ class CheckpointControllerNode(Node):
             ) else Twist()
         self._cmd_pub.publish(output)
 
+    def _publish_modality(self):
+        """Select modality 4 (pose goal only) on the inference node.
+
+        pose=True with the other three False is what compute_modality_id maps to
+        4, the GPS-only modality: the model reads the goal_pose token and masks
+        the satellite, goal-image and language ones. Satellite is False because
+        no satellite tile is ever supplied -- the inference node feeds a black
+        placeholder -- so any modality that reads that token navigates blind.
+        """
+        self._use_pose_pub.publish(Bool(data=True))
+        self._use_satellite_pub.publish(Bool(data=False))
+        self._use_image_pub.publish(Bool(data=False))
+        self._use_lan_pub.publish(Bool(data=False))
+
     def _publish_goal(self, checkpoint: Checkpoint):
         goal = NavSatFix()
         goal.latitude = checkpoint.latitude
@@ -174,10 +213,7 @@ class CheckpointControllerNode(Node):
         self._goal_gps_pub.publish(goal)
 
         self._goal_compass_pub.publish(Float32(data=0.0))
-        self._use_pose_pub.publish(Bool(data=True))
-        self._use_satellite_pub.publish(Bool(data=False))
-        self._use_image_pub.publish(Bool(data=False))
-        self._use_lan_pub.publish(Bool(data=False))
+        self._publish_modality()
         self._enable_pub.publish(Bool(data=True))
 
         with self._lock:
@@ -196,6 +232,12 @@ class CheckpointControllerNode(Node):
         with self._lock:
             self._motion_allowed = True
             self._stop_requested = False
+        # Re-assert the modality, not just the enable flag: if the inference
+        # node restarted during the pause it would otherwise come back on its
+        # own defaults (modality 0, satellite). LATCHED_QOS already covers the
+        # restart case on its own; this is the belt to that pair of braces, and
+        # it costs four Bool publishes on a path that runs once per checkpoint.
+        self._publish_modality()
         self._enable_pub.publish(Bool(data=True))
 
     def _publish_zero(self):
@@ -561,7 +603,12 @@ class CheckpointControllerNode(Node):
                         latitude=wp_lat,
                         longitude=wp_lon,
                     )
-                    progress = int((waypoint_idx + 1) * 10)  # 10, 20, ..., 100
+                    # Scale by the actual count: A* returns a variable number of
+                    # waypoints (1, 3 and 2 across the three legs of
+                    # mission9sept), so the old fixed *10 was only right back
+                    # when _linear_waypoints always produced exactly 10 -- it
+                    # logged a 3-waypoint leg as reaching 10%, 20%, 30%.
+                    progress = int((waypoint_idx + 1) * 100 / len(waypoints))
                     
                     self._publish_goal(waypoint)
                     if waypoint_idx == 0:
