@@ -24,17 +24,33 @@
     max_linear_vel: 0.3
     max_angular_vel: 0.3
 
+    # When the goal is behind the rover, turn toward it before handing control
+    # back to the controller. The model cannot request this itself: its
+    # waypoint always points forward (never beyond +-18 deg on mission_10sept),
+    # which is how every return leg so far has driven away from its goal.
+    goal_turn:
+      enabled: true
+      enter_deg: 90.0       # engage past this bearing to the goal
+      exit_deg: 30.0        # release under this; the ~1 s actuation lag
+                            # carries the turn most of the rest of the way
+      angular_vel: 0.3      # still capped by max_angular_vel
+      linear_vel: 0.0       # 0 = in place (pure rotation ran at 1.08x of
+                            # command in wuhan4_angular)
+      min_distance_m: 1.0   # ignore bearing jitter this close to the goal
+
     polar:
       # Siegwart's stability conditions (the node warns if violated):
-      #   k_rho > 0,  k_beta < 0,  k_alpha - k_rho > 0
+      #   k_rho > 0,  k_beta <= 0,  k_alpha - k_rho > 0
       # and, so the rover never reverses its direction of travel on the way:
-      #   k_alpha + (5/3) k_beta - (2/pi) k_rho > 0
-      # These defaults give 0.18 on the last one.
+      #   k_alpha + (5/3) k_beta - (2/pi) k_rho > 0   (1.18 at these values)
       k_rho: 0.5
       k_alpha: 1.5
-      # Negative: swings the approach so the rover arrives on the heading the
-      # model predicted for the waypoint. Set 0.0 for pure bearing tracking.
-      k_beta: -0.6
+      # 0 = steer on the bearing to the waypoint only. A negative k_beta swings
+      # the approach so the rover arrives on the heading the model predicted,
+      # but the waypoint is a moving target 1.5 s ahead, not a pose to arrive
+      # at: replayed on mission_10sept, -0.6 opened the commanded turn radius
+      # from 2.7 m to 3.2 m.
+      k_beta: 0.0
       # The camera faces forward and the model was trained driving forward;
       # leave this off unless you have a reason.
       backward_allowed: false

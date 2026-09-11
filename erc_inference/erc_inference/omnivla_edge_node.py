@@ -77,12 +77,22 @@ from erc_inference.utils_policy import (
 
 IMG_SIZE = (96, 96)
 IMG_SIZE_CLIP = (224, 224)
-METRIC_WAYPOINT_SPACING = 0.1
+# Scale between the model's goal/waypoint units and meters. 0.25 is what
+# LogoNav was trained with on FrodoBots data (hardcoded in MBRA's
+# vint_hf_dataset.py:662), both for the goal it reads and for the waypoints it
+# predicts. This node used 0.1, which fed goals 2.5x too large and shrank the
+# predicted waypoints 2.5x. Independent check from mission9sept: the index-4
+# waypoint (+1.5 s) came out as dx ~= 0.58 m at 0.1, i.e. 1.46 m at 0.25 --
+# 0.97 m/s, the Mini+'s typical speed in that dataset -- against 0.39 m/s.
+METRIC_WAYPOINT_SPACING = 0.25
 THRES_DIST = 30.0
+# A goal that moves further than this between two messages is a new target (a
+# new leg, or a replan), not the carrot's normal advance of a few cm per tick.
+GOAL_RESET_DISTANCE_M = 3.0
 
-# Latched state, not events -- the goal and the modality flags are published
-# once per waypoint by checkpoint_controller_node. With volatile QoS this node
-# receives nothing if it starts (or restarts) between waypoints and silently
+# Latched state, not events -- the goal (a carrot checkpoint_controller_node
+# moves along the route) and the modality flags (sent once per leg). With
+# volatile QoS this node receives nothing if it starts (or restarts) mid-leg and silently
 # falls back to the defaults below, which select modality 0 (satellite): the
 # model then masks the GPS goal out entirely and the rover drives blind.
 # TRANSIENT_LOCAL delivers the current value to a late joiner. Both ends must
@@ -108,6 +118,13 @@ WAYPOINT_DT = 0.3
 def clip_angle(angle: float) -> float:
     """Wrap an angle (rad) to [-pi, pi]."""
     return (angle + math.pi) % (2 * math.pi) - math.pi
+
+
+def ground_distance_m(lat1, lon1, lat2, lon2):
+    """Equirectangular distance -- ample for telling a carrot step from a new leg."""
+    k = math.radians(1.0) * 6378137.0
+    east = (lon2 - lon1) * k * math.cos(math.radians(0.5 * (lat1 + lat2)))
+    return math.hypot(east, (lat2 - lat1) * k)
 
 
 class HeadingPID:
@@ -268,9 +285,11 @@ def polar_gain_warnings(k_rho, k_alpha, k_beta):
     warnings = []
     if k_rho <= 0.0:
         warnings.append(f"k_rho={k_rho} must be > 0")
-    if k_beta >= 0.0:
-        warnings.append(f"k_beta={k_beta} should be < 0 "
-                        "(0 is valid if you only want bearing tracking)")
+    # Siegwart needs k_beta < 0 to converge on a final heading. The waypoint
+    # here is a moving target ~1.5 s ahead, not a pose to arrive at, so 0
+    # (bearing tracking only) is legitimate -- and the default.
+    if k_beta > 0.0:
+        warnings.append(f"k_beta={k_beta} must be <= 0 (0 = bearing tracking only)")
     if k_alpha - k_rho <= 0.0:
         warnings.append(f"k_alpha - k_rho = {k_alpha - k_rho:.3f} must be > 0")
     strong = k_alpha + (5.0 / 3.0) * k_beta - (2.0 / math.pi) * k_rho
@@ -278,6 +297,50 @@ def polar_gain_warnings(k_rho, k_alpha, k_beta):
         warnings.append(f"k_alpha + 5/3*k_beta - 2/pi*k_rho = {strong:.3f} <= 0: "
                         "the rover may reverse its direction of travel mid-approach")
     return warnings
+
+
+class GoalTurn:
+    """Turn toward the goal when it is behind the rover, before the model drives.
+
+    The model cannot ask for this. Its selected waypoint always sits in the
+    forward half-plane -- on mission_10sept its bearing never went beyond
+    +-18 deg -- so whenever a leg starts with the goal behind, any controller
+    that follows the model drives away from it. That is how the first attempt
+    at leg 3 of mission_10sept ended (goal ~175 deg behind, rover drove on from
+    15 m to 24.5 m, aborted by hand), and leg 3 of mission9sept before it: cp3
+    is back at cp1, so the return leg always opens with a U-turn.
+
+    Driven by localization, not by the model: the bearing comes from GPS and the
+    magnetometer heading, validated on mission_10sept at -5.8 deg bias against
+    GPS course over all headings. Hysteresis keeps it from chattering: engage
+    past enter_deg, release under exit_deg. The rover keeps rotating for ~1 s
+    after the command drops (cmd->gyro lag measured 0.85-1.4 s), which is why
+    exit_deg is well short of zero rather than a sign the turn is incomplete.
+    """
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.active = False
+        self.direction = 0.0
+
+    def update(self, bearing, distance, enabled, enter_deg, exit_deg, min_distance_m):
+        """bearing: rad to the goal, left-positive. Returns whether to override."""
+        if not enabled or distance < min_distance_m:
+            self.reset()
+            return False
+        magnitude = abs(math.degrees(bearing))
+        if self.active:
+            if magnitude < exit_deg:
+                self.reset()
+        elif magnitude > enter_deg:
+            self.active = True
+            # Latched when engaging: near 180 deg the sign of the bearing flips
+            # with every bit of heading noise, and re-reading it each tick would
+            # reverse the turn halfway through.
+            self.direction = 1.0 if bearing >= 0.0 else -1.0
+        return self.active
 
 
 class OmniVLAEdgeNode(Node):
@@ -304,7 +367,12 @@ class OmniVLAEdgeNode(Node):
         self.declare_parameter("learn_angle", True)
 
         self.declare_parameter("image_topic", "/erc/front_camera")
-        self.declare_parameter("gps_topic", "/erc/gps")
+        # The EKF-filtered fix (navsat_transform, 10 Hz, 0.19 m p50 from raw GPS
+        # on mission_10sept) rather than the raw SDK fix, which refreshes every
+        # ~1.3 s in 0.4 m steps. Against a carrot 1.5 m ahead a 0.4 m step
+        # swings the goal bearing by ~15 deg. Needs erc_localization's
+        # localization_global.launch.py running.
+        self.declare_parameter("gps_topic", "/erc/gps/filtered")
         # Unified heading topic from erc_localization's heading_node.py, which
         # owns the magnetometer-vs-SDK-compass choice (config/heading.yaml).
         # Float32 rather than the Int32 /erc/orientation used to be: the
@@ -375,18 +443,31 @@ class OmniVLAEdgeNode(Node):
         self.declare_parameter("pid.turn_speed_floor", 0.4)
 
         # --- Polar controller (see polar_control) ---------------------------
-        # k_alpha 1.5 against pid.kp 0.4 is the point of this controller: the
-        # PID's robustness-first gain commands 0.21 rad/s at a 30 deg bearing
-        # (a ~1.4 m turn at 0.3 m/s) and 0.10 at 15 deg (~2.9 m). The bearing
-        # term alone here reaches max_angular_vel from 11.5 deg onward.
-        # All four of Siegwart's stability conditions hold for these values;
-        # polar_gain_warnings checks them at startup and on every change.
+        # k_alpha 1.5 against pid.kp 0.4 is the point of this controller. On
+        # mission_10sept the PID never commanded more than 0.153 rad/s -- the
+        # model's waypoint bearing stays small -- and turned on a measured
+        # 4.9 m median radius. Replayed on those same waypoints, the commanded
+        # radius drops from 6.3 m to 2.7 m here. k_beta is 0 rather than
+        # Siegwart's negative value: -0.6 opened that to 3.2 m (see
+        # polar_gain_warnings for why 0 is valid).
         self.declare_parameter("polar.k_rho", 0.5)
         self.declare_parameter("polar.k_alpha", 1.5)
-        self.declare_parameter("polar.k_beta", -0.6)
+        self.declare_parameter("polar.k_beta", 0.0)
         self.declare_parameter("polar.backward_allowed", False)
         self.declare_parameter("polar.use_constant_vel", False)
         self.declare_parameter("polar.constant_vel", 0.1)
+
+        # --- Goal behind the rover (see GoalTurn) ---------------------------
+        # Overrides whichever controller is active: past enter_deg of bearing
+        # to the goal, turn at angular_vel (linear_vel forward; 0 = in place,
+        # which ran at 1.08x of command in wuhan4_angular) until under
+        # exit_deg, then hand back.
+        self.declare_parameter("goal_turn.enabled", True)
+        self.declare_parameter("goal_turn.enter_deg", 90.0)
+        self.declare_parameter("goal_turn.exit_deg", 30.0)
+        self.declare_parameter("goal_turn.angular_vel", 0.3)
+        self.declare_parameter("goal_turn.linear_vel", 0.0)
+        self.declare_parameter("goal_turn.min_distance_m", 1.0)
 
         # ---------------------------------------------------------
         # Topic names for the goal / inference request. The VALUES
@@ -493,6 +574,7 @@ class OmniVLAEdgeNode(Node):
         # feeding the PID a nominal 1/tick_rate would misstate both the
         # integral and the derivative.
         self._last_tick_time = None
+        self.goal_turn = GoalTurn()
 
         # ---------------------------------------------------------
         # Pub / Sub
@@ -557,15 +639,20 @@ class OmniVLAEdgeNode(Node):
 
     def goal_gps_callback(self, msg: NavSatFix):
         with self.lock:
-            changed = (self.goal_lat != msg.latitude or self.goal_lon != msg.longitude)
+            # checkpoint_controller_node streams a carrot that advances a few
+            # cm per tick; only a new leg or a replan moves it by meters. Reset
+            # on those jumps only: resetting on every carrot step would leave
+            # the PID with no integral or derivative at all, and a new target
+            # needs the goal-turn direction latched afresh.
+            jumped = (self.goal_lat is None or ground_distance_m(
+                self.goal_lat, self.goal_lon, msg.latitude, msg.longitude) > GOAL_RESET_DISTANCE_M)
             self.goal_lat = msg.latitude
             self.goal_lon = msg.longitude
-            # A new waypoint steps the bearing error, which would otherwise
-            # show up as a derivative kick and carry the previous waypoint's
-            # integral into a leg it has nothing to do with.
-            if changed:
+            if jumped:
                 self.heading_pid.reset()
-        self.get_logger().info(f"Goal GPS updated: lat={msg.latitude}, lon={msg.longitude}")
+                self.goal_turn.reset()
+        if jumped:
+            self.get_logger().info(f"New goal: lat={msg.latitude}, lon={msg.longitude}")
 
     def goal_compass_callback(self, msg: Float32):
         with self.lock:
@@ -605,6 +692,7 @@ class OmniVLAEdgeNode(Node):
             # the integral from before the stop would kick on the first tick.
             if was_enabled != msg.data:
                 self.heading_pid.reset()
+                self.goal_turn.reset()
                 self._last_tick_time = None
         self.get_logger().info(f"enable_inference set to {msg.data}")
 
@@ -760,6 +848,10 @@ class OmniVLAEdgeNode(Node):
         delta_x, delta_y = self.calculate_relative_position(cur_utm[0], cur_utm[1], goal_utm[0], goal_utm[1])
         relative_x, relative_y = self.rotate_to_local_frame(delta_x, delta_y, cur_compass)
         radius = np.sqrt(relative_x ** 2 + relative_y ** 2)
+        # Where the goal really is, from localization alone (forward = +rel_y,
+        # left = -rel_x: the same axes goal_pose_torch hands the model below).
+        # GoalTurn acts on this, since the model's waypoint cannot point behind.
+        goal_bearing = math.atan2(-relative_x, relative_y)
         if radius > THRES_DIST:
             relative_x *= THRES_DIST / radius
             relative_y *= THRES_DIST / radius
@@ -821,6 +913,25 @@ class OmniVLAEdgeNode(Node):
             f"waypoint_select={waypoint_select} all_waypoints_shape={waypoints.shape}"
         )
 
+        # --- Goal behind the rover? (see GoalTurn) ---
+        # Decided before the controller runs, so the PID is neither stepped
+        # during the turn nor handed its pre-turn history on the tick it ends.
+        gp = self.get_parameter
+        was_turning = self.goal_turn.active
+        if use_pose_goal:
+            turning = self.goal_turn.update(
+                goal_bearing, float(radius),
+                enabled=gp("goal_turn.enabled").value,
+                enter_deg=gp("goal_turn.enter_deg").value,
+                exit_deg=gp("goal_turn.exit_deg").value,
+                min_distance_m=gp("goal_turn.min_distance_m").value)
+        else:
+            self.goal_turn.reset()
+            turning = False
+        if was_turning and not turning:
+            self.heading_pid.reset()
+            self._last_tick_time = None
+
         # --- Controller -> (linear, angular) ---
         controller_type = self.get_parameter("controller_type").value
         if controller_type != self._last_controller_type:
@@ -832,10 +943,17 @@ class OmniVLAEdgeNode(Node):
             self.get_logger().info(f"Motion controller: {controller_type}")
             self._last_controller_type = controller_type
 
-        if controller_type == "polar":
+        if turning:
+            mode = "goal-turn"
+            linear_cmd = float(np.clip(gp("goal_turn.linear_vel").value, 0.0, max_linear))
+            angular_cmd = self.goal_turn.direction * min(abs(gp("goal_turn.angular_vel").value), max_angular)
+            detail = "controller bypassed"
+        elif controller_type == "polar":
+            mode = controller_type
             linear_cmd, angular_cmd, detail = self._polar_command(
                 dx, dy, hx, hy, max_linear, max_angular)
         elif controller_type == "pid":
+            mode = controller_type
             linear_cmd, angular_cmd, detail = self._pid_command(
                 dx, dy, hx, hy, waypoint_select, max_linear, max_angular)
         else:
@@ -845,8 +963,8 @@ class OmniVLAEdgeNode(Node):
             raise ValueError(f"unknown controller_type {controller_type!r}")
 
         debug_msg = (
-            f"[{controller_type}] {detail} | "
-            f"linear_cmd={linear_cmd:.4f} angular_cmd={angular_cmd:.4f} | "
+            f"[{mode}] goal_bearing={math.degrees(goal_bearing):+.1f}deg goal_dist={radius:.2f}m | "
+            f"{detail} | linear_cmd={linear_cmd:.4f} angular_cmd={angular_cmd:.4f} | "
             f"modality={modality_id} lan_prompt='{lan_inst}'"
         )
         self.get_logger().info(debug_msg)

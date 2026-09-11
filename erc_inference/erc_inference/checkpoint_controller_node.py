@@ -17,18 +17,30 @@ guess or separately latch a UTM zone/origin: GenerateCostmap's response
 carries utm_crs/origin_utm_x/origin_utm_y and those are passed straight
 through to PlanPath.
 
-The planned path is reduced to waypoints by line-of-sight shortcutting against
-the same costmap it was planned over, so every straight segment the controller
-actually drives is guaranteed free of lethal cells. It used to keep 10 evenly
-indexed poses regardless of path length, which silently undid the planning:
-replaying that indexing over real A* output put 27-47 lethal cells back under
-the straight lines between waypoints in three separate test scenarios (see
-erc_static_map/test/test_waypoint_subsampling.py).
+The planned path is reduced to a route by line-of-sight shortcutting against
+the same costmap it was planned over, so every straight segment of the route is
+guaranteed free of lethal cells (keeping 10 evenly indexed poses instead put
+27-47 lethal cells back under the segments in three test scenarios -- see
+test/test_waypoint_reduction.py).
+
+The route is driven with a carrot: a goal kept a fixed distance ahead of the
+rover's projection onto the route and re-published several times a second,
+rather than a few waypoints each held until the rover enters a proximity
+radius. Two things measured on mission_10sept forced that:
+- The model reads the goal as a displacement and was trained on goals 0-6 s
+  ahead (p50 1.6 m, p99 5.2 m). Waypoints up to 15 m apart, released at 8 m,
+  put the goal 9-20 m away on 100% of ticks.
+- Shrinking spacing and radius does not fix that: the rover ran 3-6 m off the
+  route, so a small radius is never entered and the goal falls behind (one
+  waypoint switch in the whole run at 3 m / 1.5 m). A carrot has no "reached"
+  state to miss; replayed on the same trajectory it kept the goal inside the
+  training range on 76% of ticks at 1.5 m ahead.
 """
 
 import json
 import math
 import threading
+import time
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
 
@@ -58,9 +70,10 @@ LETHAL_COST = 100
 
 
 # The goal and modality topics carry LATCHED STATE, not events: "the goal is
-# here", "read the pose token, ignore the satellite one". They are published
-# once per waypoint, so with the default volatile QoS an inference node that
-# starts (or restarts) between waypoints receives nothing and silently falls
+# here", "read the pose token, ignore the satellite one". The goal is
+# re-published several times a second but the modality flags only once per
+# leg, so with the default volatile QoS an inference node that starts (or
+# restarts) mid-leg receives no modality and silently falls
 # back to its own defaults -- which select modality 0 (satellite), where the
 # model masks the GPS goal out entirely. The rover then drives on visual habit
 # with no goal and nothing reports it.
@@ -79,6 +92,73 @@ LATCHED_QOS = QoSProfile(
 )
 
 
+# How far past the rover's last route projection the next one may be found.
+# A route that doubles back close to itself would otherwise let the
+# projection jump onto its later stretch and skip everything in between.
+PROJECTION_WINDOW_M = 10.0
+_METERS_PER_DEG_LAT = math.radians(1.0) * 6378137.0
+
+
+def latlon_to_local(frame, lat, lon):
+    lat0, lon0, k_east, k_north = frame
+    return (lon - lon0) * k_east, (lat - lat0) * k_north
+
+
+def local_to_latlon(frame, east, north):
+    lat0, lon0, k_east, k_north = frame
+    return lat0 + north / k_north, lon0 + east / k_east
+
+
+def route_to_local(route):
+    """[(lat, lon), ...] -> (frame, points (N, 2) east/north m, cumulative arc length).
+
+    Equirectangular about the first point: over one leg (tens of meters) its
+    error is millimetric, and it needs no UTM zone.
+    """
+    lat0, lon0 = route[0]
+    frame = (lat0, lon0, _METERS_PER_DEG_LAT * math.cos(math.radians(lat0)), _METERS_PER_DEG_LAT)
+    pts = np.array([latlon_to_local(frame, lat, lon) for lat, lon in route], dtype=float)
+    cum = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(pts, axis=0).T))])
+    return frame, pts, cum
+
+
+def project_forward(pts, cum, east, north, s_min, window_m=PROJECTION_WINDOW_M):
+    """Arc length of the route point closest to (east, north), never below s_min.
+
+    Only segments overlapping [s_min, s_min + window_m] are searched, and the
+    result never moves backward: the carrot has to keep leading the rover.
+    """
+    best_s, best_d = s_min, math.inf
+    for i in range(len(pts) - 1):
+        if cum[i + 1] < s_min:
+            continue
+        if cum[i] > s_min + window_m:
+            break
+        a = pts[i]
+        ab = pts[i + 1] - a
+        seg2 = float(ab @ ab)
+        t = 0.0 if seg2 == 0.0 else min(1.0, max(0.0, ((east - a[0]) * ab[0] + (north - a[1]) * ab[1]) / seg2))
+        d = math.hypot(east - (a[0] + t * ab[0]), north - (a[1] + t * ab[1]))
+        if d < best_d:
+            best_d, best_s = d, cum[i] + t * math.sqrt(seg2)
+    return max(s_min, best_s)
+
+
+def point_at(pts, cum, s):
+    """(east, north, route bearing in degrees, 0 = North, clockwise) at arc length s.
+
+    s is clamped to the route, so a carrot running off the end sits on the
+    final point and keeps the last segment's bearing.
+    """
+    s = min(max(s, 0.0), float(cum[-1]))
+    i = int(min(max(np.searchsorted(cum, s, side='right') - 1, 0), len(pts) - 2))
+    a, b = pts[i], pts[i + 1]
+    seg = cum[i + 1] - cum[i]
+    t = 0.0 if seg <= 0.0 else (s - cum[i]) / seg
+    bearing = math.degrees(math.atan2(b[0] - a[0], b[1] - a[1])) % 360.0
+    return float(a[0] + t * (b[0] - a[0])), float(a[1] + t * (b[1] - a[1])), bearing
+
+
 @dataclass(frozen=True)
 class Checkpoint:
     checkpoint_id: int
@@ -94,7 +174,11 @@ class CheckpointControllerNode(Node):
 
         self.declare_parameter('checkpoint_list_url', 'http://localhost:8000/checkpoints-list')
         self.declare_parameter('checkpoint_reached_url', 'http://localhost:8000/checkpoint-reached')
-        self.declare_parameter('gps_topic', '/erc/gps')
+        # Position for leg starts, carrot projection and arrival: the EKF-filtered
+        # fix (navsat_transform, 10 Hz) rather than the raw SDK fix, which
+        # refreshes every ~1.3 s in 0.4 m steps. Needs erc_localization's
+        # localization_global.launch.py running.
+        self.declare_parameter('gps_topic', '/erc/gps/filtered')
         self.declare_parameter('model_cmd_vel_topic', '/omnivla/cmd_vel')
         self.declare_parameter('cmd_vel_topic', '/cmd_vel')
         self.declare_parameter('goal_gps_topic', '/goal_gps')
@@ -104,7 +188,21 @@ class CheckpointControllerNode(Node):
         self.declare_parameter('use_image_goal_topic', '/use_image_goal')
         self.declare_parameter('use_lan_prompt_topic', '/use_lan_prompt')
         self.declare_parameter('enable_inference_topic', '/enable_inference')
-        self.declare_parameter('proximity_threshold_m', 8.0)
+        # Arrival radius for a checkpoint. The SDK decides for itself whether a
+        # checkpoint counts -- its radius is not documented anywhere in this
+        # repo -- and the old 8 m had the rover declare arrival at 7.7 m on
+        # mission_10sept. After a rejection the radius halves, down to
+        # min_checkpoint_proximity_m, so the rover closes in instead of
+        # re-posting from the same spot.
+        self.declare_parameter('checkpoint_proximity_m', 3.0)
+        self.declare_parameter('min_checkpoint_proximity_m', 1.0)
+        # How far ahead along the route the carrot sits, and how often it is
+        # re-published. 1.5 m kept the goal inside the model's training range
+        # (<= 5.2 m) on 76% of mission_10sept's ticks (2.0 m: 71%, 3.0 m: 60%);
+        # the goal distance is sqrt(lookahead^2 + cross-track^2), so it is never
+        # shorter than this. 3 Hz matches the inference tick.
+        self.declare_parameter('carrot_distance_m', 1.5)
+        self.declare_parameter('carrot_rate_hz', 3.0)
         self.declare_parameter('control_rate_hz', 10.0)
         self.declare_parameter('http_timeout_s', 15.0)
         self.declare_parameter('verification_retry_s', 1.0)
@@ -115,11 +213,10 @@ class CheckpointControllerNode(Node):
         # blocking the mission indefinitely on one leg's map.
         self.declare_parameter('costmap_service_timeout_s', 60.0)
         self.declare_parameter('planner_service_timeout_s', 15.0)
-        # Longest straight segment the controller will be asked to drive
-        # between two waypoints. Line-of-sight shortcutting already guarantees
-        # a segment is obstacle-free; this cap is about not committing to a
-        # long straight run while GPS error accumulates, and about giving the
-        # controller a steady cadence of goals on open ground.
+        # Longest straight segment of a route. Line-of-sight shortcutting
+        # already guarantees each segment is obstacle-free; the cap bounds the
+        # shortcut search and how long a single straight run can get. It no
+        # longer sets how far away the goal is -- the carrot does.
         self.declare_parameter('max_waypoint_spacing_m', 15.0)
 
         self._lock = threading.RLock()
@@ -206,20 +303,28 @@ class CheckpointControllerNode(Node):
         self._use_image_pub.publish(Bool(data=False))
         self._use_lan_pub.publish(Bool(data=False))
 
-    def _publish_goal(self, checkpoint: Checkpoint):
+    def _publish_carrot(self, lat: float, lon: float, bearing_deg: float):
         goal = NavSatFix()
-        goal.latitude = checkpoint.latitude
-        goal.longitude = checkpoint.longitude
+        goal.latitude = lat
+        goal.longitude = lon
         self._goal_gps_pub.publish(goal)
+        # The heading the rover should have at the carrot: the route's own
+        # direction there, in the SDK compass convention (0 = North,
+        # clockwise-positive) that /erc/heading_deg uses. The model reads it as
+        # cos/sin(goal - current heading); in its training data that difference
+        # was within 20 deg for 88% of samples, because it was the heading the
+        # robot really had on arrival. The constant 0.0 sent before meant
+        # "arrive facing north" on every leg and so fed the model the rover's
+        # absolute heading instead.
+        self._goal_compass_pub.publish(Float32(data=float(bearing_deg)))
 
-        self._goal_compass_pub.publish(Float32(data=0.0))
+    def _start_motion(self, sequence: int):
         self._publish_modality()
         self._enable_pub.publish(Bool(data=True))
-
         with self._lock:
             self._motion_allowed = True
             self._stop_requested = False
-            self._current_sequence = checkpoint.sequence
+            self._current_sequence = sequence
 
     def _request_stop(self):
         with self._lock:
@@ -243,37 +348,6 @@ class CheckpointControllerNode(Node):
     def _publish_zero(self):
         self._cmd_pub.publish(Twist())
 
-    @staticmethod
-    def _distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-        # Equirectangular approximation is accurate enough for a 5 m gate.
-        earth_radius_m = 6378137.0
-        lat0 = (lat1 + lat2) * 0.5
-        d_lat = (lat2 - lat1) * 0.017453292519943295
-        d_lon = (lon2 - lon1) * 0.017453292519943295
-        north = d_lat * earth_radius_m
-        east = d_lon * earth_radius_m * math.cos(lat0 * 0.017453292519943295)
-        return (north * north + east * east) ** 0.5
-
-    def _distance_to(self, checkpoint: Checkpoint) -> float:
-        with self._lock:
-            if self._current_lat is None or self._current_lon is None:
-                return float('inf')
-            return self._distance_m(
-                self._current_lat,
-                self._current_lon,
-                checkpoint.latitude,
-                checkpoint.longitude,
-            )
-
-    @staticmethod
-    def _interpolate_gps(lat1: float, lon1: float, lat2: float, lon2: float, fraction: float):
-        """Interpolate along the geodesic path from (lat1, lon1) to (lat2, lon2).
-        fraction: 0.0 = start, 1.0 = end. Uses equirectangular approximation."""
-        return (
-            lat1 + (lat2 - lat1) * fraction,
-            lon1 + (lon2 - lon1) * fraction,
-        )
-
     def _call_service_sync(self, client, request, timeout_s: float):
         """Call a service and block the calling thread until it completes or
         times out. _execute_callback runs on a MultiThreadedExecutor worker
@@ -293,17 +367,19 @@ class CheckpointControllerNode(Node):
             self.get_logger().warn(f'Service call raised: {e}')
             return None
 
-    def _generate_waypoints(self, start_lat: float, start_lon: float, target_lat: float, target_lon: float) -> list:
-        """Generate GPS waypoints for one leg (start -> target).
+    def _generate_route(self, start_lat: float, start_lon: float,
+                        target_lat: float, target_lon: float) -> List[Tuple[float, float]]:
+        """Route for one leg (start -> target) as [(lat, lon), ...], start included.
 
         Calls erc_static_map/generate_costmap for this leg's own A (start)
         and B (target), then erc_static_map/plan_path with the response --
         passing utm_crs/origin_utm straight through, so this node never
         guesses or separately derives either one (see module docstring).
-        Falls back to linear GPS interpolation if either service is
+        Falls back to the straight line start -> target if either service is
         unavailable, times out, or fails, or if planning finds no path.
         """
         log = self.get_logger()
+        straight = [(start_lat, start_lon), (target_lat, target_lon)]
 
         costmap_req = GenerateCostmap.Request()
         costmap_req.origin_lat = start_lat
@@ -315,11 +391,11 @@ class CheckpointControllerNode(Node):
             self._costmap_client, costmap_req, float(self._param('costmap_service_timeout_s'))
         )
         if costmap_resp is None:
-            log.warn('generate_costmap service unavailable or timed out; using linear interpolation')
-            return self._linear_waypoints(start_lat, start_lon, target_lat, target_lon)
+            log.warn('generate_costmap service unavailable or timed out; driving a straight line')
+            return straight
         if not costmap_resp.success:
-            log.warn(f'generate_costmap failed ({costmap_resp.message}); using linear interpolation')
-            return self._linear_waypoints(start_lat, start_lon, target_lat, target_lon)
+            log.warn(f'generate_costmap failed ({costmap_resp.message}); driving a straight line')
+            return straight
 
         plan_req = PlanPath.Request()
         plan_req.origin_lat = start_lat
@@ -335,21 +411,18 @@ class CheckpointControllerNode(Node):
             self._planner_client, plan_req, float(self._param('planner_service_timeout_s'))
         )
         if plan_resp is None:
-            log.warn('plan_path service unavailable or timed out; using linear interpolation')
-            return self._linear_waypoints(start_lat, start_lon, target_lat, target_lon)
+            log.warn('plan_path service unavailable or timed out; driving a straight line')
+            return straight
         if not plan_resp.success or len(plan_resp.path.poses) < 2:
-            log.warn(f'plan_path failed ({plan_resp.message}); using linear interpolation')
-            return self._linear_waypoints(start_lat, start_lon, target_lat, target_lon)
+            log.warn(f'plan_path failed ({plan_resp.message}); driving a straight line')
+            return straight
 
-        waypoints = self._path_to_waypoints(
+        route = self._path_to_route(
             plan_resp.path, costmap_resp.utm_crs,
             (costmap_resp.origin_utm_x, costmap_resp.origin_utm_y),
             costmap=costmap_resp.costmap,
         )
-        if waypoints:
-            log.info(f'Generated {len(waypoints)} A* waypoints to avoid obstacles')
-            return waypoints
-        return self._linear_waypoints(start_lat, start_lon, target_lat, target_lon)
+        return route if len(route) >= 2 else straight
 
     @staticmethod
     def _grid_occupancy(grid):
@@ -432,15 +505,16 @@ class CheckpointControllerNode(Node):
             out.append(points[-1])
         return out
 
-    def _path_to_waypoints(self, path, utm_crs: str, origin_utm: Tuple[float, float],
-                            costmap=None) -> List[Tuple[float, float]]:
-        """Reduce a planned Path to GPS waypoints, preserving obstacle avoidance.
+    def _path_to_route(self, path, utm_crs: str, origin_utm: Tuple[float, float],
+                       costmap=None) -> List[Tuple[float, float]]:
+        """Reduce a planned Path to a GPS route, preserving obstacle avoidance.
 
         utm_crs / origin_utm are the SAME values erc_static_map_node used to
         build the costmap this path was planned over (passed straight
-        through from the GenerateCostmap response -- see _generate_waypoints),
+        through from the GenerateCostmap response -- see _generate_route),
         so this is a direct inverse of that node's local-ENU -> UTM -> GPS
-        chain rather than a guess.
+        chain rather than a guess. The first point, where the rover stood when
+        the leg was planned, is kept: the carrot needs the first segment.
         """
         import pyproj
 
@@ -454,35 +528,23 @@ class CheckpointControllerNode(Node):
         if costmap is not None:
             kept = self._shortcut_path(points, costmap, max_spacing)
             self.get_logger().info(
-                f'Path reduced {len(points)} -> {len(kept)} waypoints by line-of-sight '
+                f'Path reduced {len(points)} -> {len(kept)} route points by line-of-sight '
                 f'shortcutting (max spacing {max_spacing:.0f} m)')
         else:
             kept = self._resample_by_distance(points, max_spacing)
             self.get_logger().warn(
-                f'No costmap available to verify waypoint segments; falling back to '
-                f'distance resampling ({len(points)} -> {len(kept)} waypoints). Straight '
+                f'No costmap available to verify route segments; falling back to '
+                f'distance resampling ({len(points)} -> {len(kept)} points). Straight '
                 f'lines between these are NOT checked against obstacles.')
 
         origin_x, origin_y = origin_utm
         transformer = pyproj.Transformer.from_crs(utm_crs, "EPSG:4326", always_xy=True)
 
-        waypoints = []
-        for x, y in kept[1:]:          # drop the first: it is where the rover already is
+        route = []
+        for x, y in kept:
             lon, lat = transformer.transform(x + origin_x, y + origin_y)
-            waypoints.append((lat, lon))
-        return waypoints
-
-    def _linear_waypoints(self, start_lat: float, start_lon: float, target_lat: float, target_lon: float) -> list:
-        """Fallback: 10 GPS waypoints at even fractions of the straight-line
-        geodesic (equirectangular approximation) from start to target."""
-        waypoints = []
-        for i in range(1, 11):
-            fraction = i / 10.0
-            lat, lon = self._interpolate_gps(
-                start_lat, start_lon, target_lat, target_lon, fraction
-            )
-            waypoints.append((lat, lon))
-        return waypoints
+            route.append((lat, lon))
+        return route
 
     def _fetch_checkpoints(self):
         response = requests.post(
@@ -512,16 +574,50 @@ class CheckpointControllerNode(Node):
             payload = {}
         return response.status_code, payload
 
-    def _wait_for_checkpoint(self, goal_handle, checkpoint: Checkpoint):
-        threshold = float(self._param('proximity_threshold_m'))
+    def _follow_route(self, goal_handle, checkpoint: Checkpoint, route, arrival_threshold_m: float) -> bool:
+        """Drive `route` by streaming a carrot to the inference node.
+
+        The carrot is the route point carrot_distance_m of arc length ahead of
+        the rover's projection onto the route, and its heading is the route's
+        own direction there. Returns True once the rover is within
+        arrival_threshold_m of the checkpoint, False if the mission is canceled.
+        """
+        frame, pts, cum = route_to_local(route)
+        goal_e, goal_n = latlon_to_local(frame, checkpoint.latitude, checkpoint.longitude)
+        lookahead = float(self._param('carrot_distance_m'))
+        period = 1.0 / float(self._param('carrot_rate_hz'))
+        total = float(cum[-1])
+        s_proj = 0.0
+        started = False
+        last_publish = 0.0
+        reported_quarter = 0
         with self._gps_condition:
             while not goal_handle.is_cancel_requested:
-                distance = self._distance_to(checkpoint)
-                self._current_distance_m = distance
-                if distance <= threshold:
-                    return True
-                self._publish_feedback(goal_handle, checkpoint.sequence, distance, 'navigating')
-                self._gps_condition.wait(timeout=0.5)
+                if self._current_lat is not None and self._current_lon is not None:
+                    east, north = latlon_to_local(frame, self._current_lat, self._current_lon)
+                    remaining = math.hypot(goal_e - east, goal_n - north)
+                    self._current_distance_m = remaining
+                    if remaining <= arrival_threshold_m:
+                        return True
+                    s_proj = project_forward(pts, cum, east, north, s_proj)
+                    now = time.monotonic()
+                    if now - last_publish >= period:
+                        last_publish = now
+                        carrot_e, carrot_n, carrot_bearing = point_at(pts, cum, s_proj + lookahead)
+                        self._publish_carrot(*local_to_latlon(frame, carrot_e, carrot_n), carrot_bearing)
+                        if not started:
+                            # Only once a goal is out: the inference node will
+                            # not drive a pose goal it has not received.
+                            self._start_motion(checkpoint.sequence)
+                            started = True
+                        self._publish_feedback(goal_handle, checkpoint.sequence, remaining, 'navigating')
+                    quarter = int(4 * s_proj / total) if total > 0.0 else 0
+                    if quarter > reported_quarter:
+                        reported_quarter = quarter
+                        self.get_logger().info(
+                            f'  {100 * s_proj / total:.0f}% of the route ({s_proj:.1f}/{total:.1f} m), '
+                            f'{remaining:.1f} m to the checkpoint')
+                self._gps_condition.wait(timeout=period)
         return False
 
     def _publish_feedback(self, goal_handle, sequence: int, distance: float, state: str):
@@ -572,6 +668,8 @@ class CheckpointControllerNode(Node):
                 self._motion_allowed = False
                 self._stop_requested = True
 
+            arrival_for_sequence = None
+            arrival_threshold_m = float(self._param('checkpoint_proximity_m'))
             while checkpoint_index < len(checkpoints):
                 if goal_handle.is_cancel_requested:
                     goal_handle.canceled()
@@ -583,54 +681,42 @@ class CheckpointControllerNode(Node):
                     start_lat = self._current_lat if self._current_lat is not None else checkpoint.latitude
                     start_lon = self._current_lon if self._current_lon is not None else checkpoint.longitude
                 
-                waypoints = self._generate_waypoints(start_lat, start_lon, checkpoint.latitude, checkpoint.longitude)
+                if arrival_for_sequence != checkpoint.sequence:
+                    arrival_for_sequence = checkpoint.sequence
+                    arrival_threshold_m = float(self._param('checkpoint_proximity_m'))
+
+                route = self._generate_route(start_lat, start_lon, checkpoint.latitude, checkpoint.longitude)
                 self.get_logger().info(
                     f'Navigating to checkpoint sequence {checkpoint.sequence} '
-                    f'({checkpoint.latitude:.8f}, {checkpoint.longitude:.8f}) via {len(waypoints)} waypoints.'
+                    f'({checkpoint.latitude:.8f}, {checkpoint.longitude:.8f}) along a {len(route)}-point '
+                    f'route, carrot {float(self._param("carrot_distance_m")):.1f} m ahead, '
+                    f'arrival within {arrival_threshold_m:.1f} m.'
                 )
+                if not self._follow_route(goal_handle, checkpoint, route, arrival_threshold_m):
+                    goal_handle.canceled()
+                    result.message = 'Mission canceled.'
+                    return result
 
-                # Navigate through each waypoint
-                for waypoint_idx, (wp_lat, wp_lon) in enumerate(waypoints):
-                    if goal_handle.is_cancel_requested:
-                        goal_handle.canceled()
-                        result.message = 'Mission canceled.'
-                        return result
-
-                    # Create temporary checkpoint for waypoint
-                    waypoint = Checkpoint(
-                        checkpoint_id=checkpoint.checkpoint_id,
-                        sequence=checkpoint.sequence,
-                        latitude=wp_lat,
-                        longitude=wp_lon,
-                    )
-                    # Scale by the actual count: A* returns a variable number of
-                    # waypoints (1, 3 and 2 across the three legs of
-                    # mission9sept), so the old fixed *10 was only right back
-                    # when _linear_waypoints always produced exactly 10 -- it
-                    # logged a 3-waypoint leg as reaching 10%, 20%, 30%.
-                    progress = int((waypoint_idx + 1) * 100 / len(waypoints))
-                    
-                    self._publish_goal(waypoint)
-                    if waypoint_idx == 0:
-                        self.get_logger().info(f'  Waypoint {progress}%: lat={wp_lat:.8f}, lon={wp_lon:.8f}')
-                    
-                    if not self._wait_for_checkpoint(goal_handle, waypoint):
-                        goal_handle.canceled()
-                        result.message = 'Mission canceled.'
-                        return result
-                    
-                    if waypoint_idx < len(waypoints) - 1:
-                        self.get_logger().info(f'  Reached {progress}%, moving to next waypoint')
-
-                # We've reached the final waypoint (checkpoint itself)
                 self._request_stop()
-                self._publish_feedback(goal_handle, checkpoint.sequence, 0.0, 'confirming_checkpoint')
+                self._publish_feedback(goal_handle, checkpoint.sequence, self._current_distance_m,
+                                       'confirming_checkpoint')
+                self.get_logger().info(
+                    f'Within {arrival_threshold_m:.1f} m of checkpoint {checkpoint.sequence} '
+                    f'({self._current_distance_m:.1f} m); asking the SDK to confirm.')
                 reached, mission_completed, payload = self._verification_loop(goal_handle, checkpoint)
                 if not reached:
                     if goal_handle.is_cancel_requested:
                         goal_handle.canceled()
                         result.message = 'Mission canceled.'
                         return result
+                    # Rejected, so the SDK's radius is tighter than ours. The
+                    # rover is already inside our radius, so re-approaching with
+                    # it would re-post from the same spot forever: close in first.
+                    tighter = max(float(self._param('min_checkpoint_proximity_m')), 0.5 * arrival_threshold_m)
+                    self.get_logger().warn(
+                        f'Checkpoint {checkpoint.sequence} rejected at {self._current_distance_m:.1f} m; '
+                        f'approaching again until within {tighter:.1f} m.')
+                    arrival_threshold_m = tighter
                     continue
 
                 result.last_checkpoint_sequence = checkpoint.sequence
