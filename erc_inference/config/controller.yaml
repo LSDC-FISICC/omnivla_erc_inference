@@ -1,0 +1,52 @@
+# Motion controller for omnivla_edge_node: turns the model's selected
+# waypoint into /cmd_vel.
+#
+# scripts/omni_vla_wrapper loads this file by default. Every value can also be
+# changed while the rover drives, e.g.
+#   ros2 param set /omnivla_edge_node controller_type pid
+#   ros2 param set /omnivla_edge_node polar.k_alpha 1.2
+#
+# Write every float with a decimal point: ROS 2 rejects `60` for a parameter
+# declared as 60.0 ("wrong parameter type").
+
+/**:
+  ros__parameters:
+    # "polar" -- Siegwart's polar-coordinate controller. Steers on the bearing
+    #            to the waypoint AND on the heading the model predicts there.
+    # "pid"   -- heading PID on the bearing to the waypoint only.
+    controller_type: polar
+
+    # Hard limits, applied by both controllers. Together they set the tightest
+    # turn the rover can be commanded to make, whatever the gains:
+    #   radius = max_linear_vel / max_angular_vel = 1.0 m at these values.
+    # If turns are still too wide once the controller is saturating, it is
+    # this ratio that has to change, not the gains.
+    max_linear_vel: 0.3
+    max_angular_vel: 0.3
+
+    polar:
+      # Siegwart's stability conditions (the node warns if violated):
+      #   k_rho > 0,  k_beta < 0,  k_alpha - k_rho > 0
+      # and, so the rover never reverses its direction of travel on the way:
+      #   k_alpha + (5/3) k_beta - (2/pi) k_rho > 0
+      # These defaults give 0.18 on the last one.
+      k_rho: 0.5
+      k_alpha: 1.5
+      # Negative: swings the approach so the rover arrives on the heading the
+      # model predicted for the waypoint. Set 0.0 for pure bearing tracking.
+      k_beta: -0.6
+      # The camera faces forward and the model was trained driving forward;
+      # leave this off unless you have a reason.
+      backward_allowed: false
+      use_constant_vel: false
+      constant_vel: 0.1
+
+    pid:
+      kp: 0.4
+      ki: 0.03
+      kd: 0.10
+      integral_limit: 0.67
+      derivative_alpha: 0.4
+      turn_slowdown_start_deg: 60.0
+      turn_slowdown_end_deg: 120.0
+      turn_speed_floor: 0.4

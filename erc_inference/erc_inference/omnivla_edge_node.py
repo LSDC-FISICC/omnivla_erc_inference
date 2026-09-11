@@ -63,6 +63,7 @@ from PIL import Image as PILImage
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rcl_interfaces.msg import SetParametersResult
 from sensor_msgs.msg import Image, NavSatFix
 from std_msgs.msg import Float32, String, Bool, Int32
 from geometry_msgs.msg import Twist
@@ -118,7 +119,7 @@ class HeadingPID:
     run asked for more than max_angular_vel, which made the output effectively
     three-valued -- hard left, hard right, straight. The default kp of 0.4
     instead saturates at ~43 deg, leaving a real proportional band. See the
-    pid_kp parameter for how the gains were chosen.
+    pid.kp parameter for how the gains were chosen.
 
     Anti-windup matters more than usual here: the rover does not always execute
     what it is told (the ratio of achieved to commanded yaw rate measured 0.98
@@ -200,6 +201,85 @@ class HeadingPID:
                 float(derivative))
 
 
+CONTROLLER_TYPES = ("polar", "pid")
+
+
+def polar_control(dx, dy, hx, hy, k_rho, k_alpha, k_beta, max_linear, max_angular,
+                  backward_allowed=False, use_constant_vel=False, constant_vel=0.1):
+    """Siegwart's polar-coordinate controller, applied to one predicted waypoint.
+
+    Siegwart & Nourbakhsh, "Introduction to Autonomous Mobile Robots", 3.6.2.
+    Everything is in the robot frame the model predicts in: the robot sits at
+    the origin with heading 0, and the goal pose is the selected waypoint --
+    position (dx, dy) and heading atan2(hy, hx). LogoNav is trained with
+    learn_angle=True, so the model predicts where the rover should be
+    pointing at that waypoint as well as where it should be; this is the
+    controller that uses that half of the prediction.
+
+        rho   = distance to the waypoint
+        alpha = bearing of the waypoint relative to the robot's heading
+        beta  = heading the model wants at the waypoint, minus that bearing
+        v     = k_rho * rho
+        w     = k_alpha * alpha + k_beta * beta
+
+    Deliberate differences from a straight port of the usual implementation:
+    - w is clipped symmetrically to +-max_angular. Clipping only the upper
+      side leaves every right turn unbounded.
+    - v is clipped to max_linear; k_rho * rho has no bound of its own.
+    - beta is wrapped to [-pi, pi] like alpha.
+    - Driving backward redefines the robot's forward axis (alpha += pi,
+      v < 0), which is Siegwart's construction. Choosing the sign of w by
+      comparing the goal bearing with the goal heading never actually
+      reverses the rover.
+    - No "goal reached, stop" latch. The waypoint is re-predicted every tick
+      ~1.5 s ahead of the rover, so rho does not approach zero in normal
+      driving, and arrival is decided by checkpoint_controller_node against
+      GPS; a latch here would stop the rover and fight that decision.
+
+    Returns (v, w, rho, alpha, beta), angles in rad.
+    """
+    rho = float(math.hypot(dx, dy))
+    goal_heading = math.atan2(hy, hx)
+    if rho < 1e-6:
+        # The model predicts no displacement: turn in place toward the heading
+        # it predicts. alpha is undefined at rho = 0, and with k_beta < 0 the
+        # beta term alone would turn AWAY from that heading.
+        w = float(np.clip(k_alpha * goal_heading, -max_angular, max_angular))
+        return 0.0, w, 0.0, 0.0, goal_heading
+
+    bearing = math.atan2(dy, dx)
+    alpha = clip_angle(bearing)
+    beta = clip_angle(goal_heading - bearing)
+
+    direction = 1.0
+    if backward_allowed and abs(alpha) > math.pi / 2:
+        direction = -1.0
+        alpha = clip_angle(alpha + math.pi)
+
+    speed = constant_vel if use_constant_vel else k_rho * rho
+    v_min = -max_linear if backward_allowed else 0.0
+    v = float(np.clip(direction * speed, v_min, max_linear))
+    w = float(np.clip(k_alpha * alpha + k_beta * beta, -max_angular, max_angular))
+    return v, w, rho, alpha, beta
+
+
+def polar_gain_warnings(k_rho, k_alpha, k_beta):
+    """Siegwart's stability conditions for polar_control, as warning strings."""
+    warnings = []
+    if k_rho <= 0.0:
+        warnings.append(f"k_rho={k_rho} must be > 0")
+    if k_beta >= 0.0:
+        warnings.append(f"k_beta={k_beta} should be < 0 "
+                        "(0 is valid if you only want bearing tracking)")
+    if k_alpha - k_rho <= 0.0:
+        warnings.append(f"k_alpha - k_rho = {k_alpha - k_rho:.3f} must be > 0")
+    strong = k_alpha + (5.0 / 3.0) * k_beta - (2.0 / math.pi) * k_rho
+    if strong <= 0.0:
+        warnings.append(f"k_alpha + 5/3*k_beta - 2/pi*k_rho = {strong:.3f} <= 0: "
+                        "the rover may reverse its direction of travel mid-approach")
+    return warnings
+
+
 class OmniVLAEdgeNode(Node):
     def __init__(self):
         super().__init__("omnivla_edge_node")
@@ -241,6 +321,11 @@ class OmniVLAEdgeNode(Node):
         self.declare_parameter("max_linear_vel", 0.3)
         self.declare_parameter("max_angular_vel", 0.3)
 
+        # Which law turns the selected waypoint into /cmd_vel: "polar" or
+        # "pid". Normally set from config/controller.yaml; can be switched
+        # live, and _on_set_parameters rejects anything else.
+        self.declare_parameter("controller_type", "polar")
+
         # --- Heading PID (see HeadingPID) -----------------------------------
         # kp 0.4 puts the angular command at the 0.3 rad/s limit for a bearing
         # error of ~43 deg, against 5.73 deg under the old arctan/DT law: the
@@ -269,13 +354,13 @@ class OmniVLAEdgeNode(Node):
         # told, and a large integral winds up against a deficit it cannot fix.
         # Set ki to 0 if the rover still weaves on real terrain -- that costs
         # steady-state bias rejection but cannot ring.
-        self.declare_parameter("pid_kp", 0.4)
-        self.declare_parameter("pid_ki", 0.03)
-        self.declare_parameter("pid_kd", 0.10)
+        self.declare_parameter("pid.kp", 0.4)
+        self.declare_parameter("pid.ki", 0.03)
+        self.declare_parameter("pid.kd", 0.10)
         # Cap on the integral STATE (rad*s). At ki=0.03 this bounds the
         # integral's contribution to ~0.02 rad/s.
-        self.declare_parameter("pid_integral_limit", 0.67)
-        self.declare_parameter("pid_derivative_alpha", 0.4)
+        self.declare_parameter("pid.integral_limit", 0.67)
+        self.declare_parameter("pid.derivative_alpha", 0.4)
 
         # --- Linear speed shaping -------------------------------------------
         # Deliberately gentle. Measured on mission9sept: the achieved/commanded
@@ -285,9 +370,23 @@ class OmniVLAEdgeNode(Node):
         # then it stayed saturated, which slowed it further. Speed is therefore
         # only reduced once the goal is far enough off-axis that driving
         # forward stops closing the distance at all (past 90 deg it opens it).
-        self.declare_parameter("turn_slowdown_start_deg", 60.0)
-        self.declare_parameter("turn_slowdown_end_deg", 120.0)
-        self.declare_parameter("turn_speed_floor", 0.4)
+        self.declare_parameter("pid.turn_slowdown_start_deg", 60.0)
+        self.declare_parameter("pid.turn_slowdown_end_deg", 120.0)
+        self.declare_parameter("pid.turn_speed_floor", 0.4)
+
+        # --- Polar controller (see polar_control) ---------------------------
+        # k_alpha 1.5 against pid.kp 0.4 is the point of this controller: the
+        # PID's robustness-first gain commands 0.21 rad/s at a 30 deg bearing
+        # (a ~1.4 m turn at 0.3 m/s) and 0.10 at 15 deg (~2.9 m). The bearing
+        # term alone here reaches max_angular_vel from 11.5 deg onward.
+        # All four of Siegwart's stability conditions hold for these values;
+        # polar_gain_warnings checks them at startup and on every change.
+        self.declare_parameter("polar.k_rho", 0.5)
+        self.declare_parameter("polar.k_alpha", 1.5)
+        self.declare_parameter("polar.k_beta", -0.6)
+        self.declare_parameter("polar.backward_allowed", False)
+        self.declare_parameter("polar.use_constant_vel", False)
+        self.declare_parameter("polar.constant_vel", 0.1)
 
         # ---------------------------------------------------------
         # Topic names for the goal / inference request. The VALUES
@@ -371,13 +470,24 @@ class OmniVLAEdgeNode(Node):
         self.enable_inference = True
 
         self.heading_pid = HeadingPID(
-            kp=self.get_parameter("pid_kp").value,
-            ki=self.get_parameter("pid_ki").value,
-            kd=self.get_parameter("pid_kd").value,
+            kp=self.get_parameter("pid.kp").value,
+            ki=self.get_parameter("pid.ki").value,
+            kd=self.get_parameter("pid.kd").value,
             out_limit=self.get_parameter("max_angular_vel").value,
-            integral_limit=self.get_parameter("pid_integral_limit").value,
-            derivative_alpha=self.get_parameter("pid_derivative_alpha").value,
+            integral_limit=self.get_parameter("pid.integral_limit").value,
+            derivative_alpha=self.get_parameter("pid.derivative_alpha").value,
         )
+
+        controller_type = self.get_parameter("controller_type").value
+        if controller_type not in CONTROLLER_TYPES:
+            raise ValueError(f"controller_type must be one of {CONTROLLER_TYPES}, "
+                             f"got {controller_type!r} (check config/controller.yaml)")
+        self._last_controller_type = None
+        for warning in polar_gain_warnings(self.get_parameter("polar.k_rho").value,
+                                           self.get_parameter("polar.k_alpha").value,
+                                           self.get_parameter("polar.k_beta").value):
+            self.get_logger().warn(f"polar gains: {warning}")
+        self.add_on_set_parameters_callback(self._on_set_parameters)
         # Real elapsed time between ticks: the forward pass took 168 ms in
         # profiling and the timer is not guaranteed to fire on schedule, so
         # feeding the PID a nominal 1/tick_rate would misstate both the
@@ -711,7 +821,76 @@ class OmniVLAEdgeNode(Node):
             f"waypoint_select={waypoint_select} all_waypoints_shape={waypoints.shape}"
         )
 
-        # --- PID controller -> (linear, angular) ---
+        # --- Controller -> (linear, angular) ---
+        controller_type = self.get_parameter("controller_type").value
+        if controller_type != self._last_controller_type:
+            # Switching laws mid-drive: the PID's integral and derivative
+            # history describe the other law's commands, and its dt clock has
+            # been idle while polar ran.
+            self.heading_pid.reset()
+            self._last_tick_time = None
+            self.get_logger().info(f"Motion controller: {controller_type}")
+            self._last_controller_type = controller_type
+
+        if controller_type == "polar":
+            linear_cmd, angular_cmd, detail = self._polar_command(
+                dx, dy, hx, hy, max_linear, max_angular)
+        elif controller_type == "pid":
+            linear_cmd, angular_cmd, detail = self._pid_command(
+                dx, dy, hx, hy, waypoint_select, max_linear, max_angular)
+        else:
+            # __init__ refuses to start with this and _on_set_parameters
+            # rejects it live, so reaching here means both were bypassed.
+            # Raising makes timer_callback stop the rover rather than guess.
+            raise ValueError(f"unknown controller_type {controller_type!r}")
+
+        debug_msg = (
+            f"[{controller_type}] {detail} | "
+            f"linear_cmd={linear_cmd:.4f} angular_cmd={angular_cmd:.4f} | "
+            f"modality={modality_id} lan_prompt='{lan_inst}'"
+        )
+        self.get_logger().info(debug_msg)
+        self.debug_pub.publish(String(data=debug_msg))
+
+        return float(linear_cmd), float(angular_cmd)
+
+    def _on_set_parameters(self, params):
+        """Reject an unknown controller_type; warn when polar gains go unstable."""
+        gains = {name: self.get_parameter(name).value
+                 for name in ("polar.k_rho", "polar.k_alpha", "polar.k_beta")}
+        touched_gains = False
+        for param in params:
+            if param.name == "controller_type" and param.value not in CONTROLLER_TYPES:
+                return SetParametersResult(
+                    successful=False,
+                    reason=f"controller_type must be one of {CONTROLLER_TYPES}, got {param.value!r}")
+            if param.name in gains:
+                gains[param.name] = param.value
+                touched_gains = True
+        if touched_gains:
+            for warning in polar_gain_warnings(gains["polar.k_rho"], gains["polar.k_alpha"],
+                                               gains["polar.k_beta"]):
+                self.get_logger().warn(f"polar gains: {warning}")
+        return SetParametersResult(successful=True)
+
+    def _polar_command(self, dx, dy, hx, hy, max_linear, max_angular):
+        gp = self.get_parameter
+        v, w, rho, alpha, beta = polar_control(
+            dx, dy, hx, hy,
+            k_rho=gp("polar.k_rho").value,
+            k_alpha=gp("polar.k_alpha").value,
+            k_beta=gp("polar.k_beta").value,
+            max_linear=max_linear,
+            max_angular=max_angular,
+            backward_allowed=gp("polar.backward_allowed").value,
+            use_constant_vel=gp("polar.use_constant_vel").value,
+            constant_vel=gp("polar.constant_vel").value,
+        )
+        detail = (f"rho={rho:.3f}m alpha={math.degrees(alpha):+.1f}deg "
+                  f"beta={math.degrees(beta):+.1f}deg")
+        return v, w, detail
+
+    def _pid_command(self, dx, dy, hx, hy, waypoint_select, max_linear, max_angular):
         EPS = 1e-8
         maxv = max_linear
 
@@ -719,11 +898,11 @@ class OmniVLAEdgeNode(Node):
         # with `ros2 param set` while the rover drives, which is the only
         # practical way to tune this on real terrain. Cheap next to the
         # forward pass that just ran.
-        self.heading_pid.kp = self.get_parameter("pid_kp").value
-        self.heading_pid.ki = self.get_parameter("pid_ki").value
-        self.heading_pid.kd = self.get_parameter("pid_kd").value
-        self.heading_pid.integral_limit = self.get_parameter("pid_integral_limit").value
-        self.heading_pid.derivative_alpha = self.get_parameter("pid_derivative_alpha").value
+        self.heading_pid.kp = self.get_parameter("pid.kp").value
+        self.heading_pid.ki = self.get_parameter("pid.ki").value
+        self.heading_pid.kd = self.get_parameter("pid.kd").value
+        self.heading_pid.integral_limit = self.get_parameter("pid.integral_limit").value
+        self.heading_pid.derivative_alpha = self.get_parameter("pid.derivative_alpha").value
         self.heading_pid.out_limit = max_angular
 
         # Measured tick period, not the nominal one (see _last_tick_time).
@@ -761,9 +940,9 @@ class OmniVLAEdgeNode(Node):
         # that driving forward no longer closes the distance. Deliberately NOT
         # proportional to the angular command: on this rover, slowing mid-turn
         # measured worse yaw tracking, not better (see turn_slowdown_start_deg).
-        slow_start = math.radians(self.get_parameter("turn_slowdown_start_deg").value)
-        slow_end = math.radians(self.get_parameter("turn_slowdown_end_deg").value)
-        floor = self.get_parameter("turn_speed_floor").value
+        slow_start = math.radians(self.get_parameter("pid.turn_slowdown_start_deg").value)
+        slow_end = math.radians(self.get_parameter("pid.turn_slowdown_end_deg").value)
+        floor = self.get_parameter("pid.turn_speed_floor").value
         abs_err = abs(heading_error)
         if abs_err <= slow_start:
             speed_scale = 1.0
@@ -775,17 +954,12 @@ class OmniVLAEdgeNode(Node):
 
         linear_vel_limit = float(np.clip(linear_vel_value * speed_scale, 0.0, maxv))
 
-        debug_msg = (
+        detail = (
             f"heading_err={math.degrees(heading_error):+.1f}deg dist={distance:.3f}m "
             f"dt={dt:.3f}s | P={p_term:+.4f} I={i_term:+.4f} D={d_term:+.4f} | "
-            f"linear_raw={linear_vel_value:.4f} scale={speed_scale:.2f} | "
-            f"linear_cmd={linear_vel_limit:.4f} angular_cmd={angular_vel_limit:.4f} | "
-            f"modality={modality_id} lan_prompt='{lan_inst}'"
+            f"linear_raw={linear_vel_value:.4f} scale={speed_scale:.2f}"
         )
-        self.get_logger().info(debug_msg)
-        self.debug_pub.publish(String(data=debug_msg))
-
-        return float(linear_vel_limit), float(angular_vel_limit)
+        return linear_vel_limit, angular_vel_limit, detail
 
     def publish_cmd(self, linear: float, angular: float):
         msg = Twist()
