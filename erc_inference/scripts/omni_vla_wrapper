@@ -1,4 +1,42 @@
 #!/usr/bin/env bash
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PACKAGE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+WORKSPACE_ROOT="$(cd "${PACKAGE_ROOT}/../.." && pwd)"
+
+if [ -f /opt/ros/jazzy/setup.bash ]; then
+  source /opt/ros/jazzy/setup.bash
+fi
+
+CONDA_SH=""
+for candidate in \
+  "/opt/conda/etc/profile.d/conda.sh" \
+  "/usr/local/anaconda3/etc/profile.d/conda.sh" \
+  "/home/${USER}/anaconda3/etc/profile.d/conda.sh" \
+  "${HOME}/anaconda3/etc/profile.d/conda.sh" \
+  "${HOME}/miniconda3/etc/profile.d/conda.sh" \
+  "${HOME}/miniforge3/etc/profile.d/conda.sh"; do
+  if [ -f "${candidate}" ]; then
+    CONDA_SH="${candidate}"
+    break
+  fi
+done
+
+if [ -n "${CONDA_SH}" ]; then
+  source "${CONDA_SH}"
+  if command -v conda >/dev/null 2>&1; then
+    conda activate omnivla_py312 >/dev/null 2>&1 || true
+  fi
+fi
+
+if [ -f "${WORKSPACE_ROOT}/install/setup.bash" ]; then
+  source "${WORKSPACE_ROOT}/install/setup.bash"
+fi
+
+export PYTHONPATH="${PYTHONPATH:+${PYTHONPATH}:}${PACKAGE_ROOT}:${WORKSPACE_ROOT}/OmniVLA"
+
+exec python3 -c "from erc_inference.omnivla_edge_node import main; main()" "$@"
 
 source /home/$USER/anaconda3/etc/profile.d/conda.sh
 conda activate omnivla
