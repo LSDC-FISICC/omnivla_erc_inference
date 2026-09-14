@@ -10,10 +10,13 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        ('share/' + package_name + '/launch', ['launch/omnivla_edge.launch.py', 'launch/omnivla_original.launch.py']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    scripts=['scripts/omni_vla_wrapper'], # Instala el ejecutable envuelto
+    scripts=['scripts/omni_vla_wrapper',
+             'scripts/omni_vla_edge_wrapper',
+             'scripts/omni_vla_original_wrapper'], # Instala el ejecutable envuelto
     maintainer='jabes',
     maintainer_email='jabes@todo.todo',
     description='TODO: Package description',
@@ -27,6 +30,7 @@ setup(
         'console_scripts': [
             'omni_vla_edge_node = erc_inference.omni_vla_edge_node:main',
             'omnivla_edge_node = erc_inference.omnivla_edge_node:main',
+            'omnivla_original_node = erc_inference.omnivla_original_node:main',
             'checkpoint_controller_node = erc_inference.checkpoint_controller_node:main',
         ],
     },

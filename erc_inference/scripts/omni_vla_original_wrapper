@@ -36,4 +36,4 @@ fi
 
 export PYTHONPATH="${PYTHONPATH:+${PYTHONPATH}:}${PACKAGE_ROOT}:${WORKSPACE_ROOT}/OmniVLA"
 
-exec python3 -c "from erc_inference.omnivla_edge_node import main; main()" "$@"
+exec python3 -c "from erc_inference.omnivla_original_node import main; main()" "$@"
