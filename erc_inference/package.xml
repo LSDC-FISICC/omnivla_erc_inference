@@ -16,6 +16,7 @@
   <depend>erc_static_map_msgs</depend>
   <exec_depend>python3-requests</exec_depend>
   <exec_depend>python3-pyproj</exec_depend>
+  <exec_depend>python3-utm</exec_depend>
   <!-- launch/mission.launch.py brings these up; nothing here imports them. -->
   <exec_depend>erc_bridge</exec_depend>
   <exec_depend>erc_localization</exec_depend>
@@ -25,6 +26,8 @@
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>
   <test_depend>python3-pytest</test_depend>
+  <test_depend>python3-yaml</test_depend>
+  <test_depend>python3-utm</test_depend>
 
   <export>
     <build_type>ament_python</build_type>

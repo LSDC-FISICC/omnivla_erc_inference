@@ -22,10 +22,12 @@ The inference node expects a model checkpoint and the configured camera, GPS, co
 
 ## Motion controller
 
-`omnivla_edge_node` turns the model's selected waypoint into `/cmd_vel` with one of two control laws, chosen by `controller_type` in [`config/controller.yaml`](config/controller.yaml):
+`omnivla_edge_node` turns localization and the model's selected waypoint into `/omnivla/cmd_vel` with one of two control laws, chosen by `controller_type` in [`config/controller.yaml`](config/controller.yaml). The laws live in [`erc_inference/motion_control.py`](erc_inference/motion_control.py), free of ROS and torch.
 
-- `polar` (default) — Siegwart's polar-coordinate controller. Steers on the bearing to the waypoint (and, with `polar.k_beta` < 0, on the heading the model predicts there).
-- `pid` — heading PID on the bearing to the waypoint only.
+- `polar` (default) — bearing tracking. `polar.steering_source` picks what it steers toward: `carrot` (default, the route goal located by GPS + heading; the model's waypoint is only logged) or `model` (the model's waypoint, as on mission_16sept, where it asked for about a ninth of the turn the route needed). `polar.linear_law` picks the speed: `cruise` (default, 0.3 m/s tapering to `polar.min_linear_vel` on large bearings, never a speed below that floor) or `rho` (Siegwart's `k_rho` × waypoint distance, which fell to 0.05 m/s and left the rover standing on mission_16sept).
+- `pid` — heading PID on the bearing to the model's waypoint only.
+
+`checkpoint_controller_node` then limits acceleration on `/cmd_vel` (`max_linear_accel`, `max_linear_decel`, `max_angular_accel`, `max_angular_decel`); checkpoint stops and cancels stay immediate.
 
 `scripts/omni_vla_wrapper` loads that file automatically (override it with `OMNIVLA_CONTROLLER_CONFIG=/path/to.yaml`). When running the node directly, pass it yourself:
 
@@ -37,14 +39,25 @@ ros2 run erc_inference omnivla_edge_node --ros-args \
 Everything in it can be changed while the rover drives:
 
 ```bash
-ros2 param set /omnivla_edge_node controller_type pid
-ros2 param set /omnivla_edge_node polar.k_alpha 1.2
+ros2 param set /omnivla_edge_node polar.steering_source model
+ros2 param set /omnivla_edge_node polar.min_linear_vel 0.2
 ```
 
-When the goal is more than `goal_turn.enter_deg` behind the rover, the node overrides either controller and turns toward it first (in place by default). It uses the bearing from localization rather than the model, whose waypoint cannot point backward.
+When the goal is more than `goal_turn.enter_deg` behind the rover, the node overrides either controller, stops for `goal_turn.brake_s`, and turns toward it in place. It uses the bearing from localization rather than the model, whose waypoint cannot point backward.
+
+### Checking a controller change
+
+[`test/controller_sim.py`](test/controller_sim.py) drives whole checkpoint missions in closed loop with this package's own control code and `config/controller.yaml`, against a rover model fitted to mission_16sept (delay, gains, breakaway speeds, localization error) and swept over the ranges those numbers are uncertain in. Run it after changing any gain:
+
+```bash
+source /opt/ros/jazzy/setup.bash && source ~/lsdc_ws/install/setup.bash
+cd omnivla_erc_inference/erc_inference
+python3 test/controller_sim.py          # needs utm and PyYAML (the project venv has both)
+python3 -m pytest test/test_motion_control.py test/test_controller_sim.py   # also needs pytest
+```
 
 ## Route following
 
-`checkpoint_controller_node` plans each leg with A\* and drives it with a carrot: a goal `carrot_distance_m` (default 1.5 m) ahead of the rover's projection on the route, re-published at `carrot_rate_hz`, with the route's direction as `/goal_compass`. A checkpoint counts as reached within `checkpoint_proximity_m` (default 3 m); if the SDK rejects it, the radius halves, down to `min_checkpoint_proximity_m`, and the rover closes in.
+`checkpoint_controller_node` plans each leg with A\* and drives it with a carrot: a goal `carrot_distance_m` (default 1.5 m) ahead of the rover's projection on the route, re-published at `carrot_rate_hz`, with the route's direction as `/goal_compass`. A checkpoint counts as reached within `checkpoint_proximity_m` (default 6 m); if the SDK rejects it, the radius halves, down to `min_checkpoint_proximity_m`, and the rover closes in.
 
 Both nodes read position from `/erc/gps/filtered`, so `erc_localization`'s `localization_global.launch.py` must be running.

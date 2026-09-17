@@ -2,7 +2,6 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-erc_inference/test
 erc_inference/__pycache__/
 .pytest_cache/
 .mypy_cache/

@@ -1,68 +1,128 @@
-# Motion controller for omnivla_edge_node: turns the model's selected
-# waypoint into /cmd_vel.
+# Motion controller for omnivla_edge_node: turns localization and the model's
+# selected waypoint into /omnivla/cmd_vel. checkpoint_controller_node then applies
+# acceleration limits (max_linear_accel & co., its own parameters) on the way to
+# /cmd_vel.
 #
-# scripts/omni_vla_wrapper loads this file by default. Every value can also be
+# scripts/omni_vla_wrapper loads this file by default. Defaults live in
+# erc_inference/motion_control.py (DEFAULT_PARAMS); every value can also be
 # changed while the rover drives, e.g.
-#   ros2 param set /omnivla_edge_node controller_type pid
-#   ros2 param set /omnivla_edge_node polar.k_alpha 1.2
+#   ros2 param set /omnivla_edge_node polar.steering_source model
+#   ros2 param set /omnivla_edge_node polar.min_linear_vel 0.2
+#
+# Every change here should be re-run through test/controller_sim.py, which
+# loads this file.
 #
 # Write every float with a decimal point: ROS 2 rejects `60` for a parameter
 # declared as 60.0 ("wrong parameter type").
 
 /**:
   ros__parameters:
-    # "polar" -- Siegwart's polar-coordinate controller. Steers on the bearing
-    #            to the waypoint AND on the heading the model predicts there.
-    # "pid"   -- heading PID on the bearing to the waypoint only.
+    # "polar" -- bearing-tracking controller (see polar.* below).
+    # "pid"   -- heading PID on the bearing to the model's waypoint only.
     controller_type: polar
 
     # Hard limits, applied by both controllers. Together they set the tightest
-    # turn the rover can be commanded to make, whatever the gains:
-    #   radius = max_linear_vel / max_angular_vel = 1.0 m at these values.
-    # If turns are still too wide once the controller is saturating, it is
-    # this ratio that has to change, not the gains.
+    # turn the rover can be commanded to make: radius = linear / angular.
     max_linear_vel: 0.3
     max_angular_vel: 0.3
 
-    # When the goal is behind the rover, turn toward it before handing control
-    # back to the controller. The model cannot request this itself: its
-    # waypoint always points forward (never beyond +-18 deg on mission_10sept),
-    # which is how every return leg so far has driven away from its goal.
+    # When the goal is behind the rover, stop and turn in place toward it before
+    # handing control back. Driven by localization, not by the model.
     goal_turn:
       enabled: true
       enter_deg: 90.0       # engage past this bearing to the goal
-      exit_deg: 30.0        # release under this; the ~1 s actuation lag
-                            # carries the turn most of the rest of the way
-      angular_vel: 0.3      # still capped by max_angular_vel
-      linear_vel: 0.0       # 0 = in place (pure rotation ran at 1.08x of
-                            # command in wuhan4_angular)
+      exit_deg: 45.0        # release under this; the ~1.3 s actuation lag
+                            # carries the turn most of the rest of the way,
+                            # and polar steering finishes it
+      angular_vel: 0.3      # in place this ran at 1.18x of command on
+                            # mission_16sept; lower speeds are untested
+      linear_vel: 0.0       # 0 = in place
       min_distance_m: 1.0   # ignore bearing jitter this close to the goal
+      # Full stop before the spin starts. mission_16sept went from 0.22 m/s
+      # forward to a 0.3 rad/s spin in one tick, pitched 41 deg into that spin
+      # and rolled over shortly after (cause not established).
+      brake_s: 1.0
 
     polar:
-      # Siegwart's stability conditions (the node warns if violated):
-      #   k_rho > 0,  k_beta <= 0,  k_alpha - k_rho > 0
-      # and, so the rover never reverses its direction of travel on the way:
-      #   k_alpha + (5/3) k_beta - (2/pi) k_rho > 0   (1.18 at these values)
+      # What the rover steers toward.
+      #   "carrot" -- the goal checkpoint_controller_node streams along the
+      #               route, located by GPS + heading. The model's waypoint is
+      #               only logged (model_alpha), for comparison.
+      #   "model"  -- the bearing of the model's selected waypoint.
+      # On mission_16sept the model's bearing was 0.117x the bearing to the
+      # carrot (683 ticks, r = 0.60): median 5 deg asked against 36 deg needed on
+      # leg 3. Steering on it left the rover 20-35 deg off the route whole legs
+      # at a time, and nothing short of GoalTurn corrected it.
+      steering_source: carrot
+
+      # How forward speed is chosen.
+      #   "cruise" -- max_linear_vel while the bearing is within
+      #               slowdown_start_deg, tapering to min_linear_vel at
+      #               slowdown_end_deg. Never a speed in (0, min_linear_vel).
+      #   "rho"    -- k_rho x distance to the model's waypoint (Siegwart). On
+      #               mission_16sept this fell to 0.05 m/s whenever the model
+      #               predicted a short waypoint (16% of ticks, runs up to 19 s),
+      #               and the rover stood still: held commands of 0.049-0.065
+      #               m/s never moved it, held 0.3 m/s always did.
+      linear_law: cruise
+      # Must stay above the speed at which the rover starts to move, which is
+      # somewhere between 0.065 and 0.26 m/s and not measured yet: run the
+      # 0.05 -> 0.30 m/s ramp in the field before lowering this.
+      min_linear_vel: 0.25
+      slowdown_start_deg: 30.0
+      slowdown_end_deg: 60.0
+
+      # Steering on the carrot. Chosen with test/controller_sim.py over 5
+      # scenarios x 36 rover models (delay 0.9-1.8 s, moving yaw gain 0.2-1.0,
+      # breakaway 0.1-0.2 m/s, heading bias +-6 deg). k_heading 1.2 weaved
+      # (yaw rate changing sign) 10.6/min at p95; 0.5 with the settings below
+      # 3.3/min, same completion and cross-track (p95 2.05 m).
+      # rad/s per rad of bearing:
+      k_heading: 0.5
+      # No steering inside this bearing: a 0.2 m position error against a
+      # carrot 1.5 m ahead already moves the bearing ~8 deg.
+      heading_deadzone_deg: 6.0
+      # Subtract the turn still in transit (gain x the last delay_s of yaw-rate
+      # commands) from the carrot bearing, so the ~1.3 s delay does not make
+      # the rover keep correcting a turn it has already been told to make.
+      # gain 0 disables it.
+      delay_compensation_s: 1.3
+      delay_compensation_gain: 1.0
+
+      # Siegwart gains, used only with steering_source "model" (k_alpha) and
+      # linear_law "rho" (k_rho). Stability conditions (the node warns if
+      # violated): k_rho > 0, k_beta <= 0, k_alpha - k_rho > 0. k_beta 0 =
+      # bearing tracking only; -0.6 opened the replayed turn radius on
+      # mission_10sept from 2.7 m to 3.2 m.
       k_rho: 0.5
       k_alpha: 1.5
-      # 0 = steer on the bearing to the waypoint only. A negative k_beta swings
-      # the approach so the rover arrives on the heading the model predicted,
-      # but the waypoint is a moving target 1.5 s ahead, not a pose to arrive
-      # at: replayed on mission_10sept, -0.6 opened the commanded turn radius
-      # from 2.7 m to 3.2 m.
       k_beta: 0.0
-      # The camera faces forward and the model was trained driving forward;
-      # leave this off unless you have a reason.
+      # The camera faces forward and the model was trained driving forward.
       backward_allowed: false
-      use_constant_vel: false
-      constant_vel: 0.1
 
     pid:
+      # kp 0.4 puts the angular command at the 0.3 rad/s limit for a bearing
+      # error of ~43 deg, against 5.73 deg under the old arctan/DT law. Picked
+      # for robustness to the loop delay: simulated against a delay +
+      # first-order plant at actuation ratios 0.98 and 0.50, worst-case
+      # overshoot over 30/90/180 deg steps (parenthesis = zero crossings):
+      #
+      #   kp    ki    kd  | delay 0.6s | 0.9s        | 1.2s
+      #   0.5   0.15  0.08|  9.3 (24x) | 13.0 (35x)  | 18.1 (32x)
+      #   0.6   0.03  0.10|  1.6 ( 1x) |  5.4 ( 3x)  | 10.9 ( 5x)
+      #   0.6   0.00  0.10|  0.0 ( 0x) |  4.6 (24x)  | 10.1 (39x)
+      #   0.4   0.03  0.10|  2.4 ( 4x) |  2.5 ( 4x)  |  4.7 ( 4x)  <- chosen
+      #
+      # ki is small on purpose: the rover does not always execute what it is
+      # told, and a large integral winds up against a deficit it cannot fix.
       kp: 0.4
       ki: 0.03
       kd: 0.10
-      integral_limit: 0.67
+      integral_limit: 0.67     # cap on the integral state (rad*s)
       derivative_alpha: 0.4
+      # Speed is only reduced once the goal is far enough off-axis that driving
+      # forward stops closing the distance: on mission9sept slowing mid-turn
+      # measured a worse yaw-rate ratio (0.29) than cruising (0.50-0.98).
       turn_slowdown_start_deg: 60.0
       turn_slowdown_end_deg: 120.0
       turn_speed_floor: 0.4

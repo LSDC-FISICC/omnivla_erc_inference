@@ -21,7 +21,7 @@ The planned path is reduced to a route by line-of-sight shortcutting against
 the same costmap it was planned over, so every straight segment of the route is
 guaranteed free of lethal cells (keeping 10 evenly indexed poses instead put
 27-47 lethal cells back under the segments in three test scenarios -- see
-test/test_waypoint_reduction.py).
+erc_inference/test/test_waypoint_reduction.py).
 
 The route is driven with a carrot: a goal kept a fixed distance ahead of the
 rover's projection onto the route and re-published several times a second,
@@ -58,6 +58,8 @@ from std_msgs.msg import Bool, Float32
 
 from erc_inference_msgs.action import StartMission
 from erc_static_map_msgs.srv import GenerateCostmap, PlanPath
+
+from erc_inference.motion_control import CommandShaper
 
 
 # nav_msgs/OccupancyGrid convention: 0-100 is a probability of occupancy and
@@ -193,8 +195,8 @@ class CheckpointControllerNode(Node):
         # repo -- and the old 8 m had the rover declare arrival at 7.7 m on
         # mission_10sept. After a rejection the radius halves, down to
         # min_checkpoint_proximity_m, so the rover closes in instead of
-        # re-posting from the same spot.
-        self.declare_parameter('checkpoint_proximity_m', 3.0)
+        # re-posting from the same spot: 6 -> 3 -> 1.5 -> 1 m.
+        self.declare_parameter('checkpoint_proximity_m', 6.0)
         self.declare_parameter('min_checkpoint_proximity_m', 1.0)
         # How far ahead along the route the carrot sits, and how often it is
         # re-published. 1.5 m kept the goal inside the model's training range
@@ -204,6 +206,14 @@ class CheckpointControllerNode(Node):
         self.declare_parameter('carrot_distance_m', 1.5)
         self.declare_parameter('carrot_rate_hz', 3.0)
         self.declare_parameter('control_rate_hz', 10.0)
+        # Acceleration limits on what this node writes to /cmd_vel (see
+        # CommandShaper). Chosen in test/controller_sim.py against the measured
+        # 1.3 s actuation delay; 0 disables a limit. Stops requested through
+        # _request_stop and mission cancels bypass them.
+        self.declare_parameter('max_linear_accel', 0.3)
+        self.declare_parameter('max_linear_decel', 0.6)
+        self.declare_parameter('max_angular_accel', 0.6)
+        self.declare_parameter('max_angular_decel', 1.2)
         self.declare_parameter('http_timeout_s', 15.0)
         self.declare_parameter('verification_retry_s', 1.0)
         # Costmap/planner service call tuning. Costmap generation involves a
@@ -229,6 +239,8 @@ class CheckpointControllerNode(Node):
         self._stop_requested = True
         self._current_sequence = 0
         self._current_distance_m = float('inf')
+        self._shaper = CommandShaper(*self._shaper_limits())
+        self._last_output_time = None
 
         self._model_cmd_sub = self.create_subscription(
             Twist, self._param('model_cmd_vel_topic'), self._model_cmd_callback, 10
@@ -282,11 +294,23 @@ class CheckpointControllerNode(Node):
             self._current_lon = msg.longitude
             self._gps_condition.notify_all()
 
+    def _shaper_limits(self):
+        return (float(self._param('max_linear_accel')), float(self._param('max_linear_decel')),
+                float(self._param('max_angular_accel')), float(self._param('max_angular_decel')))
+
     def _publish_output(self):
+        now = time.monotonic()
         with self._lock:
-            output = self._last_model_cmd if (
+            target = self._last_model_cmd if (
                 self._mission_active and self._motion_allowed and not self._stop_requested
             ) else Twist()
+            dt = 0.0 if self._last_output_time is None else now - self._last_output_time
+            self._last_output_time = now
+            self._shaper.configure(*self._shaper_limits())
+            linear, angular = self._shaper.step(target.linear.x, target.angular.z, dt)
+        output = Twist()
+        output.linear.x = linear
+        output.angular.z = angular
         self._cmd_pub.publish(output)
 
     def _publish_modality(self):
@@ -346,6 +370,10 @@ class CheckpointControllerNode(Node):
         self._enable_pub.publish(Bool(data=True))
 
     def _publish_zero(self):
+        # Immediate, not shaped: the next shaped output must start from the zero
+        # the rover was actually sent.
+        with self._lock:
+            self._shaper.reset()
         self._cmd_pub.publish(Twist())
 
     def _call_service_sync(self, client, request, timeout_s: float):
