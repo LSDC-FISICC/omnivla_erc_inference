@@ -17,6 +17,26 @@ import numpy as np
 from PIL import Image as PILImage
 from typing import List, Tuple, Dict, Optional
 
+def imgmsg_to_rgb8(msg) -> np.ndarray:
+    """Decode a sensor_msgs/Image into an HxWx3 uint8 RGB array.
+
+    Avoids cv_bridge: its compiled cv_bridge_boost extension is built
+    against ROS's system numpy (1.x) and segfaults when loaded in a
+    process where torch has already pulled in this venv's numpy 2.x.
+    Only the encodings the camera topics actually publish are supported.
+    """
+    channels = {"rgb8": 3, "bgr8": 3, "mono8": 1}.get(msg.encoding)
+    if channels is None:
+        raise ValueError(f"Unsupported image encoding for imgmsg_to_rgb8: {msg.encoding!r}")
+    rows = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.step)
+    img = rows[:, : msg.width * channels].reshape(msg.height, msg.width, channels)
+    if msg.encoding == "bgr8":
+        img = img[:, :, ::-1]
+    elif msg.encoding == "mono8":
+        img = np.repeat(img, 3, axis=2)
+    return np.ascontiguousarray(img)
+
+
 #model architecture
 from erc_inference.model_omnivla_edge import OmniVLA_edge
 

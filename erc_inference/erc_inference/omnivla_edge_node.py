@@ -67,12 +67,12 @@ from rcl_interfaces.msg import SetParametersResult
 from sensor_msgs.msg import Image, NavSatFix
 from std_msgs.msg import Float32, String, Bool, Int32
 from geometry_msgs.msg import Twist
-from cv_bridge import CvBridge
 
 from erc_inference.utils_policy import (
     transform_images_map,
     load_model,
     transform_images_PIL_mask,
+    imgmsg_to_rgb8,
 )
 
 IMG_SIZE = (96, 96)
@@ -346,7 +346,6 @@ class GoalTurn:
 class OmniVLAEdgeNode(Node):
     def __init__(self):
         super().__init__("omnivla_edge_node")
-        self.bridge = CvBridge()
         self.lock = threading.RLock()
 
         # ---------------------------------------------------------
@@ -611,7 +610,7 @@ class OmniVLAEdgeNode(Node):
     # Sensor callbacks (live robot state)
     # ---------------------------------------------------------
     def image_callback(self, msg: Image):
-        cv_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding="rgb8")
+        cv_img = imgmsg_to_rgb8(msg)
         pil_img = PILImage.fromarray(cv_img)
         with self.lock:
             self.latest_frame_full = pil_img.resize(IMG_SIZE_CLIP)
@@ -631,7 +630,7 @@ class OmniVLAEdgeNode(Node):
     # `ros2 topic pub`)
     # ---------------------------------------------------------
     def goal_image_callback(self, msg: Image):
-        cv_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding="rgb8")
+        cv_img = imgmsg_to_rgb8(msg)
         pil_img = PILImage.fromarray(cv_img).resize(IMG_SIZE)
         with self.lock:
             self.goal_image_pil = pil_img

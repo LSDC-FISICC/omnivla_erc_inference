@@ -30,10 +30,21 @@ if [ -n "${CONDA_SH}" ]; then
   fi
 fi
 
+PYTHON_BIN="python3"
+if ! command -v conda >/dev/null 2>&1; then
+  # No conda on this machine (e.g. the Spark): fall back to the plain venv
+  # that has OmniVLA's deps (torch/transformers) pip-installed. Override
+  # with OMNIVLA_VENV if your venv lives somewhere else.
+  OMNIVLA_VENV="${OMNIVLA_VENV:-${HOME}/lsdc/erc-omni-vla/.venv}"
+  if [ -x "${OMNIVLA_VENV}/bin/python3" ]; then
+    PYTHON_BIN="${OMNIVLA_VENV}/bin/python3"
+  fi
+fi
+
 if [ -f "${WORKSPACE_ROOT}/install/setup.bash" ]; then
   source "${WORKSPACE_ROOT}/install/setup.bash"
 fi
 
 export PYTHONPATH="${PYTHONPATH:+${PYTHONPATH}:}${PACKAGE_ROOT}:${WORKSPACE_ROOT}/OmniVLA"
 
-exec python3 -c "from erc_inference.omnivla_original_node import main; main()" "$@"
+exec "${PYTHON_BIN}" -c "from erc_inference.omnivla_original_node import main; main()" "$@"

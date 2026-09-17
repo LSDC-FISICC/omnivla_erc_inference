@@ -21,10 +21,16 @@ import torch
 import utm
 from PIL import Image as PILImage
 from torch.nn.utils.rnn import pad_sequence
+
+# Must come before `transformers`: clip's import chain is what first pulls in
+# torch._dynamo/triton. Importing transformers first leaves torch._dynamo in
+# a state that segfaults when triton's native extension loads afterwards
+# (reproduced on this Spark's aarch64 + torch 2.13.0+cu130 + triton 3.7.1).
+from erc_inference.utils_policy import imgmsg_to_rgb8
+
 from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
 
 import rclpy
-from cv_bridge import CvBridge
 from geometry_msgs.msg import Twist
 from rclpy.node import Node
 from sensor_msgs.msg import Image, NavSatFix
@@ -65,7 +71,6 @@ def strip_ddp_prefix(state_dict):
 class OmniVLAOriginalNode(Node):
     def __init__(self):
         super().__init__("omnivla_original_node")
-        self.bridge = CvBridge()
         self.lock = threading.RLock()
 
         # Parameters aligned with omnivla_edge_node.py
@@ -247,7 +252,7 @@ class OmniVLAOriginalNode(Node):
         return 0
 
     def image_callback(self, msg: Image):
-        cv_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding="rgb8")
+        cv_img = imgmsg_to_rgb8(msg)
         pil_img = PILImage.fromarray(cv_img)
         with self.lock:
             self.latest_frame_full = pil_img.resize(IMG_SIZE_CLIP)
@@ -263,7 +268,7 @@ class OmniVLAOriginalNode(Node):
             self.current_compass_deg = msg.data
 
     def goal_image_callback(self, msg: Image):
-        cv_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding="rgb8")
+        cv_img = imgmsg_to_rgb8(msg)
         pil_img = PILImage.fromarray(cv_img).resize(IMG_SIZE)
         with self.lock:
             self.goal_image_pil = pil_img
