@@ -47,4 +47,22 @@ fi
 
 export PYTHONPATH="${PYTHONPATH:+${PYTHONPATH}:}${PACKAGE_ROOT}:${WORKSPACE_ROOT}/OmniVLA"
 
-exec "${PYTHON_BIN}" -c "from erc_inference.omnivla_original_node import main; main()" "$@"
+# Motion-controller parameters (controller_type, gains, limits), installed by
+# setup.py -- the same file omni_vla_wrapper feeds the edge node, so both models
+# run the same control law and a comparison isolates the model. Point
+# OMNIVLA_CONTROLLER_CONFIG at another file to replace it, or append
+# `--ros-args -p name:=value` to override single values.
+CONFIG="${OMNIVLA_CONTROLLER_CONFIG:-}"
+if [ -z "$CONFIG" ]; then
+    SHARE=$("${PYTHON_BIN}" -c "from ament_index_python.packages import get_package_share_directory as g; print(g('erc_inference'))") || exit 1
+    CONFIG="$SHARE/config/controller.yaml"
+fi
+if [ ! -f "$CONFIG" ]; then
+    # Fail loudly: starting on the node's built-in defaults would silently
+    # ignore whatever controller the operator thinks they selected.
+    echo "omni_vla_original_wrapper: controller config not found: $CONFIG" >&2
+    echo "  rebuild with colcon so setup.py installs it, or set OMNIVLA_CONTROLLER_CONFIG" >&2
+    exit 1
+fi
+
+exec "${PYTHON_BIN}" -c "from erc_inference.omnivla_original_node import main; main()" --ros-args --params-file "$CONFIG" "$@"

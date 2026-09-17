@@ -32,9 +32,20 @@ from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq,
 
 import rclpy
 from geometry_msgs.msg import Twist
+from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Image, NavSatFix
 from std_msgs.msg import Bool, Float32, Int32, String
+
+from erc_inference.motion_control import (
+    DEFAULT_PARAMS,
+    MotionController,
+    goal_bearing_from_offset,
+    parameter_errors,
+    polar_gain_warnings,
+    robot_frame_offset,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 OMNIVLA_ROOT = PROJECT_ROOT / "OmniVLA"
@@ -52,13 +63,35 @@ from prismatic.vla.constants import ACTION_DIM, NUM_ACTIONS_CHUNK, POSE_DIM
 
 IMG_SIZE = (96, 96)
 IMG_SIZE_CLIP = (224, 224)
-METRIC_WAYPOINT_SPACING = 0.1
+# Scale between the model's goal/waypoint units and meters, same value and same
+# reason as omnivla_edge_node: frodobots_dataset.py:606 normalizes both the
+# goal_pose the model reads and the waypoints it predicts by 0.25. This node
+# used 0.1, which fed goals 2.5x too large and shrank the waypoints 2.5x.
+METRIC_WAYPOINT_SPACING = 0.25
 THRES_DIST = 30.0
+# A goal that moves further than this between two messages is a new target (a
+# new leg, or a replan), not the carrot's normal advance of a few cm per tick.
+GOAL_RESET_DISTANCE_M = 3.0
+
+# The goal and the modality flags are latched state, not events, and
+# checkpoint_controller_node publishes them TRANSIENT_LOCAL. A volatile
+# subscriber here would miss them when this node starts mid-leg and silently
+# drive on the defaults below (modality 0, satellite, no GPS goal). Same
+# profile as omnivla_edge_node and checkpoint_controller_node; all three
+# must agree.
+LATCHED_QOS = QoSProfile(
+    depth=1,
+    history=HistoryPolicy.KEEP_LAST,
+    reliability=ReliabilityPolicy.RELIABLE,
+    durability=DurabilityPolicy.TRANSIENT_LOCAL,
+)
 
 
-def clip_angle(angle: float) -> float:
-    """Wrap an angle (rad) to [-pi, pi]."""
-    return (angle + math.pi) % (2 * math.pi) - math.pi
+def ground_distance_m(lat1, lon1, lat2, lon2):
+    """Equirectangular distance -- ample for telling a carrot step from a new leg."""
+    k = math.radians(1.0) * 6378137.0
+    east = (lon2 - lon1) * k * math.cos(math.radians(0.5 * (lat1 + lat2)))
+    return math.hypot(east, (lat2 - lat1) * k)
 
 
 def strip_ddp_prefix(state_dict):
@@ -74,7 +107,12 @@ class OmniVLAOriginalNode(Node):
         self.lock = threading.RLock()
 
         # Parameters aligned with omnivla_edge_node.py
-        self.declare_parameter("model_checkpoint_path", str(OMNIVLA_ROOT / "omnivla-original"))
+        # runs/omnivla-original--120000_chkpt, NOT OMNIVLA_ROOT/"omnivla-original": same step label,
+        # different weights. This is the checkpoint probe_omnivla.py / probe_swap_lora_head.py
+        # confirmed healthy (std=0.237) before the FrodoBots fine-tune collapsed at 160k+.
+        self.declare_parameter(
+            "model_checkpoint_path", str(OMNIVLA_ROOT / "runs" / "omnivla-original--120000_chkpt")
+        )
         self.declare_parameter("model_checkpoint_step", 120000)
         self.declare_parameter("context_size", 5)
         self.declare_parameter("obs_encoder", "efficientnet-b0")
@@ -90,13 +128,17 @@ class OmniVLAOriginalNode(Node):
         self.declare_parameter("learn_angle", True)
 
         self.declare_parameter("image_topic", "/erc/front_camera")
-        self.declare_parameter("gps_topic", "/erc/gps")
+        # The filtered fix, not raw /erc/gps: it is what checkpoint_controller_node
+        # projects the carrot against, and raw refreshes every ~1.2 s in 0.4 m jumps.
+        self.declare_parameter("gps_topic", "/erc/gps/filtered")
         self.declare_parameter("compass_topic", "/erc/heading_deg")
         self.declare_parameter("cmd_vel_topic", "/omnivla/cmd_vel")
-        self.declare_parameter("tick_rate", 3.0)
-
-        self.declare_parameter("max_linear_vel", 0.3)
-        self.declare_parameter("max_angular_vel", 0.3)
+        # Control parameters (including tick_rate, max_linear_vel, max_angular_vel):
+        # defaults in motion_control.DEFAULT_PARAMS, values and rationale in
+        # config/controller.yaml. Same set the edge node declares, so both models
+        # run the same control law and the comparison isolates the model.
+        for name, default in DEFAULT_PARAMS.items():
+            self.declare_parameter(name, default)
 
         self.declare_parameter("debug_topic", "/omnivla_debug")
         self.declare_parameter("goal_image_topic", "/goal_img")
@@ -130,8 +172,12 @@ class OmniVLAOriginalNode(Node):
         self.current_compass_deg = None
 
         self.goal_image_pil = PILImage.new("RGB", IMG_SIZE, color=(0, 0, 0))
-        self.goal_lat = 0.0
-        self.goal_lon = 0.0
+        # None, not 0.0: (0.0, 0.0) is a real coordinate in the Gulf of Guinea, so a
+        # 0.0 default is indistinguishable from a goal that actually arrived and
+        # would aim the rover at a bearing clamped to THRES_DIST, looking like a
+        # plausible 30 m goal instead of failing loudly.
+        self.goal_lat = None
+        self.goal_lon = None
         self.goal_compass_deg = 0.0
         self.lan_inst_prompt = ""
         self.use_pose_goal = False
@@ -141,6 +187,16 @@ class OmniVLAOriginalNode(Node):
         self.waypoint_select = 4
         self.enable_inference = True
 
+        params = self._control_params()
+        errors = parameter_errors(params)
+        if errors:
+            raise ValueError("; ".join(errors) + " (check config/controller.yaml)")
+        for warning in polar_gain_warnings(params["polar.k_rho"], params["polar.k_alpha"], params["polar.k_beta"]):
+            self.get_logger().warn(f"polar gains: {warning}")
+        self.add_on_set_parameters_callback(self._on_set_parameters)
+        self.controller = MotionController(params)
+        self._last_controller_type = None
+
         self.cmd_vel_pub = self.create_publisher(Twist, self.get_parameter("cmd_vel_topic").value, 10)
         self.debug_pub = self.create_publisher(String, self.get_parameter("debug_topic").value, 10)
 
@@ -149,15 +205,15 @@ class OmniVLAOriginalNode(Node):
         self.create_subscription(Float32, self.get_parameter("compass_topic").value, self.compass_callback, 10)
 
         self.create_subscription(Image, self.get_parameter("goal_image_topic").value, self.goal_image_callback, 10)
-        self.create_subscription(NavSatFix, self.get_parameter("goal_gps_topic").value, self.goal_gps_callback, 10)
-        self.create_subscription(Float32, self.get_parameter("goal_compass_topic").value, self.goal_compass_callback, 10)
+        self.create_subscription(NavSatFix, self.get_parameter("goal_gps_topic").value, self.goal_gps_callback, LATCHED_QOS)
+        self.create_subscription(Float32, self.get_parameter("goal_compass_topic").value, self.goal_compass_callback, LATCHED_QOS)
         self.create_subscription(String, self.get_parameter("lan_prompt_topic").value, self.lan_prompt_callback, 10)
-        self.create_subscription(Bool, self.get_parameter("use_pose_goal_topic").value, self.use_pose_goal_callback, 10)
-        self.create_subscription(Bool, self.get_parameter("use_satellite_topic").value, self.use_satellite_callback, 10)
-        self.create_subscription(Bool, self.get_parameter("use_image_goal_topic").value, self.use_image_goal_callback, 10)
-        self.create_subscription(Bool, self.get_parameter("use_lan_prompt_topic").value, self.use_lan_prompt_callback, 10)
+        self.create_subscription(Bool, self.get_parameter("use_pose_goal_topic").value, self.use_pose_goal_callback, LATCHED_QOS)
+        self.create_subscription(Bool, self.get_parameter("use_satellite_topic").value, self.use_satellite_callback, LATCHED_QOS)
+        self.create_subscription(Bool, self.get_parameter("use_image_goal_topic").value, self.use_image_goal_callback, LATCHED_QOS)
+        self.create_subscription(Bool, self.get_parameter("use_lan_prompt_topic").value, self.use_lan_prompt_callback, LATCHED_QOS)
         self.create_subscription(Int32, self.get_parameter("waypoint_select_topic").value, self.waypoint_select_callback, 10)
-        self.create_subscription(Bool, self.get_parameter("enable_inference_topic").value, self.enable_inference_callback, 10)
+        self.create_subscription(Bool, self.get_parameter("enable_inference_topic").value, self.enable_inference_callback, LATCHED_QOS)
 
         tick_rate = self.get_parameter("tick_rate").value
         self.timer = self.create_timer(1.0 / tick_rate, self.timer_callback)
@@ -199,33 +255,27 @@ class OmniVLAOriginalNode(Node):
         if not os.path.exists(proprio_path):
             proprio_path = os.path.join(model_dir, f"pose_projector--{step}_checkpoint.pt")
 
-        if os.path.exists(action_path):
-            state_dict = torch.load(action_path, map_location=self.device)
+        # Both heads are randomly initialised above. Loading them was previously
+        # best-effort, so a model_checkpoint_step that does not match the files in
+        # model_checkpoint_path left the node driving on random weights without
+        # saying so -- and the two are set independently.
+        for path, module, what in ((action_path, action_head, "action head"),
+                                   (proprio_path, pose_projector, "proprio projector")):
+            if not os.path.exists(path):
+                raise FileNotFoundError(
+                    f"{what} checkpoint not found: {path} -- check that "
+                    f"model_checkpoint_step ({step}) matches model_checkpoint_path ({model_dir})")
+            state_dict = torch.load(path, map_location=self.device)
             if isinstance(state_dict, dict) and "model" in state_dict:
                 state_dict = state_dict["model"]
-            state_dict = strip_ddp_prefix(state_dict)
-            action_head.load_state_dict(state_dict, strict=True)
-            self.get_logger().info(f"Loaded action head checkpoint: {action_path}")
-
-        if os.path.exists(proprio_path):
-            state_dict = torch.load(proprio_path, map_location=self.device)
-            if isinstance(state_dict, dict) and "model" in state_dict:
-                state_dict = state_dict["model"]
-            state_dict = strip_ddp_prefix(state_dict)
-            pose_projector.load_state_dict(state_dict, strict=True)
-            self.get_logger().info(f"Loaded proprio checkpoint: {proprio_path}")
+            module.load_state_dict(strip_ddp_prefix(state_dict), strict=True)
+            self.get_logger().info(f"Loaded {what} checkpoint: {path}")
 
         return vla, action_head, pose_projector, processor
 
     @staticmethod
     def calculate_relative_position(x_a, y_a, x_b, y_b):
         return x_b - x_a, y_b - y_a
-
-    @staticmethod
-    def rotate_to_local_frame(delta_x, delta_y, heading_a_rad):
-        rel_x = delta_x * math.cos(heading_a_rad) + delta_y * math.sin(heading_a_rad)
-        rel_y = -delta_x * math.sin(heading_a_rad) + delta_y * math.cos(heading_a_rad)
-        return rel_x, rel_y
 
     @staticmethod
     def compute_modality_id(pose_goal, satellite, image_goal, lan_prompt):
@@ -276,9 +326,16 @@ class OmniVLAOriginalNode(Node):
 
     def goal_gps_callback(self, msg: NavSatFix):
         with self.lock:
+            # The carrot advances a few cm per tick; only a new leg or a replan
+            # moves it by meters. Reset the controller on those, not on every step.
+            jumped = (self.goal_lat is None or ground_distance_m(
+                self.goal_lat, self.goal_lon, msg.latitude, msg.longitude) > GOAL_RESET_DISTANCE_M)
             self.goal_lat = msg.latitude
             self.goal_lon = msg.longitude
-        self.get_logger().info(f"Goal GPS updated: lat={msg.latitude}, lon={msg.longitude}")
+            if jumped:
+                self.controller.reset()
+        if jumped:
+            self.get_logger().info(f"New goal: lat={msg.latitude}, lon={msg.longitude}")
 
     def goal_compass_callback(self, msg: Float32):
         with self.lock:
@@ -311,25 +368,38 @@ class OmniVLAOriginalNode(Node):
 
     def enable_inference_callback(self, msg: Bool):
         with self.lock:
+            was_enabled = self.enable_inference
             self.enable_inference = msg.data
+            # The rover is stopped while disabled (checkpoint verification, and the
+            # gaps between legs). Resuming with the state from before the stop
+            # would kick on the first tick.
+            if was_enabled != msg.data:
+                self.controller.reset()
         self.get_logger().info(f"enable_inference set to {msg.data}")
 
     def timer_callback(self):
         with self.lock:
+            # A pose goal is only required by the modalities that actually read the
+            # goal_pose token (use_pose_goal); the others have it masked inside the
+            # model, so gating them on a GPS goal would stall them for no reason.
+            have_pose_goal = self.goal_lat is not None and self.goal_lon is not None
             ready = (
                 self.enable_inference
                 and len(self.context_queue) == self.context_size + 1
                 and self.latest_frame_full is not None
                 and self.current_lon is not None
                 and self.current_compass_deg is not None
+                and (have_pose_goal or not self.use_pose_goal)
             )
             if not ready:
                 self.publish_cmd(0.0, 0.0)
+                self.controller.note_idle(self._now_s())
                 if self.enable_inference:
                     self.get_logger().info(
                         f"enable_inference={self.enable_inference}, context_queue={len(self.context_queue)}/{self.context_size + 1}, "
                         f"latest_frame_full={self.latest_frame_full is not None}, current_lat={self.current_lat is not None}, "
-                        f"current_lon={self.current_lon is not None}, current_compass_deg={self.current_compass_deg is not None}"
+                        f"current_lon={self.current_lon is not None}, current_compass_deg={self.current_compass_deg is not None}, "
+                        f"goal_gps={have_pose_goal} (required={self.use_pose_goal})"
                     )
                 return
 
@@ -339,8 +409,11 @@ class OmniVLAOriginalNode(Node):
             current_lon = self.current_lon
             current_compass_deg = self.current_compass_deg
 
-            goal_lat = self.goal_lat
-            goal_lon = self.goal_lon
+            # Reachable with no goal only when use_pose_goal is False, i.e. the model
+            # masks this token anyway. Fall back to the current position so the goal
+            # vector is (0, 0) instead of feeding None into UTM.
+            goal_lat = self.goal_lat if self.goal_lat is not None else self.current_lat
+            goal_lon = self.goal_lon if self.goal_lon is not None else self.current_lon
             goal_compass_deg = self.goal_compass_deg
             lan_inst_prompt = self.lan_inst_prompt
             goal_image_pil = self.goal_image_pil
@@ -351,8 +424,6 @@ class OmniVLAOriginalNode(Node):
             use_lan_prompt = self.use_lan_prompt
 
             waypoint_select = self.waypoint_select
-            max_linear = self.get_parameter("max_linear_vel").value
-            max_angular = self.get_parameter("max_angular_vel").value
 
         try:
             linear_vel, angular_vel = self.run_inference(
@@ -371,12 +442,11 @@ class OmniVLAOriginalNode(Node):
                 use_image_goal,
                 use_lan_prompt,
                 waypoint_select,
-                max_linear,
-                max_angular,
             )
         except Exception as exc:  # pragma: no cover - runtime safety
             self.get_logger().error(f"Inference failed: {exc}")
             self.publish_cmd(0.0, 0.0)
+            self.controller.note_idle(self._now_s())
             return
 
         self.publish_cmd(linear_vel, angular_vel)
@@ -506,8 +576,6 @@ class OmniVLAOriginalNode(Node):
         use_image_goal,
         use_lan_prompt,
         waypoint_select,
-        max_linear,
-        max_angular,
     ):
         cur_utm = utm.from_latlon(current_lat, current_lon)
         cur_compass = -float(current_compass_deg) / 180.0 * math.pi
@@ -516,8 +584,11 @@ class OmniVLAOriginalNode(Node):
         goal_compass = -float(goal_compass_deg) / 180.0 * math.pi
 
         delta_x, delta_y = self.calculate_relative_position(cur_utm[0], cur_utm[1], goal_utm[0], goal_utm[1])
-        relative_x, relative_y = self.rotate_to_local_frame(delta_x, delta_y, cur_compass)
+        relative_x, relative_y = robot_frame_offset(delta_x, delta_y, current_compass_deg)
         radius = np.sqrt(relative_x ** 2 + relative_y ** 2)
+        # Where the goal really is, from localization alone, before the clamp below.
+        # GoalTurn acts on this, since the model's waypoint cannot point behind.
+        goal_bearing = goal_bearing_from_offset(relative_x, relative_y)
         if radius > THRES_DIST:
             relative_x *= THRES_DIST / radius
             relative_y *= THRES_DIST / radius
@@ -587,61 +658,52 @@ class OmniVLAOriginalNode(Node):
             )
 
         waypoints = predicted_actions.float().cpu().numpy()
-        chosen_waypoint = waypoints[0][waypoint_select].copy()
-        chosen_waypoint[:2] *= METRIC_WAYPOINT_SPACING
-        dx, dy, hx, hy = chosen_waypoint
+        chunk = waypoints[0].copy()
+        chunk[:, :2] *= METRIC_WAYPOINT_SPACING
+        dx, dy, hx, hy = chunk[waypoint_select]
 
         self.get_logger().info(
             f"[modality={modality_id_value}] raw_waypoint(dx={dx:.3f}, dy={dy:.3f}, hx={hx:.3f}, hy={hy:.3f}) "
             f"waypoint_select={waypoint_select} all_waypoints_shape={waypoints.shape}"
         )
 
-        EPS = 1e-8
-        DT = 1.0 / self.get_parameter("tick_rate").value
-        if abs(dx) < EPS and abs(dy) < EPS:
-            linear_vel_value = 0.0
-            angular_vel_value = 1.0 * clip_angle(np.arctan2(hy, hx)) / DT
-        elif abs(dx) < EPS:
-            linear_vel_value = 0.0
-            angular_vel_value = 1.0 * np.sign(dy) * np.pi / (2 * DT)
-        else:
-            linear_vel_value = dx / DT
-            angular_vel_value = np.arctan(dy / dx) / DT
-
-        linear_vel_value = np.clip(linear_vel_value, 0, 0.5)
-        angular_vel_value = np.clip(angular_vel_value, -1.0, 1.0)
-
-        maxv, maxw = max_linear, max_angular
-        if abs(linear_vel_value) <= maxv:
-            if abs(angular_vel_value) <= maxw:
-                linear_vel_limit = linear_vel_value
-                angular_vel_limit = angular_vel_value
-            else:
-                rd = linear_vel_value / angular_vel_value
-                linear_vel_limit = maxw * np.sign(linear_vel_value) * abs(rd)
-                angular_vel_limit = maxw * np.sign(angular_vel_value)
-        else:
-            if abs(angular_vel_value) <= 0.001:
-                linear_vel_limit = maxv * np.sign(linear_vel_value)
-                angular_vel_limit = 0.0
-            else:
-                rd = linear_vel_value / angular_vel_value
-                if abs(rd) >= maxv / maxw:
-                    linear_vel_limit = maxv * np.sign(linear_vel_value)
-                    angular_vel_limit = maxv * np.sign(angular_vel_value) / abs(rd)
-                else:
-                    linear_vel_limit = maxw * np.sign(linear_vel_value) * abs(rd)
-                    angular_vel_limit = maxw * np.sign(angular_vel_value)
+        # --- Controller -> (linear, angular) ---
+        params = self._control_params()
+        if params["controller_type"] != self._last_controller_type:
+            self.get_logger().info(f"Motion controller: {params['controller_type']}")
+            self._last_controller_type = params["controller_type"]
+        mode, linear_cmd, angular_cmd, detail = self.controller.command(
+            self._now_s(), params, goal_bearing, float(radius), chunk.tolist(),
+            waypoint_select, use_pose_goal)
 
         debug_msg = (
-            f"linear_raw={linear_vel_value:.4f} angular_raw={angular_vel_value:.4f} | "
-            f"linear_cmd={linear_vel_limit:.4f} angular_cmd={angular_vel_limit:.4f} | "
+            f"[{mode}] goal_bearing={math.degrees(goal_bearing):+.1f}deg goal_dist={radius:.2f}m | "
+            f"{detail} | linear_cmd={linear_cmd:.4f} angular_cmd={angular_cmd:.4f} | "
             f"modality={modality_id_value} lan_prompt='{lan_inst}'"
         )
         self.get_logger().info(debug_msg)
         self.debug_pub.publish(String(data=debug_msg))
 
-        return float(linear_vel_limit), float(angular_vel_limit)
+        return float(linear_cmd), float(angular_cmd)
+
+    def _now_s(self):
+        return self.get_clock().now().nanoseconds * 1e-9
+
+    def _control_params(self, overrides=None):
+        params = {name: self.get_parameter(name).value for name in DEFAULT_PARAMS}
+        params.update(overrides or {})
+        return params
+
+    def _on_set_parameters(self, changes):
+        """Reject parameter sets the controller cannot run; warn on unstable polar gains."""
+        params = self._control_params({p.name: p.value for p in changes if p.name in DEFAULT_PARAMS})
+        errors = parameter_errors(params)
+        if errors:
+            return SetParametersResult(successful=False, reason="; ".join(errors))
+        if any(p.name in ("polar.k_rho", "polar.k_alpha", "polar.k_beta") for p in changes):
+            for warning in polar_gain_warnings(params["polar.k_rho"], params["polar.k_alpha"], params["polar.k_beta"]):
+                self.get_logger().warn(f"polar gains: {warning}")
+        return SetParametersResult(successful=True)
 
     def publish_cmd(self, linear: float, angular: float):
         msg = Twist()
