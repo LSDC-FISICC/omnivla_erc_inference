@@ -39,6 +39,8 @@ def _plants():
         "slow yaw, long delay": replace(cs.RoverModel(), k_w_moving=0.2, delay_s=1.8, v_breakaway=0.2),
         "fast yaw, short delay": replace(cs.RoverModel(), k_w_moving=1.0, delay_s=0.9, heading_bias_deg=-6.0),
         "heading holds": replace(cs.RoverModel(), heading_freeze_every_s=45.0, heading_freeze_s=15.0),
+        # mission_16sept: telemetry 1.16 s old on arrival, the rest of the 1.3 s is actuation.
+        "telemetry lag": replace(cs.RoverModel(), telemetry_latency_s=1.16, delay_s=0.2),
     }
 
 
@@ -73,3 +75,21 @@ def test_deployed_16sept_controller_stalls_in_simulation(node):
                            seed=0, node=module, node_defaults=defaults).stalled_s
                for name in cs.SCENARIOS]
     assert max(stalled) > 5.0
+
+
+def test_plan_passes_the_models_sidesteps_and_carrot_does_not(node):
+    """The plan's authority is the point of steering_source plan: a sidestep the model asks for reaches the rover.
+
+    Judged on the straight route over several seeds: on routes with corners the
+    signed offset jumps between segments and a single run says little.
+    """
+    module, defaults = node
+    plant = replace(cs.RoverModel(), avoid_every_s=25.0, avoid_s=10.0)
+    moved = {}
+    for source in ("plan", "carrot"):
+        moved[source] = sorted(cs.simulate(cs.SCENARIOS["straight"], cs.controller_params({"polar.steering_source": source}),
+                                           plant, seed=seed, node=module, node_defaults=defaults).sidestep_m
+                               for seed in range(6))
+    median = {k: 0.5 * (v[2] + v[3]) for k, v in moved.items()}
+    assert median["plan"] > 0.3
+    assert median["carrot"] < 0.15

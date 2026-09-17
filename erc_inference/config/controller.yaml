@@ -31,29 +31,71 @@
     goal_turn:
       enabled: true
       enter_deg: 90.0       # engage past this bearing to the goal
-      exit_deg: 45.0        # release under this; the ~1.3 s actuation lag
-                            # carries the turn most of the rest of the way,
-                            # and polar steering finishes it
+      exit_deg: 45.0        # release under this; the ~1.3 s between a command
+                            # and its effect in the heading carries the turn
+                            # most of the rest of the way, and polar
+                            # steering finishes it
       angular_vel: 0.3      # in place this ran at 1.18x of command on
                             # mission_16sept; lower speeds are untested
       linear_vel: 0.0       # 0 = in place
       min_distance_m: 1.0   # ignore bearing jitter this close to the goal
       # Full stop before the spin starts. mission_16sept went from 0.22 m/s
-      # forward to a 0.3 rad/s spin in one tick, pitched 41 deg into that spin
-      # and rolled over shortly after (cause not established).
+      # forward to a 0.3 rad/s spin in one tick. That spin turned the rover to
+      # face a raised planter missing from OSM; it drove over the curb and
+      # rolled (docs/Mission16sept.md section 2). GoalTurn turns toward the carrot
+      # whatever is there.
       brake_s: 1.0
 
     polar:
       # What the rover steers toward.
-      #   "carrot" -- the goal checkpoint_controller_node streams along the
-      #               route, located by GPS + heading. The model's waypoint is
-      #               only logged (model_alpha), for comparison.
-      #   "model"  -- the bearing of the model's selected waypoint.
+      #   "plan"   -- the model is the local planner: the point plan_lookahead_m
+      #               along its predicted path, kept within
+      #               max_plan_deviation_deg of the carrot's bearing. The carrot
+      #               (A* route) bounds where the plan may take the rover.
+      #   "carrot" -- the carrot alone, located by GPS + heading; the model is
+      #               only logged. Same as "plan" with a 0 deg cone.
+      #   "model"  -- the bearing of the model's selected waypoint, unbounded
+      #               (mission_16sept's steering).
       # On mission_16sept the model's bearing was 0.117x the bearing to the
       # carrot (683 ticks, r = 0.60): median 5 deg asked against 36 deg needed on
-      # leg 3. Steering on it left the rover 20-35 deg off the route whole legs
-      # at a time, and nothing short of GoalTurn corrected it.
-      steering_source: carrot
+      # leg 3. Steering on it kept the rover pointed 20-35 deg away from the
+      # carrot (median per leg); cross-track to the route stayed 0.6-1.4 m, but
+      # when the carrot swung behind, only GoalTurn corrected it.
+      steering_source: plan
+      # How far along the model's path the plan is aimed (the carrot's own
+      # lookahead), and the shortest path trusted as a plan: the model predicted
+      # paths under 0.3 m on 22% of mission_16sept's ticks, and those leave the
+      # carrot alone in charge.
+      plan_lookahead_m: 1.5
+      plan_min_length_m: 0.3
+      #
+      # What the plan adds to the carrot: its bearing MINUS the share of the
+      # carrot's bearing the model turns by on its own, less a deadzone, capped.
+      #   deviation = clip(shift(plan - plan_bearing_gain x carrot, deadzone), +-cone)
+      # The model's plan turned 0.117x the carrot's bearing (mission_16sept, 683
+      # ticks, r = 0.60, 5 deg noise). Capping the raw plan-carrot difference
+      # instead (gain 1.0) let that underturning through: on those ticks it moved
+      # the bearing 20 deg at the median, always toward straight ahead. The
+      # residual left after removing 0.117x was 3 deg median, 7.9 deg p90, and
+      # crossed the 8 deg deadzone on 9% of ticks.
+      #
+      # test/controller_sim.py, both timing readings, 1440 missions per row,
+      # all complete, stalls p95 <= 0.8 s. "Sidestep": the emulated model veers
+      # 25 deg for 10 s every 25 s; median distance the rover moved that way.
+      #                                  no obstacles           with sidesteps
+      #                                  xtrack p50/p95/max  weave  sidestep  weave
+      #   carrot only                    0.19/1.98/2.7 m   2.6/min  0.09 m  2.6/min
+      #   raw cone 20 (gain 1.0)         0.26/2.27/3.3 m   1.7/min  0.51 m  2.8/min
+      #   residual, deadzone 0, cone 20  0.20/1.99/2.8 m   3.9/min  0.50 m  5.4/min
+      #   residual, deadzone 8, cone 30  0.19/1.99/2.7 m   2.6/min  0.46 m  4.6/min  <- chosen
+      # If the real gain is not 0.117 (swept 0.0-1.0), cross-track stays at
+      # p50 0.19-0.22 m; weave rises to 6.0/min at 1.0, where the model would be
+      # turning fully by itself and the residual double-counts the carrot.
+      # The deadzone is what keeps the model's 5 deg noise from weaving the
+      # rover. At 1.5 m ahead a 30 deg deviation is 0.87 m sideways.
+      plan_bearing_gain: 0.117
+      plan_deviation_deadzone_deg: 8.0
+      max_plan_deviation_deg: 30.0
 
       # How forward speed is chosen.
       #   "cruise" -- max_linear_vel while the bearing is within
@@ -86,6 +128,17 @@
       # commands) from the carrot bearing, so the ~1.3 s delay does not make
       # the rover keep correcting a turn it has already been told to make.
       # gain 0 disables it.
+      #
+      # 1.3 s is the command -> gyro delay measured on bag time, i.e. from a
+      # command leaving this stack to its effect showing up in the telemetry
+      # this node steers on. On mission_16sept that telemetry was already
+      # 1.16 s old on arrival (heading content 1.10 s old at each tick), so the
+      # split is either ~0.2 s actuation + ~1.1 s telemetry delay, or ~1.3 s
+      # actuation behind a rover clock offset -- the bag cannot tell which
+      # (docs/ARQUITECTURA_ACTUAL.md section 8.4 in Earth-rover-ros2-bridge).
+      # The compensation is the same end-to-end quantity either way, and
+      # test/controller_sim.py passes under both splits; without it the yaw
+      # rate changed sign 7.4/min at p95 instead of 2.5/min.
       delay_compensation_s: 1.3
       delay_compensation_gain: 1.0
 

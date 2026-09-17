@@ -18,7 +18,10 @@ What is modelled rather than run, and where each number comes from:
   held 0.049-0.065 m/s never moved, held 0.3 always did; the threshold in between
   is unmeasured, so it is swept).
 - Localization: AR(1) position error 0.2 m / 3 s (EKF p50 0.19 m), heading bias
-  +-6 deg (magnetometer +5.6 deg on mission9sept), 2 deg noise, 0.25 s latency.
+  +-6 deg (magnetometer +5.6 deg on mission9sept), 2 deg noise. Timing under both
+  readings of mission_16sept (RoverModel.telemetry_latency_s): either 0.25 s
+  sensor latency behind 1.3 s of actuation, or heading and speed 0.9-1.4 s old,
+  dead-reckoned to now as ekf_global does, behind 0.1-0.4 s of actuation.
 - The model (ModelEmulator), only needed by steering_source "model" and linear
   law "rho": fitted on mission_16sept's 683 polar ticks -- alpha = 0.117 x carrot
   bearing (r = 0.60), 5 deg noise correlated over ~2 s, and short-waypoint episodes
@@ -115,11 +118,30 @@ class RoverModel:
     position_sigma_m: float = 0.2
     position_tau_s: float = 3.0
     heading_sigma_deg: float = 2.0
+    # Two readings of mission_16sept's timing, which the bag cannot tell apart
+    # (see docs/Mission16sept.md, "Latencias"). IMU, wheel and magnetometer
+    # samples reach the bridge 1.16 s (p50) after their own timestamps, and the
+    # command->gyro delay measured on bag time is ~1.3 s.
+    #   telemetry_latency_s == 0: the timestamps are off by a clock offset; the
+    #     data is only sensor_latency_s old and the 1.3 s is actuation (delay_s).
+    #   telemetry_latency_s > 0: the data really is that old; the estimate is the
+    #     state telemetry_latency_s ago dead-reckoned to now with that stale
+    #     speed and heading (ekf_global with predict_to_current_time and no
+    #     smooth_lagged_data), and delay_s is only the remaining actuation.
     sensor_latency_s: float = 0.25
+    telemetry_latency_s: float = 0.0
     # heading_node holds its last output when the magnetometer drops out
     # (mission_16sept: holds of 5.2 s and 15.2 s). 0 = never.
     heading_freeze_every_s: float = 0.0
     heading_freeze_s: float = 5.0
+    # The emulated model (ModelEmulator): the share of the carrot's bearing its
+    # plan turns by (0.117 fitted on mission_16sept), and optional sidesteps --
+    # every avoid_every_s the plan deviates avoid_deg beyond that for avoid_s,
+    # alternating sides, standing in for going around something. 0 = never.
+    model_bearing_gain: float = 0.117
+    avoid_every_s: float = 0.0
+    avoid_s: float = 6.0
+    avoid_deg: float = 25.0
 
 
 class Rover:
@@ -169,12 +191,17 @@ class Localization:
         if (self.m.heading_freeze_every_s > 0.0 and self._history
                 and t % self.m.heading_freeze_every_s < self.m.heading_freeze_s):
             heading = self._history[-1][3]
-        self._history.append((t, rover.x + self.err[0], rover.y + self.err[1], heading))
-        while len(self._history) > 1 and self._history[1][0] <= t - self.m.sensor_latency_s:
+        self._history.append((t, rover.x + self.err[0], rover.y + self.err[1], heading, rover.v))
+        latency = self.m.telemetry_latency_s if self.m.telemetry_latency_s > 0.0 else self.m.sensor_latency_s
+        while len(self._history) > 1 and self._history[1][0] <= t - latency:
             self._history.popleft()
 
     def estimate(self):
-        _, x, y, theta = self._history[0]
+        _, x, y, theta, v = self._history[0]
+        lag = self.m.telemetry_latency_s
+        if lag > 0.0:
+            x += v * lag * math.cos(theta)
+            y += v * lag * math.sin(theta)
         return x, y, theta
 
 
@@ -182,28 +209,48 @@ class Localization:
 # The model's waypoint
 # ---------------------------------------------------------------------------
 
+def avoid_window(model: RoverModel, t):
+    """Index of the sidestep window t falls in, or None."""
+    if model.avoid_every_s <= 0.0 or t < model.avoid_every_s:
+        return None
+    if t % model.avoid_every_s >= model.avoid_s:
+        return None
+    return int(t // model.avoid_every_s)
+
+
 class ModelEmulator:
-    SLOPE = 0.117
     NOISE_DEG = 5.0
     NOISE_TAU_S = 2.0
     ALPHA_LIMIT_DEG = 25.0
     SHORT_RATE_PER_S = 1.0 / 40.0
     SHORT_MEAN_S = 7.0
 
-    def __init__(self, rng):
+    def __init__(self, rng, model: RoverModel):
         self.rng = rng
+        self.m = model
         self.noise = 0.0
         self.short_until = -1.0
 
-    def waypoint(self, t, dt, carrot_bearing):
+    def chunk(self, t, dt, carrot_bearing):
+        """The model's 8 waypoints: a straight path at the emulated bearing, index 4 at rho.
+
+        Without sidesteps (RoverModel.avoid_every_s = 0) the emulation has no
+        obstacles in it, so it shows what giving the model steering authority costs
+        in tracking, not what it buys in avoidance.
+        """
         a = math.exp(-dt / self.NOISE_TAU_S)
         self.noise = a * self.noise + math.sqrt(1 - a * a) * self.NOISE_DEG * self.rng.standard_normal()
         if t >= self.short_until and self.rng.random() < self.SHORT_RATE_PER_S * dt:
             self.short_until = t + self.rng.exponential(self.SHORT_MEAN_S)
-        alpha = math.radians(float(np.clip(self.SLOPE * math.degrees(carrot_bearing) + self.noise,
-                                           -self.ALPHA_LIMIT_DEG, self.ALPHA_LIMIT_DEG)))
+        alpha_deg = float(np.clip(self.m.model_bearing_gain * math.degrees(carrot_bearing) + self.noise,
+                                  -self.ALPHA_LIMIT_DEG, self.ALPHA_LIMIT_DEG))
+        window = avoid_window(self.m, t)
+        if window is not None:
+            alpha_deg += self.m.avoid_deg if window % 2 == 0 else -self.m.avoid_deg
+        alpha = math.radians(alpha_deg)
         rho = 0.1 if t < self.short_until else float(np.clip(1.4 + 0.15 * self.rng.standard_normal(), 0.3, 1.7))
-        return rho * math.cos(alpha), rho * math.sin(alpha), math.cos(alpha), math.sin(alpha)
+        return [(rho * (i + 1) / 5 * math.cos(alpha), rho * (i + 1) / 5 * math.sin(alpha),
+                 math.cos(alpha), math.sin(alpha)) for i in range(8)]
 
 
 # ---------------------------------------------------------------------------
@@ -267,7 +314,23 @@ class Result:
     max_lateral_accel: float
     goal_turns: int
     arrival_error_max: float
+    # Median over the model's sidestep windows of how far the rover moved toward
+    # the side the model asked for, from where it was when the window opened
+    # (signed distance to the route); nan without sidesteps.
+    sidestep_m: float = float("nan")
     trace: dict = field(default_factory=dict, repr=False)
+
+
+def signed_route_offset(p, segments):
+    """Distance to the closest route segment, positive to the left of travel."""
+    best, signed = math.inf, 0.0
+    for a, b in segments:
+        d = point_segment_distance(p, a, b)
+        if d < best:
+            ab = b - a
+            side = ab[0] * (p[1] - a[1]) - ab[1] * (p[0] - a[0])
+            best, signed = d, math.copysign(d, side) if side != 0.0 else 0.0
+    return signed
 
 
 def point_segment_distance(p, a, b):
@@ -283,7 +346,7 @@ def simulate(scenario: Scenario, params: dict, model: RoverModel, seed: int, rec
     rng = np.random.default_rng(seed)
     rover = Rover(model, *scenario.start)
     loc = Localization(model, rng)
-    emulator = ModelEmulator(rng)
+    emulator = ModelEmulator(rng, model)
     controller = mc.MotionController(params)
     shaper = mc.CommandShaper(cp["max_linear_accel"], cp["max_linear_decel"],
                               cp["max_angular_accel"], cp["max_angular_decel"])
@@ -322,6 +385,7 @@ def simulate(scenario: Scenario, params: dict, model: RoverModel, seed: int, rec
 
     log_t, log_out, log_true, cross, route_segments = [], [], [], [], []
     stop_resets = set()   # output indices that follow an immediate stop
+    sidestep = {}         # sidestep window -> (offset at its start, best progress toward the asked side)
     ticks = []            # (t, leg, mode, carrot bearing, model alpha, linear, angular)
     leg_times = []
     t = 0.0
@@ -394,9 +458,10 @@ def simulate(scenario: Scenario, params: dict, model: RoverModel, seed: int, rec
                 rel_x, rel_y = mc.robot_frame_offset(gl[0] - cur[0], gl[1] - cur[1], heading_deg)
                 bearing = mc.goal_bearing_from_offset(rel_x, rel_y)
                 radius = math.hypot(rel_x, rel_y)
-                waypoint = emulator.waypoint(t, tick_period, bearing)
+                chunk = emulator.chunk(t, tick_period, bearing)
+                waypoint = chunk[4]
                 mode, v, w, _ = controller.command(t + inference_latency, params, bearing, radius,
-                                                   waypoint, 4, True)
+                                                   chunk, 4, True)
                 ticks.append((t, leg_index, mode, bearing, math.atan2(waypoint[1], waypoint[0]), v, w))
                 turning = mode == "goal-turn"
                 goal_turns += int(turning and not was_turning)
@@ -417,7 +482,16 @@ def simulate(scenario: Scenario, params: dict, model: RoverModel, seed: int, rec
             log_true.append((rover.v, rover.w, rover.x, rover.y))
             if phase == "follow" and route_segments:
                 p = np.array([rover.x, rover.y])
-                cross.append(min(point_segment_distance(p, a, b) for a, b in route_segments))
+                d = min(point_segment_distance(p, a, b) for a, b in route_segments)
+                cross.append(d)
+                # Judged on the rover's own motion: the 1.3 s delay lands the
+                # sidestep after its window, so windows extend by 3 s.
+                w = avoid_window(model, t) if avoid_window(model, t) is not None else avoid_window(model, t - 3.0)
+                if w is not None:
+                    side = 1.0 if w % 2 == 0 else -1.0   # matches ModelEmulator: even windows go left
+                    offset = side * signed_route_offset(p, route_segments)
+                    start, best = sidestep.get(w, (offset, 0.0))
+                    sidestep[w] = (start, max(best, offset - start))
 
         rover.step(t, dt)
         t += dt
@@ -459,6 +533,7 @@ def simulate(scenario: Scenario, params: dict, model: RoverModel, seed: int, rec
         max_lateral_accel=float(np.max(np.abs(true_arr[:, 0] * true_arr[:, 1]))),
         goal_turns=goal_turns,
         arrival_error_max=float(max(arrival_errors)) if arrival_errors else float("nan"),
+        sidestep_m=float(np.median([best for _, best in sidestep.values()])) if sidestep else float("nan"),
     )
     if record:
         result.trace = dict(t=T, out=out_arr, true=true_arr, ticks=ticks, leg_times=leg_times)
@@ -481,18 +556,31 @@ AS_DEPLOYED_16SEPT = {
 }
 NO_SHAPING = {"max_linear_accel": 0.0, "max_linear_decel": 0.0, "max_angular_accel": 0.0, "max_angular_decel": 0.0}
 
-SWEEP = {
-    "delay_s": [0.9, 1.3, 1.8],
-    "k_w_moving": [0.2, 0.36, 1.0],
-    "v_breakaway": [0.1, 0.2],
-    "heading_bias_deg": [-6.0, 6.0],
+# One grid per reading of mission_16sept's timing (see RoverModel). Both are
+# swept because the bag cannot say which one is true; results break down by
+# telemetry_latency_s (0.0 = the clock-offset reading).
+SWEEPS = {
+    "clock offset: all 1.3 s is actuation": {
+        "delay_s": [0.9, 1.3, 1.8],
+        "k_w_moving": [0.2, 0.36, 1.0],
+        "v_breakaway": [0.1, 0.2],
+        "heading_bias_deg": [-6.0, 6.0],
+    },
+    "telemetry lag: data 1.16 s old, short actuation": {
+        "telemetry_latency_s": [0.9, 1.16, 1.4],
+        "delay_s": [0.1, 0.2, 0.4],
+        "k_w_moving": [0.2, 0.36, 1.0],
+        "v_breakaway": [0.1, 0.2],
+        "heading_bias_deg": [-6.0, 6.0],
+    },
 }
 
 
 def plant_grid():
-    keys = list(SWEEP)
-    for values in itertools.product(*(SWEEP[k] for k in keys)):
-        yield replace(RoverModel(), **dict(zip(keys, values)))
+    for sweep in SWEEPS.values():
+        keys = list(sweep)
+        for values in itertools.product(*(sweep[k] for k in keys)):
+            yield replace(RoverModel(), **dict(zip(keys, values)))
 
 
 _WORKER = {}
@@ -557,7 +645,8 @@ def main():
         "as deployed 16-sept": (AS_DEPLOYED_16SEPT, NO_SHAPING),
         "16-sept + shaping + brake": ({**AS_DEPLOYED_16SEPT, "goal_turn.brake_s": 1.0}, {}),
         "model steering + cruise": ({"polar.steering_source": "model"}, {}),
-        "carrot steering + cruise (config)": ({}, {}),
+        "carrot steering + cruise": ({"polar.steering_source": "carrot"}, {}),
+        "plan within a cone of the carrot (config)": ({}, {}),
     }
     if args.tune:
         runs = {}
@@ -571,6 +660,7 @@ def main():
         summarize(label, results)
         if not args.tune:
             breakdown(results, "scenario")
+            breakdown(results, "telemetry_latency_s")
             breakdown(results, "v_breakaway")
             breakdown(results, "k_w_moving")
             breakdown(results, "delay_s")

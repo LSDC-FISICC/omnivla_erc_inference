@@ -24,10 +24,17 @@ The inference node expects a model checkpoint and the configured camera, GPS, co
 
 `omnivla_edge_node` turns localization and the model's selected waypoint into `/omnivla/cmd_vel` with one of two control laws, chosen by `controller_type` in [`config/controller.yaml`](config/controller.yaml). The laws live in [`erc_inference/motion_control.py`](erc_inference/motion_control.py), free of ROS and torch.
 
-- `polar` (default) — bearing tracking. `polar.steering_source` picks what it steers toward: `carrot` (default, the route goal located by GPS + heading; the model's waypoint is only logged) or `model` (the model's waypoint, as on mission_16sept, where it asked for about a ninth of the turn the route needed). `polar.linear_law` picks the speed: `cruise` (default, 0.3 m/s tapering to `polar.min_linear_vel` on large bearings, never a speed below that floor) or `rho` (Siegwart's `k_rho` × waypoint distance, which fell to 0.05 m/s and left the rover standing on mission_16sept).
+- `polar` (default) — bearing tracking. `polar.steering_source` picks what it steers toward:
+  - `plan` (default): the model is the local planner, bounded by A*. The rover steers at the carrot plus the plan's *residual*: the bearing of the point `polar.plan_lookahead_m` (1.5 m) along the model's predicted path, minus the share of the carrot's bearing the model turns by on its own (`polar.plan_bearing_gain`, 0.117 on mission_16sept), less a `polar.plan_deviation_deadzone_deg` (8°) deadzone, capped at `polar.max_plan_deviation_deg` (±30°). With nothing to go around, it tracks like the carrot alone; a deviation the model plans beyond its usual underturning reaches the rover. A path shorter than `polar.plan_min_length_m` leaves the carrot alone in charge.
+  - `carrot`: the route goal alone, located by GPS + heading; the model is only logged.
+  - `model`: the model's index-4 waypoint, unbounded — mission_16sept's steering, where the model asked for about a ninth of the turn the route needed.
+
+  `polar.linear_law` picks the speed: `cruise` (default, 0.3 m/s tapering to `polar.min_linear_vel` on large bearings, never a speed below that floor) or `rho` (Siegwart's `k_rho` × waypoint distance, which fell to 0.05 m/s and left the rover standing on mission_16sept).
 - `pid` — heading PID on the bearing to the model's waypoint only.
 
 `checkpoint_controller_node` then limits acceleration on `/cmd_vel` (`max_linear_accel`, `max_linear_decel`, `max_angular_accel`, `max_angular_decel`); checkpoint stops and cancels stay immediate.
+
+**Timing.** The control law runs on the edge node's 3 Hz timer with the latest value of each input; it never waits for a new GPS fix or camera frame. `checkpoint_controller_node` republishes the latest command on `/cmd_vel` at 10 Hz. On `mission_16sept` the inputs behind each tick were old: heading content ~1.10 s, newest GPS fix ~1.04 s, and `/erc/gps/filtered` extrapolated from ~1.1 s-old speed and heading. A command's effect took ~1.3 s to appear in that telemetry. `polar.delay_compensation_s` / `_gain` subtract the turn still in transit over those 1.3 s. The simulator passes with the telemetry delay modelled either as real latency or as a rover clock offset (`RoverModel.telemetry_latency_s`); without the compensation the yaw rate changes sign ~3× as often. Detail: `Earth-rover-ros2-bridge/docs/ARQUITECTURA_ACTUAL.md` §8.4.
 
 `scripts/omni_vla_wrapper` loads that file automatically (override it with `OMNIVLA_CONTROLLER_CONFIG=/path/to.yaml`). When running the node directly, pass it yourself:
 

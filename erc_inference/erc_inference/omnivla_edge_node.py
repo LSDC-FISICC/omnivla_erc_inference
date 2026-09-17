@@ -571,9 +571,9 @@ class OmniVLAEdgeNode(Node):
             )
 
         waypoints = predicted_actions.float().cpu().numpy()
-        chosen_waypoint = waypoints[0][waypoint_select].copy()
-        chosen_waypoint[:2] *= METRIC_WAYPOINT_SPACING
-        dx, dy, hx, hy = chosen_waypoint
+        chunk = waypoints[0].copy()
+        chunk[:, :2] *= METRIC_WAYPOINT_SPACING
+        dx, dy, hx, hy = chunk[waypoint_select]
 
         self.get_logger().info(
             f"[modality={modality_id}] raw_waypoint(dx={dx:.3f}, dy={dy:.3f}, hx={hx:.3f}, hy={hy:.3f}) "
@@ -586,7 +586,7 @@ class OmniVLAEdgeNode(Node):
             self.get_logger().info(f"Motion controller: {params['controller_type']}")
             self._last_controller_type = params["controller_type"]
         mode, linear_cmd, angular_cmd, detail = self.controller.command(
-            self._now_s(), params, goal_bearing, float(radius), (float(dx), float(dy), float(hx), float(hy)),
+            self._now_s(), params, goal_bearing, float(radius), chunk.tolist(),
             waypoint_select, use_pose_goal)
 
         debug_msg = (

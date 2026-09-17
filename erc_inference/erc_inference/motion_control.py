@@ -11,7 +11,7 @@ import numpy as np
 
 
 CONTROLLER_TYPES = ("polar", "pid")
-STEERING_SOURCES = ("carrot", "model")
+STEERING_SOURCES = ("plan", "carrot", "model")
 LINEAR_LAWS = ("cruise", "rho")
 
 
@@ -231,12 +231,39 @@ def steer(bearing, k_heading, max_angular, deadzone_rad):
     return float(np.clip(math.copysign(k_heading * magnitude, bearing), -max_angular, max_angular))
 
 
+def plan_target(waypoints, lookahead_m):
+    """Bearing (rad) of the point lookahead_m along the model's predicted path, and the path length.
+
+    waypoints: the model's chunk as (dx, dy, hx, hy) in meters, robot frame, in time
+    order; the path starts at the robot. A path shorter than lookahead_m uses its
+    last point. Returns (None, length) for a path with no displacement.
+    """
+    x0, y0, walked = 0.0, 0.0, 0.0
+    target = None
+    for dx, dy, _, _ in waypoints:
+        step = math.hypot(dx - x0, dy - y0)
+        if target is None and step > 0.0 and walked + step >= lookahead_m:
+            t = (lookahead_m - walked) / step
+            target = (x0 + t * (dx - x0), y0 + t * (dy - y0))
+        walked += step
+        x0, y0 = dx, dy
+    if target is None:
+        target = (x0, y0)
+    if math.hypot(*target) < 1e-6:
+        return None, walked
+    return math.atan2(target[1], target[0]), walked
+
+
 class DelayCompensator:
     """Heading change still on its way from yaw-rate commands already sent.
 
-    Commands take T_d ~ 1.3 s to act (Tarea B), so a bearing measured now does not
-    yet show the turn the last 1.3 s of commands will produce. Subtracting that
-    turn from the bearing is a Smith predictor reduced to its yaw channel.
+    A command's effect takes T_d ~ 1.3 s (Tarea B, bag time) to appear in the
+    heading this controller reads, so a bearing measured now does not yet show
+    the turn the last 1.3 s of commands will produce. Subtracting that turn from
+    the bearing is a Smith predictor reduced to its yaw channel. Most of those
+    1.3 s may be telemetry age rather than actuation (IMU and magnetometer
+    samples arrived 1.16 s after their stamps on mission_16sept); the
+    correction is the same end-to-end delay either way.
     `gain` is the yaw rate achieved per unit commanded; 0 disables the correction.
     """
 
@@ -280,8 +307,11 @@ class GoalTurn:
 
     brake_s: after engaging, command a full stop for this long before turning.
     On mission_16sept the rover went from 0.22 m/s forward to a 0.3 rad/s spin in
-    one tick, and was pitched 41 deg into that spin two seconds later (cause not
-    established; the step is what this removes).
+    one tick; the step is what this removes.
+
+    The turn is toward the carrot, whatever is there: on mission_16sept it spun
+    the rover to face a raised planter the OSM map does not have, and the rover
+    then drove over its curb and rolled.
     """
 
     def __init__(self):
@@ -375,7 +405,12 @@ DEFAULT_PARAMS = {
     "pid.turn_slowdown_start_deg": 60.0,
     "pid.turn_slowdown_end_deg": 120.0,
     "pid.turn_speed_floor": 0.4,
-    "polar.steering_source": "carrot",
+    "polar.steering_source": "plan",
+    "polar.plan_lookahead_m": 1.5,
+    "polar.plan_min_length_m": 0.3,
+    "polar.plan_bearing_gain": 0.117,
+    "polar.plan_deviation_deadzone_deg": 8.0,
+    "polar.max_plan_deviation_deg": 30.0,
     "polar.linear_law": "cruise",
     "polar.k_rho": 0.5,
     "polar.k_alpha": 1.5,
@@ -412,11 +447,19 @@ def parameter_errors(params):
         errors.append("polar.min_linear_vel must lie in [0, max_linear_vel]")
     if params["polar.slowdown_end_deg"] < params["polar.slowdown_start_deg"]:
         errors.append("polar.slowdown_end_deg must be >= polar.slowdown_start_deg")
+    if params["polar.plan_lookahead_m"] <= 0.0:
+        errors.append("polar.plan_lookahead_m must be > 0")
+    if params["polar.plan_deviation_deadzone_deg"] < 0.0:
+        errors.append("polar.plan_deviation_deadzone_deg must be >= 0")
+    if not 0.0 <= params["polar.plan_bearing_gain"] <= 1.0:
+        errors.append("polar.plan_bearing_gain must lie in [0, 1]")
+    if not 0.0 <= params["polar.max_plan_deviation_deg"] <= 180.0:
+        errors.append("polar.max_plan_deviation_deg must lie in [0, 180]")
     return errors
 
 
 class MotionController:
-    """Turns localization + the model's waypoint into (linear, angular) for one tick."""
+    """Turns localization + the model's predicted path into (linear, angular) for one tick."""
 
     def __init__(self, params):
         self.heading_pid = HeadingPID(
@@ -439,13 +482,16 @@ class MotionController:
         """The node published a stop without running the controller."""
         self.delay_compensator.record(now, 0.0)
 
-    def command(self, now, params, goal_bearing, goal_distance, waypoint, waypoint_select, use_pose_goal):
+    def command(self, now, params, goal_bearing, goal_distance, waypoints, waypoint_select, use_pose_goal):
         """Returns (mode, linear, angular, detail).
 
         goal_bearing (rad, left-positive) and goal_distance (m) locate the goal
         the checkpoint controller streams (the carrot) from localization alone.
-        waypoint is the model's selected (dx, dy, hx, hy) in meters.
+        waypoints is the model's whole chunk, (dx, dy, hx, hy) per row in meters;
+        waypoints[waypoint_select] is the single waypoint the "model" source, the
+        "rho" law and the PID use.
         """
+        waypoint = tuple(waypoints[waypoint_select])
         max_linear = params["max_linear_vel"]
         max_angular = params["max_angular_vel"]
         controller_type = params["controller_type"]
@@ -482,7 +528,8 @@ class MotionController:
                 detail = "controller bypassed"
         elif controller_type == "polar":
             mode = "polar"
-            linear, angular, detail = self._polar(now, params, goal_bearing, waypoint, max_linear, max_angular)
+            linear, angular, detail = self._polar(now, params, goal_bearing, waypoints, waypoint,
+                                                  max_linear, max_angular)
         elif controller_type == "pid":
             mode = "pid"
             linear, angular, detail = self._pid(now, params, waypoint, waypoint_select, max_linear, max_angular)
@@ -492,7 +539,7 @@ class MotionController:
         self.delay_compensator.record(now, angular)
         return mode, float(linear), float(angular), detail
 
-    def _polar(self, now, params, goal_bearing, waypoint, max_linear, max_angular):
+    def _polar(self, now, params, goal_bearing, waypoints, waypoint, max_linear, max_angular):
         dx, dy, hx, hy = waypoint
         source = params["polar.steering_source"]
         if source == "model" and params["polar.linear_law"] == "rho":
@@ -505,10 +552,34 @@ class MotionController:
                           f"beta={math.degrees(beta):+.1f}deg")
 
         model_alpha = math.atan2(dy, dx) if math.hypot(dx, dy) > 1e-6 else math.atan2(hy, hx)
-        if source == "carrot":
+        plan_note = ""
+        if source in ("plan", "carrot"):
             pending = self.delay_compensator.pending_turn(
                 now, params["polar.delay_compensation_s"], params["polar.delay_compensation_gain"])
-            bearing = clip_angle(goal_bearing - pending)
+            deviation = 0.0
+            if source == "plan":
+                # The model plans; the A* carrot bounds it. The model on its own
+                # turns only plan_bearing_gain of the carrot's bearing, so that
+                # expected share is removed first: what is left is what the plan
+                # does beyond its usual underturning (going around something),
+                # and only that is added to the carrot and capped. Taking it
+                # relative to the carrot also lets the delay compensation apply to
+                # both. plan_bearing_gain 1.0 caps the raw plan-carrot difference.
+                plan_bearing, plan_length = plan_target(waypoints, params["polar.plan_lookahead_m"])
+                if plan_bearing is None or plan_length < params["polar.plan_min_length_m"]:
+                    plan_note = f" plan=none(len {plan_length:.2f}m)"
+                else:
+                    expected = params["polar.plan_bearing_gain"] * goal_bearing
+                    raw = clip_angle(plan_bearing - expected)
+                    # The model's bearing wanders ~5 deg around its expected share on
+                    # its own; ignore that much so it does not weave the rover.
+                    dz = math.radians(params["polar.plan_deviation_deadzone_deg"])
+                    shifted = math.copysign(max(0.0, abs(raw) - dz), raw)
+                    cap = math.radians(params["polar.max_plan_deviation_deg"])
+                    deviation = float(np.clip(shifted, -cap, cap))
+                    plan_note = (f" plan={math.degrees(plan_bearing):+.1f}deg expected={math.degrees(expected):+.1f}deg "
+                                 f"dev={math.degrees(raw):+.1f}->{math.degrees(deviation):+.1f}deg")
+            bearing = clip_angle(goal_bearing - pending + deviation)
             k = params["polar.k_heading"]
         else:
             pending = 0.0
@@ -523,7 +594,7 @@ class MotionController:
                                   math.radians(params["polar.slowdown_start_deg"]),
                                   math.radians(params["polar.slowdown_end_deg"]))
         return linear, angular, (f"steer={source} bearing={math.degrees(bearing):+.1f}deg "
-                                 f"pending={math.degrees(pending):+.1f}deg "
+                                 f"pending={math.degrees(pending):+.1f}deg{plan_note} "
                                  f"model_alpha={math.degrees(model_alpha):+.1f}deg rho={math.hypot(dx, dy):.3f}m")
 
     def _pid(self, now, params, waypoint, waypoint_select, max_linear, max_angular):
@@ -580,9 +651,9 @@ class CommandShaper:
 
     On mission_16sept the command stepped from forward motion straight into a
     0.3 rad/s spin, and from that spin straight to 0.3 m/s, each within one
-    tick. The rover had pitched to 41 deg in the first of those spins and rolled
-    over after the second (cause not established). Shaping every command on the
-    way out removes those steps whichever law produced them.
+    tick, just before the rover drove over a planter curb and rolled. Shaping
+    every command on the way out removes those steps whichever law produced
+    them; it does not keep the rover off a curb.
     """
 
     def __init__(self, linear_accel, linear_decel, angular_accel, angular_decel):
