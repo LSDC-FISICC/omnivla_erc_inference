@@ -59,6 +59,7 @@ from prismatic.models.action_heads import L1RegressionActionHead_idcat
 from prismatic.models.backbones.llm.prompting import PurePromptBuilder
 from prismatic.models.projectors import ProprioProjector
 from prismatic.training.train_utils import get_current_action_mask, get_next_actions_mask
+from prismatic.vla.action_tokenizer import ActionTokenizer
 from prismatic.vla.constants import ACTION_DIM, NUM_ACTIONS_CHUNK, POSE_DIM
 
 IMG_SIZE = (96, 96)
@@ -156,8 +157,19 @@ class OmniVLAOriginalNode(Node):
         self.get_logger().info(f"Loading OmniVLA original on {self.device} ...")
         self.vla, self.action_head, self.pose_projector, self.processor = self.load_model()
         self.vla = self.vla.to(self.device).eval()
-        self.action_head = self.action_head.to(self.device).eval()
+        # run_inference casts actions_hidden_states/modality_id to bfloat16 and calls
+        # predict_action() outside the autocast block that covers self.vla(...), so
+        # action_head's own weights must already be bfloat16 -- unlike pose_projector,
+        # which stays float32 because it only runs inside that autocast block. Matches
+        # OmniVLA/inference/run_omnivla.py's init_module(..., to_bf16=True) for action_head.
+        self.action_head = self.action_head.to(self.device).to(torch.bfloat16).eval()
         self.pose_projector = self.pose_projector.to(self.device).eval()
+        # Without this, transform_datatype gets action_tokenizer=None and emits an
+        # empty action_chunk_string, so the prompt's labels never carry the
+        # ACTION_TOKEN_BEGIN_IDX-range tokens get_current_action_mask/
+        # get_next_actions_mask look for -- both masks come back all-False and the
+        # actions_hidden_states reshape collapses to a zero-sized last dim.
+        self.action_tokenizer = ActionTokenizer(self.processor.tokenizer)
         self.context_size = self.get_parameter("context_size").value
         self.num_patches = self.vla.vision_backbone.get_num_patches() * self.vla.vision_backbone.get_num_images_in_input() + 1
         self.get_logger().info("Original OmniVLA model loaded.")
@@ -461,7 +473,7 @@ class OmniVLAOriginalNode(Node):
             current_image_pil,
             goal_image_pil,
             prompt_builder=PurePromptBuilder,
-            action_tokenizer=None,
+            action_tokenizer=self.action_tokenizer,
             base_tokenizer=self.processor.tokenizer,
             image_transform=self.processor.image_processor.apply_transform,
         )

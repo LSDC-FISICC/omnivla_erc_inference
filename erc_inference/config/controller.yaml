@@ -27,6 +27,14 @@
     # ros2 launch does not guarantee is this repo.
     model_checkpoint_path: /home/nvidia-ott/lsdc/erc-omni-vla/OmniVLA/omnivla-edge/omnivla-edge.pth
 
+/omnivla_original_node:
+  ros__parameters:
+    # The node's default resolves relative to this package's own checkout
+    # (PROJECT_ROOT/OmniVLA/runs/...), which here is just an empty placeholder
+    # dir -- the real OmniVLA checkout with the trained runs/ lives in the
+    # separate erc-omni-vla repo instead.
+    model_checkpoint_path: /home/nvidia-ott/lsdc/erc-omni-vla/OmniVLA/runs/omnivla-original--120000_chkpt
+
 /**:
   ros__parameters:
     # "polar" -- bearing-tracking controller (see polar.* below).
