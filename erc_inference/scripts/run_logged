@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Run a ROS node and keep the evidence when it dies.
+#
+# Eight restarts of checkpoint_controller_node are on record with no trace:
+# three in mission_17sept_2, three in W1, two in W2. /rosout shows the node
+# coming back ("Checkpoint controller ready; waiting for start_mission action.")
+# but never shows it going down, because the process dies without logging --
+# consistent with a hard crash rather than an orderly cancellation. The
+# traceback goes to stderr, which nothing was capturing.
+#
+# This wraps any command, timestamps every line of stdout AND stderr into a
+# file, and records how the process ended -- exit code or signal. It does NOT
+# restart anything: the point is to find out why it dies, and an auto-restart
+# would hide the very gap being investigated.
+#
+#   ./run_logged ros2 run erc_inference checkpoint_controller_node
+#   ./run_logged --tag cp3 ros2 run erc_inference checkpoint_controller_node
+#
+# Log lands in ${ERC_LOG_DIR:-~/lsdc/erc-omni-vla/rosbags/logs}.
+set -uo pipefail
+
+TAG=""
+if [ "${1:-}" = "--tag" ]; then TAG="_$2"; shift 2; fi
+if [ $# -eq 0 ]; then echo "usage: $0 [--tag NAME] <command...>" >&2; exit 2; fi
+
+LOG_DIR="${ERC_LOG_DIR:-$HOME/lsdc/erc-omni-vla/rosbags/logs}"
+mkdir -p "$LOG_DIR"
+# last arg is the node name for `ros2 run pkg node`; sanitise it so an
+# inline script does not become the filename
+NAME="$(basename "${!#}" | tr -cs "A-Za-z0-9_.-" "_" | cut -c1-40)"
+LOG="$LOG_DIR/$(date +%Y%m%d_%H%M%S)_${NAME}${TAG}.log"
+
+# unbuffered, or a crash truncates the last and most interesting lines
+export PYTHONUNBUFFERED=1
+
+{
+  echo "=== $(date -Is) START: $* ==="
+  echo "=== host=$(hostname) pwd=$PWD ==="
+} | tee -a "$LOG"
+
+# stderr merged into stdout so tracebacks are interleaved in order, then each
+# line stamped. awk flushes per line; without that the tail is lost on a crash.
+stdbuf -oL -eL "$@" 2>&1 \
+  | stdbuf -oL awk '{ printf "%s %s\n", strftime("%H:%M:%S"), $0; fflush() }' \
+  | tee -a "$LOG"
+
+rc=${PIPESTATUS[0]}
+if [ "$rc" -gt 128 ]; then
+  sig=$((rc - 128))
+  msg="KILLED by signal $sig ($(kill -l "$sig" 2>/dev/null || echo '?'))"
+else
+  msg="exit code $rc"
+fi
+{
+  echo "=== $(date -Is) END: $msg ==="
+  echo "=== log: $LOG ==="
+} | tee -a "$LOG"
+exit "$rc"
