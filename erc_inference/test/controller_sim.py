@@ -104,6 +104,9 @@ def controller_params(overrides=None):
 # Rover and sensors
 # ---------------------------------------------------------------------------
 
+import obstacles as obs
+
+
 @dataclass
 class RoverModel:
     delay_s: float = 1.3
@@ -275,6 +278,10 @@ class Scenario:
     name: str
     start: tuple            # (east, north, heading ENU rad)
     legs: list              # each leg: list of (east, north) route points, the last is the checkpoint
+    # Things the A* route does not know about, because OSM does not have kerbs,
+    # steps or parked bicycles. Empty means the clear-path world every scenario
+    # assumed before obstacle avoidance existed.
+    obstacles: list = field(default_factory=list)
 
 
 def mission_16sept_legs():
@@ -291,6 +298,20 @@ SCENARIOS = {
     # mission_16sept's checkpoints, starting where the bag started (rover facing
     # roughly away from checkpoint 1, as in leg 3 of that bag).
     "mission_16sept": Scenario("mission_16sept", (0.0, 0.0, math.radians(90.0)), mission_16sept_legs()),
+    # --- worlds with things A* cannot see -------------------------------
+    # A kerb across the route with a gap on one side: the 16-sept case, where
+    # OSM showed open plaza and a 15-20 cm granite edge was waiting.
+    "kerb": Scenario("kerb", (0.0, 0.0, 0.0), [[(20.0, 0.0)]],
+                     [obs.Segment((8.0, -3.0), (8.0, 0.55))]),
+    # Something standing in the middle of the route: a post, a bin, another
+    # rover. Either side works, which is where a selector can dither.
+    "post": Scenario("post", (0.0, 0.0, 0.0), [[(20.0, 0.0)]],
+                     [obs.Disc((8.0, 0.0), 0.40)]),
+    # Two offset obstacles: clearing the first points the rover at the second.
+    # This is the one that punishes reacting to only the current frame.
+    "chicane": Scenario("chicane", (0.0, 0.0, 0.0), [[(24.0, 0.0)]],
+                        [obs.Segment((8.0, -3.0), (8.0, 0.55)),
+                         obs.Segment((13.0, -0.55), (13.0, 3.0))]),
 }
 
 
@@ -314,6 +335,10 @@ class Result:
     max_lateral_accel: float
     goal_turns: int
     arrival_error_max: float
+    # With obstacles in the world, not hitting them is a harder
+    # requirement than tracking the route, and a separate one.
+    hit: bool = False
+    min_clearance_m: float = float('inf')
     # Median over the model's sidestep windows of how far the rover moved toward
     # the side the model asked for, from where it was when the window opened
     # (signed distance to the route); nan without sidesteps.
@@ -339,8 +364,38 @@ def point_segment_distance(p, a, b):
     return float(np.hypot(*(p - (a + t * ab))))
 
 
+
+def plan_for_deviation(delta, goal_bearing, params):
+    """A waypoint chunk whose plan yields exactly `delta` of steering deviation.
+
+    The avoidance deviation is pushed through the SAME code path the model's plan
+    uses, so it meets the real deadzone, the real cap and the real delay
+    compensation rather than a reimplementation of them. MotionController
+    computes
+
+        raw       = plan_bearing - plan_bearing_gain * goal_bearing
+        deviation = clip(sign(raw) * max(0, |raw| - deadzone), +-cap)
+
+    so inverting it means adding the deadzone back before handing it over.
+
+    NOTE for the real node: feed the deviation directly instead of through this
+    channel. The 8 deg deadzone was tuned to swallow the model's own ~5 deg of
+    bearing noise; an avoidance command is not noise and should not have to pay
+    it. Compensating here keeps the simulator honest about everything else.
+    """
+    gain = params["polar.plan_bearing_gain"]
+    dz = math.radians(params["polar.plan_deviation_deadzone_deg"])
+    d = float(delta)
+    mag = abs(d) + dz if abs(d) > 1e-6 else 0.0
+    plan_bearing = gain * goal_bearing + math.copysign(mag, d if d else 1.0)
+    # straight path at that bearing, long enough to clear plan_min_length_m
+    step = 0.4
+    return [(step * (i + 1) * math.cos(plan_bearing),
+             step * (i + 1) * math.sin(plan_bearing), 0.0, 0.0) for i in range(8)]
+
+
 def simulate(scenario: Scenario, params: dict, model: RoverModel, seed: int, record=False,
-             dt=0.02, node=None, node_defaults=None):
+             dt=0.02, node=None, node_defaults=None, avoid=None):
     node = node or load_checkpoint_node()
     cp = node_defaults or checkpoint_node_defaults()
     rng = np.random.default_rng(seed)
@@ -382,6 +437,9 @@ def simulate(scenario: Scenario, params: dict, model: RoverModel, seed: int, rec
     out = (0.0, 0.0)
     goal_turns = 0
     was_turning = False
+    hit = False
+    min_clearance = float('inf')
+    world = list(getattr(scenario, 'obstacles', []) or [])
 
     log_t, log_out, log_true, cross, route_segments = [], [], [], [], []
     stop_resets = set()   # output indices that follow an immediate stop
@@ -459,6 +517,12 @@ def simulate(scenario: Scenario, params: dict, model: RoverModel, seed: int, rec
                 bearing = mc.goal_bearing_from_offset(rel_x, rel_y)
                 radius = math.hypot(rel_x, rel_y)
                 chunk = emulator.chunk(t, tick_period, bearing)
+                if avoid is not None and world:
+                    # Perception sees the world from where the rover actually is.
+                    bearings_deg, free, caps = obs.profile(rover.x, rover.y, rover.theta,
+                                                           world, rng)
+                    delta = avoid(bearings_deg, free, bearing, caps)
+                    chunk = plan_for_deviation(delta, bearing, params)
                 waypoint = chunk[4]
                 mode, v, w, _ = controller.command(t + inference_latency, params, bearing, radius,
                                                    chunk, 4, True)
@@ -494,6 +558,12 @@ def simulate(scenario: Scenario, params: dict, model: RoverModel, seed: int, rec
                     sidestep[w] = (start, max(best, offset - start))
 
         rover.step(t, dt)
+        if world:
+            # the rover really is where it is, not where the EKF thinks;
+            # a collision does not care about localisation error
+            c = obs.clearance((rover.x, rover.y), world)
+            min_clearance = min(min_clearance, c)
+            hit = hit or c <= obs.FOOTPRINT_W / 2
         t += dt
 
     completed = leg_index == len(scenario.legs)
@@ -534,6 +604,8 @@ def simulate(scenario: Scenario, params: dict, model: RoverModel, seed: int, rec
         goal_turns=goal_turns,
         arrival_error_max=float(max(arrival_errors)) if arrival_errors else float("nan"),
         sidestep_m=float(np.median([best for _, best in sidestep.values()])) if sidestep else float("nan"),
+        hit=hit,
+        min_clearance_m=min_clearance,
     )
     if record:
         result.trace = dict(t=T, out=out_arr, true=true_arr, ticks=ticks, leg_times=leg_times)
