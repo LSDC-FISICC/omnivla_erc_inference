@@ -395,7 +395,7 @@ def plan_for_deviation(delta, goal_bearing, params):
 
 
 def simulate(scenario: Scenario, params: dict, model: RoverModel, seed: int, record=False,
-             dt=0.02, node=None, node_defaults=None, avoid=None):
+             dt=0.02, node=None, node_defaults=None, avoid=None, stop=None, override=None):
     node = node or load_checkpoint_node()
     cp = node_defaults or checkpoint_node_defaults()
     rng = np.random.default_rng(seed)
@@ -526,6 +526,19 @@ def simulate(scenario: Scenario, params: dict, model: RoverModel, seed: int, rec
                 waypoint = chunk[4]
                 mode, v, w, _ = controller.command(t + inference_latency, params, bearing, radius,
                                                    chunk, 4, True)
+                if override is not None and world:
+                    # erc_inference.sidestep.SideStep: fed estimated heading and
+                    # position, as the node would be; perception from the truth
+                    ob, of, _oc = obs.profile(rover.x, rover.y, rover.theta, world, rng)
+                    v, w, _note, resumed = override.step(t, etheta, (cur[0], cur[1]),
+                                                         ob, of, v, w)
+                    if resumed:
+                        controller.reset()
+                if stop is not None and world and v > 0.0:
+                    # carrot_controller_node's obstacle_stop: brake, never steer
+                    sb, sf, _sc = obs.profile(rover.x, rover.y, rover.theta, world, rng)
+                    if stop(sb, sf):
+                        v, w = 0.0, 0.0
                 ticks.append((t, leg_index, mode, bearing, math.atan2(waypoint[1], waypoint[0]), v, w))
                 turning = mode == "goal-turn"
                 goal_turns += int(turning and not was_turning)

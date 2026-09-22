@@ -10,7 +10,7 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        ('share/' + package_name + '/launch', ['launch/omnivla_edge.launch.py', 'launch/omnivla_original.launch.py', 'launch/mission.launch.py', 'launch/mission_omnivla.launch.py']),
+        ('share/' + package_name + '/launch', ['launch/omnivla_edge.launch.py', 'launch/omnivla_original.launch.py', 'launch/mission.launch.py', 'launch/mission_omnivla.launch.py', 'launch/mission_carrot.launch.py']),
         ('share/' + package_name + '/config', ['config/controller.yaml']),
     ],
     install_requires=['setuptools'],
@@ -33,6 +33,7 @@ setup(
             'omnivla_edge_node = erc_inference.omnivla_edge_node:main',
             'omnivla_original_node = erc_inference.omnivla_original_node:main',
             'checkpoint_controller_node = erc_inference.checkpoint_controller_node:main',
+            'carrot_controller_node = erc_inference.carrot_controller_node:main',
         ],
     },
 )
