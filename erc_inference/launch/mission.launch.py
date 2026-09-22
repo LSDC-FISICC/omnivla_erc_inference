@@ -2,7 +2,8 @@
 
 Layers, in the order they come up:
 
-    erc_bridge        erc_data_node, erc_screenshot_node, erc_control_node
+    erc_bridge        erc_data_node, erc_screenshot_node, erc_control_node,
+                      erc_status_node (read-only latency instrumentation)
     erc_static_map    erc_static_map_node, erc_astar_planner_node
     erc_inference     omnivla edge node (model + motion controller)
     erc_localization  localization_global.launch.py
@@ -59,6 +60,16 @@ def generate_launch_description():
              name='erc_screenshot_node', output='screen'),
         Node(package='erc_bridge', executable='erc_control_node',
              name='erc_control_node', output='screen'),
+        # Read-only: polls GET /status and publishes /erc/telemetry_age and
+        # /erc/frame_age_front|rear so they land in the bag. SDK v6.3 reports
+        # the age of the telemetry and of the newest cached camera frame, which
+        # is what separates the two readings ARQUITECTURA_ACTUAL Sec 8.4 leaves
+        # open (real transport delay vs a rover clock ~1.1 s behind) and gives
+        # the camera content lag TAREA1 Sec 6.2 had to infer from a fit.
+        # mission_wuhan_hard was recorded without it and both stay unresolved.
+        # Nothing consumes these topics; none of them reach control.
+        Node(package='erc_bridge', executable='erc_status_node',
+             name='erc_status_node', output='screen'),
     ]
 
     static_map = [

@@ -59,6 +59,16 @@ def generate_launch_description():
              name='erc_screenshot_node', output='screen'),
         Node(package='erc_bridge', executable='erc_control_node',
              name='erc_control_node', output='screen'),
+        # Read-only: polls GET /status and publishes /erc/telemetry_age and
+        # /erc/frame_age_front|rear so they land in the bag. SDK v6.3 reports
+        # the age of the telemetry and of the newest cached camera frame, which
+        # is what separates the two readings ARQUITECTURA_ACTUAL Sec 8.4 leaves
+        # open (real transport delay vs a rover clock ~1.1 s behind) and gives
+        # the camera content lag TAREA1 Sec 6.2 had to infer from a fit.
+        # mission_wuhan_hard was recorded without it and both stay unresolved.
+        # Nothing consumes these topics; none of them reach control.
+        Node(package='erc_bridge', executable='erc_status_node',
+             name='erc_status_node', output='screen'),
     ]
 
     static_map = [
