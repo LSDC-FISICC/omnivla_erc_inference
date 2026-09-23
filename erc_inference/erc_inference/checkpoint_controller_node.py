@@ -196,7 +196,7 @@ class CheckpointControllerNode(Node):
         # mission_10sept. After a rejection the radius halves, down to
         # min_checkpoint_proximity_m, so the rover closes in instead of
         # re-posting from the same spot: 6 -> 3 -> 1.5 -> 1 m.
-        self.declare_parameter('checkpoint_proximity_m', 6.0)
+        self.declare_parameter('checkpoint_proximity_m', 8.0)
         self.declare_parameter('min_checkpoint_proximity_m', 1.0)
         # How far ahead along the route the carrot sits, and how often it is
         # re-published. 1.5 m kept the goal inside the model's training range
