@@ -90,8 +90,17 @@ ros2 bag play <bag> --clock
 rviz2 -d $(ros2 pkg prefix erc_inference)/share/erc_inference/rviz/local_planning.rviz --ros-args -p use_sim_time:=true
 ```
 
-Si el DGX no tiene `rviz2`: `sudo apt install ros-jazzy-rviz2`. Sin RViz,
-`bags/bag_leg_view.py <bag> out.png` dibuja lo mismo desde el bag (último tramo).
+Sin monitor en el DGX (acceso remoto):
+- **Foxglove, sin ROS en la laptop.** Los bags son MCAP. `bags/extract_viz.sh <bag>` saca solo los
+  tópicos de visualización (sin imágenes: MB en vez de GB); se copia a la laptop y se abre en
+  Foxglove. En el panel 3D, fixed frame `leg_local`.
+- **Foxglove en vivo:** `sudo apt install ros-jazzy-foxglove-bridge`; en el DGX
+  `ros2 launch foxglove_bridge foxglove_bridge_launch.xml port:=8766`; en la laptop
+  `ssh -L 8766:localhost:8766 <dgx>` y en Foxglove abrir `ws://localhost:8766`. Puerto 8766
+  porque `e2e/fake_world.py` usa el 8765.
+- **RViz en la laptop:** copiar el bag (o el extracto) y `rviz/local_planning.rviz`; solo usa
+  mensajes estándar, no hace falta este código.
+- **Sin nada:** `bags/bag_leg_view.py <bag> out.png` dibuja lo mismo a PNG (último tramo).
 
 Los bags grabados antes de este cambio no tienen esos tópicos. Para ellos, `bags/bag_local_map.py`
 reconstruye el mapa y las replanificaciones a PNG.
