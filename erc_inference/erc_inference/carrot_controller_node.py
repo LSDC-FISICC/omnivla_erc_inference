@@ -31,15 +31,18 @@ What it adds, OFF by default -- obstacle_stop:
   rollover. It has never run in the field; turn it on deliberately.
 
 What it adds, OFF by default -- obstacle_sidestep (sidestep.py):
-  Instead of stopping for good: brake, turn 90 deg IN PLACE towards the side
-  the profile shows open, advance sidestep.advance_m, and hand back to the
+  Instead of stopping for good: brake, turn ~60 deg IN PLACE towards the
+  route's side if the profile shows it open, advance sidestep.advance_m, and hand back to the
   carrot, which brings the rover back to the route. Turning in place is the one
-  thing this rover turns well at (k_w 1.18 against 0.36 moving). controller_sim,
-  6 seeds per scenario: 0 collisions in kerb, post, chicane and straight; the
-  mission completes 6/6 in all four. It replaces obstacle_stop when on, and uses
-  the same stop_distance_m / stop_sector_deg / stop_confirm_ticks. If it cannot
-  find a side it holds still ("give up") until /enable_inference is toggled.
-  Never run in the field.
+  thing this rover turns well at (k_w 1.18 against 0.36 moving). It replaces
+  obstacle_stop when on, and uses the same stop_distance_m / stop_sector_deg /
+  stop_confirm_ticks. If it cannot find a side it holds still ("give up") until
+  /enable_inference is toggled. First field runs 2026-09-22
+  (mission_carrot_sidestep*): 23 side-steps, all real obstacles, none hit --
+  but in a saw-tooth along the same hedge, which is what
+  checkpoint_controller_node's local_replan is for. controller_sim, carrot
+  1.5 m, 8 seeds x 8 scenarios: alone 1 collision and 57/64 completed; with
+  local_replan 0 collisions and 63/64.
 
 The carrot distance is a parameter of checkpoint_controller_node, which the
 mission launch leaves to be started by hand -- pass carrot_distance_m there.
@@ -272,7 +275,7 @@ class CarrotControllerNode(Node):
         r = np.where(np.isfinite(r), r, s.range_max)
         return a, r
 
-    def _sidestep_gate(self, v, w, hdg, cur):
+    def _sidestep_gate(self, v, w, hdg, cur, bearing):
         """-> (v, w, note, resumed). SideStep's yaw is CCW; the compass is CW."""
         scan = self._fresh_scan()
         if scan is None:
@@ -283,7 +286,7 @@ class CarrotControllerNode(Node):
             return v, w, ' [side-step] perception stale, ignored', False
         before = self.sidestep.state
         v, w, note, resumed = self.sidestep.step(
-            self._now(), -math.radians(hdg), cur, scan[0], scan[1], v, w)
+            self._now(), -math.radians(hdg), cur, scan[0], scan[1], v, w, bearing)
         if self.sidestep.state != before:
             self.get_logger().warn(f'obstacle_sidestep: {before} -> {self.sidestep.state} {note}')
         return v, w, (f' {note}' if note else ''), resumed
@@ -338,7 +341,7 @@ class CarrotControllerNode(Node):
             self._now(), params, bearing, float(radius), NULL_PLAN, 4, True)
 
         if self.get_parameter('obstacle_sidestep').value:
-            v, w, note, resumed = self._sidestep_gate(v, w, hdg, cur)
+            v, w, note, resumed = self._sidestep_gate(v, w, hdg, cur, bearing)
             if resumed:
                 # its delay compensation recorded turns it never commanded
                 self.controller.reset()

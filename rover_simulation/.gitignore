@@ -1,0 +1,4 @@
+e2e/out/
+*.png
+*.jpg
+__pycache__/

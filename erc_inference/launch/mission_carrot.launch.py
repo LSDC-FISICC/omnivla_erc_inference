@@ -23,15 +23,20 @@ Arguments:
                                profile sees something close straight ahead.
                                Brakes, never steers -- see its docstring. Needs
                                perception:=true. Never run in the field yet.
-    obstacle_sidestep:=false|true  instead of stopping for good: brake, turn 90
-                               deg in place to the open side, advance 1.3 m,
+    obstacle_sidestep:=false|true  instead of stopping for good: brake, turn ~60
+                               deg in place (route's side if open), advance 1.3 m,
                                back to the carrot. Replaces obstacle_stop.
                                Needs perception:=true. Never run in the field.
 
 Still by hand, exactly as with mission.launch.py -- and this is where the carrot
-distance goes, because it is checkpoint_controller_node's parameter:
+distance and the local obstacle map go, because both are
+checkpoint_controller_node's parameters:
 
     ros2 run erc_inference checkpoint_controller_node --ros-args -p carrot_distance_m:=2.5
+    # or, with the local map + replanning around what OSM does not have
+    # (local_planner.py; needs perception:=true; never run in the field):
+    ros2 run erc_inference checkpoint_controller_node --ros-args \
+        -p carrot_distance_m:=1.5 -p local_replan:=true
     ros2 action send_goal /start_mission erc_inference_msgs/action/StartMission \\
         "{resume_from_latest_scanned: false}"
 
@@ -40,6 +45,10 @@ training distribution (median 1.6 m). Without the model that constraint is gone,
 and in simulation 2.5 m halves the weave (3.0 -> 1.6 sign changes/min) at the
 cost of p95 cross-track 0.98 -> 1.17 m from cutting corners. Do not use 2.5 m
 with mission.launch.py: it would push the model's goal out of range.
+
+With local_replan use 1.5 m: the carrot has to follow the local detours, and
+2.5 m cuts their corners. controller_sim, 8 seeds x 8 scenarios with
+obstacle_sidestep on: 1.5 m completed 63/64 with 0 collisions (2.5 m: 61/64).
 """
 
 import os
@@ -119,7 +128,8 @@ def generate_launch_description():
 
     reminder = LogInfo(msg=(
         'mission_carrot up. Start by hand: ros2 run erc_inference '
-        'checkpoint_controller_node --ros-args -p carrot_distance_m:=2.5'))
+        'checkpoint_controller_node --ros-args -p carrot_distance_m:=2.5  '
+        '(with local map: -p carrot_distance_m:=1.5 -p local_replan:=true)'))
 
     return LaunchDescription(
         args + bridge + static_map + [

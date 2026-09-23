@@ -12,6 +12,7 @@ setup(
         ('share/' + package_name, ['package.xml']),
         ('share/' + package_name + '/launch', ['launch/omnivla_edge.launch.py', 'launch/omnivla_original.launch.py', 'launch/mission.launch.py', 'launch/mission_omnivla.launch.py', 'launch/mission_carrot.launch.py']),
         ('share/' + package_name + '/config', ['config/controller.yaml']),
+        ('share/' + package_name + '/rviz', ['rviz/local_planning.rviz']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,

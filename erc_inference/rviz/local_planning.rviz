@@ -1,0 +1,95 @@
+# Local planning view: everything in the leg frame checkpoint_controller_node drives in.
+#   live:   rviz2 -d $(ros2 pkg prefix erc_inference)/share/erc_inference/rviz/local_planning.rviz
+#   bag:    ros2 bag play <bag> --clock   and   rviz2 -d ... --ros-args -p use_sim_time:=true
+# leg_local restarts at every leg (origin = where the leg started, logged by the node).
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid (1 m)
+      Enabled: true
+      Cell Size: 1
+      Plane Cell Count: 60
+      Reference Frame: leg_local
+      Color: 160; 160; 164
+    - Class: rviz_default_plugins/Map
+      Name: Local costmap (/erc/local_costmap)
+      Enabled: true
+      Topic:
+        Value: /erc/local_costmap
+        Depth: 1
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+      Color Scheme: costmap
+      Alpha: 0.7
+    - Class: rviz_default_plugins/Path
+      Name: Global route (A* on OSM)
+      Enabled: true
+      Topic:
+        Value: /erc/global_route
+        Depth: 1
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+      Color: 255; 150; 0
+      Line Style: Billboards
+      Line Width: 0.08
+    - Class: rviz_default_plugins/Path
+      Name: Current route (with local detours)
+      Enabled: true
+      Topic:
+        Value: /erc/local_route
+        Depth: 1
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+      Color: 0; 200; 80
+      Line Style: Billboards
+      Line Width: 0.06
+    - Class: rviz_default_plugins/PointStamped
+      Name: Carrot
+      Enabled: true
+      Topic:
+        Value: /erc/carrot
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+      Color: 255; 0; 255
+      Radius: 0.15
+      History Length: 1
+    - Class: rviz_default_plugins/LaserScan
+      Name: Free space (erc_perception, in rover_leg)
+      Enabled: true
+      Topic:
+        Value: /erc/free_space_leg
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+      Style: Spheres
+      Size (m): 0.06
+      Color Transformer: FlatColor
+      Color: 255; 40; 40
+      Decay Time: 0
+    - Class: rviz_default_plugins/TF
+      Name: TF (rover_leg)
+      Enabled: true
+      Show Names: true
+      Marker Scale: 0.6
+  Enabled: true
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: leg_local
+    Frame Rate: 15
+  Name: root
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+  Views:
+    Current:
+      Class: rviz_default_plugins/TopDownOrtho
+      Name: Current View
+      Scale: 30
+      Target Frame: rover_leg
+Window Geometry:
+  Height: 900
+  Width: 1400

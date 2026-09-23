@@ -23,6 +23,12 @@ guaranteed free of lethal cells (keeping 10 evenly indexed poses instead put
 27-47 lethal cells back under the segments in three test scenarios -- see
 erc_inference/test/test_waypoint_reduction.py).
 
+With local_replan (off by default) the route is also corrected on the move:
+local_planner.LocalReplanner maps /erc/free_space into the leg's frame and,
+when the route ahead runs into something OSM did not have, splices in an A*
+path to the first clear point of the route past it. See local_planner.py for
+why (the 22-sept saw-tooth along a hedge) and its open limits.
+
 The route is driven with a carrot: a goal kept a fixed distance ahead of the
 rover's projection onto the route and re-published several times a second,
 rather than a few waypoints each held until the rover enters a proximity
@@ -52,13 +58,17 @@ from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
-from geometry_msgs.msg import Twist
-from sensor_msgs.msg import NavSatFix
+from geometry_msgs.msg import PointStamped, PoseStamped, TransformStamped, Twist
+from nav_msgs.msg import OccupancyGrid, Path
+from sensor_msgs.msg import LaserScan, NavSatFix
 from std_msgs.msg import Bool, Float32
 
 from erc_inference_msgs.action import StartMission
 from erc_static_map_msgs.srv import GenerateCostmap, PlanPath
 
+from tf2_ros import TransformBroadcaster
+
+from erc_inference import local_planner
 from erc_inference.motion_control import CommandShaper
 
 
@@ -228,6 +238,25 @@ class CheckpointControllerNode(Node):
         # shortcut search and how long a single straight run can get. It no
         # longer sets how far away the goal is -- the carrot does.
         self.declare_parameter('max_waypoint_spacing_m', 15.0)
+        # Local obstacle map + replanning onto the global route (local_planner.py).
+        # Off by default: never run in the field. Needs erc_perception's
+        # /erc/free_space and the compass. local.* are LocalReplanner's parameters.
+        self.declare_parameter('local_replan', False)
+        self.declare_parameter('heading_topic', '/erc/heading_deg')
+        self.declare_parameter('free_space_topic', '/erc/free_space')
+        self.declare_parameter('local_costmap_topic', '/erc/local_costmap')
+        self.declare_parameter('local_route_topic', '/erc/local_route')
+        # For RViz (config: rviz/local_planning.rviz, fixed frame leg_local). The
+        # leg frame is the carrot's own east/north metres from the leg start; it
+        # is not in the map->odom->base_link tree, so this node also publishes
+        # leg_local->rover_leg (the pose the carrot and the planner use) and a copy
+        # of /erc/free_space in rover_leg. Always on during a leg: cheap, and it
+        # is what makes a bag reviewable.
+        self.declare_parameter('global_route_topic', '/erc/global_route')
+        self.declare_parameter('carrot_point_topic', '/erc/carrot')
+        self.declare_parameter('free_space_leg_topic', '/erc/free_space_leg')
+        for name, default in local_planner.DEFAULTS.items():
+            self.declare_parameter(f'local.{name}', default)
 
         self._lock = threading.RLock()
         self._gps_condition = threading.Condition(self._lock)
@@ -241,6 +270,9 @@ class CheckpointControllerNode(Node):
         self._current_distance_m = float('inf')
         self._shaper = CommandShaper(*self._shaper_limits())
         self._last_output_time = None
+        self._heading_deg: Optional[float] = None
+        self._scans = []               # LaserScans not yet folded into the local map
+        self._static_map = None        # this leg's OSM costmap, for the local planner
 
         self._model_cmd_sub = self.create_subscription(
             Twist, self._param('model_cmd_vel_topic'), self._model_cmd_callback, 10
@@ -248,6 +280,16 @@ class CheckpointControllerNode(Node):
         self._gps_sub = self.create_subscription(
             NavSatFix, self._param('gps_topic'), self._gps_callback, 10
         )
+        self._heading_sub = self.create_subscription(
+            Float32, self._param('heading_topic'), self._heading_callback, 10)
+        self._scan_sub = self.create_subscription(
+            LaserScan, self._param('free_space_topic'), self._scan_callback, 10)
+        self._local_map_pub = self.create_publisher(OccupancyGrid, self._param('local_costmap_topic'), 1)
+        self._local_route_pub = self.create_publisher(Path, self._param('local_route_topic'), LATCHED_QOS)
+        self._global_route_pub = self.create_publisher(Path, self._param('global_route_topic'), LATCHED_QOS)
+        self._carrot_pub = self.create_publisher(PointStamped, self._param('carrot_point_topic'), 10)
+        self._scan_leg_pub = self.create_publisher(LaserScan, self._param('free_space_leg_topic'), 10)
+        self._tf = TransformBroadcaster(self)
 
         # cmd_vel is streaming data and stays volatile; everything below it is
         # latched state (see LATCHED_QOS).
@@ -293,6 +335,26 @@ class CheckpointControllerNode(Node):
             self._current_lat = msg.latitude
             self._current_lon = msg.longitude
             self._gps_condition.notify_all()
+
+    def _heading_callback(self, msg: Float32):
+        with self._lock:
+            self._heading_deg = float(msg.data)
+
+    def _scan_callback(self, msg: LaserScan):
+        with self._lock:
+            active = self._mission_active
+        if active:
+            leg = LaserScan()
+            leg.header.stamp, leg.header.frame_id = msg.header.stamp, 'rover_leg'
+            leg.angle_min, leg.angle_max, leg.angle_increment = msg.angle_min, msg.angle_max, msg.angle_increment
+            leg.range_min, leg.range_max, leg.ranges = msg.range_min, msg.range_max, msg.ranges
+            self._scan_leg_pub.publish(leg)
+        with self._lock:
+            if self._mission_active and self._param('local_replan'):
+                # stamped on arrival with the heading of that moment; at 3 Hz
+                # the loop in _follow_route drains these within ~0.1 s
+                self._scans.append((time.monotonic(), msg, self._heading_deg))
+                del self._scans[:-10]
 
     def _shaper_limits(self):
         return (float(self._param('max_linear_accel')), float(self._param('max_linear_decel')),
@@ -408,6 +470,7 @@ class CheckpointControllerNode(Node):
         """
         log = self.get_logger()
         straight = [(start_lat, start_lon), (target_lat, target_lon)]
+        self._static_map = None
 
         costmap_req = GenerateCostmap.Request()
         costmap_req.origin_lat = start_lat
@@ -445,6 +508,10 @@ class CheckpointControllerNode(Node):
             log.warn(f'plan_path failed ({plan_resp.message}); driving a straight line')
             return straight
 
+        occupancy = self._grid_occupancy(costmap_resp.costmap)
+        if occupancy is not None:
+            self._static_map = (*occupancy, costmap_resp.utm_crs,
+                                costmap_resp.origin_utm_x, costmap_resp.origin_utm_y)
         route = self._path_to_route(
             plan_resp.path, costmap_resp.utm_crs,
             (costmap_resp.origin_utm_x, costmap_resp.origin_utm_y),
@@ -612,6 +679,20 @@ class CheckpointControllerNode(Node):
         """
         frame, pts, cum = route_to_local(route)
         goal_e, goal_n = latlon_to_local(frame, checkpoint.latitude, checkpoint.longitude)
+        replanner = None
+        if self._param('local_replan'):
+            replanner = local_planner.LocalReplanner(
+                pts, **{n: self._param(f'local.{n}') for n in local_planner.DEFAULTS})
+            extra_lethal = self._static_lethal(frame)
+            with self._lock:
+                self._scans.clear()
+            self.get_logger().info(
+                f'Local replanning ON; leg frame origin ({frame[0]:.8f}, {frame[1]:.8f}), '
+                f'map {replanner.map.w}x{replanner.map.h} cells, static OSM costmap '
+                f'{"used" if extra_lethal else "not available"}.')
+            self._publish_local_route(pts)
+        self._publish_path(self._global_route_pub, pts)
+        last_map_publish = 0.0
         lookahead = float(self._param('carrot_distance_m'))
         period = 1.0 / float(self._param('carrot_rate_hz'))
         total = float(cum[-1])
@@ -629,9 +710,22 @@ class CheckpointControllerNode(Node):
                         return True
                     s_proj = project_forward(pts, cum, east, north, s_proj)
                     now = time.monotonic()
+                    self._publish_rover_leg(east, north)
+                    if replanner is not None:
+                        new_pts = self._local_step(replanner, now, east, north, pts, cum, s_proj,
+                                                   extra_lethal)
+                        if new_pts is not None:
+                            pts = new_pts
+                            cum = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(pts, axis=0).T))])
+                            total, s_proj, reported_quarter = float(cum[-1]), 0.0, 0
+                            self._publish_local_route(pts)
+                        if now - last_map_publish >= 1.0:
+                            last_map_publish = now
+                            self._publish_local_map(replanner.map)
                     if now - last_publish >= period:
                         last_publish = now
                         carrot_e, carrot_n, carrot_bearing = point_at(pts, cum, s_proj + lookahead)
+                        self._publish_carrot_point(carrot_e, carrot_n)
                         self._publish_carrot(*local_to_latlon(frame, carrot_e, carrot_n), carrot_bearing)
                         if not started:
                             # Only once a goal is out: the inference node will
@@ -647,6 +741,92 @@ class CheckpointControllerNode(Node):
                             f'{remaining:.1f} m to the checkpoint')
                 self._gps_condition.wait(timeout=period)
         return False
+
+    def _local_step(self, replanner, now, east, north, pts, cum, s_proj, extra_lethal):
+        """Fold pending scans into the map, then maybe replan. Called with the lock held."""
+        scans, self._scans = self._scans, []
+        for _t, scan, heading_deg in scans:
+            if heading_deg is None:
+                continue
+            r = np.asarray(scan.ranges, float)
+            bearings = np.degrees(scan.angle_min + np.arange(len(r)) * scan.angle_increment)
+            # the profile reports range_max where it found nothing: free, not a hit
+            hit = np.isfinite(r) & (r < scan.range_max - 0.05)
+            r = np.where(np.isfinite(r), r, scan.range_max)
+            replanner.observe(_t, east, north, math.radians(90.0 - heading_deg), bearings, r, hit)
+        new_pts, note = replanner.check(now, east, north, pts, cum, s_proj, extra_lethal)
+        if note:
+            (self.get_logger().info if new_pts is not None else self.get_logger().warn)(note)
+        return new_pts
+
+    def _static_lethal(self, frame):
+        """xs, ys in the leg frame -> lethal in this leg's OSM costmap (building
+        footprints), so a local detour cannot go through a building. None if
+        the leg has no costmap (straight-line fallback)."""
+        if self._static_map is None:
+            return None
+        import pyproj
+        occ, res, ox, oy, utm_crs, origin_x, origin_y = self._static_map
+        to_utm = pyproj.Transformer.from_crs('EPSG:4326', utm_crs, always_xy=True)
+        h, w = occ.shape
+
+        def lethal(xs, ys):
+            lat, lon = local_to_latlon(frame, np.asarray(xs, float), np.asarray(ys, float))
+            ux, uy = to_utm.transform(lon, lat)
+            c = np.floor((np.asarray(ux) - origin_x - ox) / res).astype(int)
+            r = np.floor((np.asarray(uy) - origin_y - oy) / res).astype(int)
+            inside = (r >= 0) & (r < h) & (c >= 0) & (c < w)
+            out = np.zeros(np.shape(xs), bool)
+            out[inside] = occ[r[inside], c[inside]]
+            return out
+        return lethal
+
+    def _publish_local_map(self, cmap):
+        """The local map as an OccupancyGrid in the leg frame ('leg_local', east/north
+        metres from the leg origin logged at leg start): -1 unseen, 0-100 from log-odds."""
+        g = OccupancyGrid()
+        g.header.stamp = self.get_clock().now().to_msg()
+        g.header.frame_id = 'leg_local'
+        g.info.resolution = float(cmap.p['resolution_m'])
+        g.info.width, g.info.height = cmap.w, cmap.h
+        g.info.origin.position.x, g.info.origin.position.y = float(cmap.ox), float(cmap.oy)
+        prob = 100.0 / (1.0 + np.exp(-cmap.L))
+        data = np.where(cmap.seen, np.clip(prob, 0, 100), -1).astype(np.int8)
+        g.data = data.ravel().tolist()
+        self._local_map_pub.publish(g)
+
+    def _publish_rover_leg(self, east, north):
+        """leg_local -> rover_leg: the position the carrot projects, the compass yaw."""
+        if self._heading_deg is None:
+            return
+        t = TransformStamped()
+        t.header.stamp = self.get_clock().now().to_msg()
+        t.header.frame_id, t.child_frame_id = 'leg_local', 'rover_leg'
+        t.transform.translation.x, t.transform.translation.y = float(east), float(north)
+        yaw = math.radians(90.0 - self._heading_deg)
+        t.transform.rotation.z, t.transform.rotation.w = math.sin(yaw / 2.0), math.cos(yaw / 2.0)
+        self._tf.sendTransform(t)
+
+    def _publish_carrot_point(self, east, north):
+        p = PointStamped()
+        p.header.stamp = self.get_clock().now().to_msg()
+        p.header.frame_id = 'leg_local'
+        p.point.x, p.point.y = float(east), float(north)
+        self._carrot_pub.publish(p)
+
+    def _publish_local_route(self, pts):
+        self._publish_path(self._local_route_pub, pts)
+
+    def _publish_path(self, pub, pts):
+        path = Path()
+        path.header.stamp = self.get_clock().now().to_msg()
+        path.header.frame_id = 'leg_local'
+        for x, y in pts:
+            ps = PoseStamped()
+            ps.header = path.header
+            ps.pose.position.x, ps.pose.position.y = float(x), float(y)
+            path.poses.append(ps)
+        pub.publish(path)
 
     def _publish_feedback(self, goal_handle, sequence: int, distance: float, state: str):
         feedback = StartMission.Feedback()

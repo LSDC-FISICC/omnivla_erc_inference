@@ -56,6 +56,7 @@ PACKAGE_ROOT = os.path.dirname(HERE)
 sys.path.insert(0, PACKAGE_ROOT)
 
 from erc_inference import motion_control as mc  # noqa: E402
+from erc_inference import local_planner as lp  # noqa: E402
 
 NODE_PATH = os.path.join(PACKAGE_ROOT, "erc_inference", "checkpoint_controller_node.py")
 CONFIG_PATH = os.path.join(PACKAGE_ROOT, "config", "controller.yaml")
@@ -312,6 +313,18 @@ SCENARIOS = {
     "chicane": Scenario("chicane", (0.0, 0.0, 0.0), [[(24.0, 0.0)]],
                         [obs.Segment((8.0, -3.0), (8.0, 0.55)),
                          obs.Segment((13.0, -0.55), (13.0, 3.0))]),
+    # The 22-sept hedge: a long planter wall crossing the route at a shallow
+    # angle, so the carrot keeps pulling the rover back into it after every
+    # side-step (mission_carrot_sidestep*: 5 brakes 2-2.5 m apart along it).
+    "hedge": Scenario("hedge", (0.0, 0.0, 0.0), [[(26.0, 0.0)]],
+                      [obs.Segment((4.0, -4.0), (20.0, 1.2))]),
+    # A raised planter sitting on the route, wider than the camera sees at once.
+    "planter": Scenario("planter", (0.0, 0.0, 0.0), [[(22.0, 0.0)]],
+                        [obs.Segment((8.5, -2.5), (11.5, -2.5)), obs.Segment((11.5, -2.5), (11.5, 2.5)),
+                         obs.Segment((11.5, 2.5), (8.5, 2.5)), obs.Segment((8.5, 2.5), (8.5, -2.5))]),
+    # Stairs or a long wall across the route, passable only past one end.
+    "wall": Scenario("wall", (0.0, 0.0, 0.0), [[(20.0, 0.0)]],
+                     [obs.Segment((9.0, -6.0), (9.0, 2.0))]),
 }
 
 
@@ -339,6 +352,8 @@ class Result:
     # requirement than tracking the route, and a separate one.
     hit: bool = False
     min_clearance_m: float = float('inf')
+    # local_planner.LocalReplanner: how many times the route was spliced
+    replans: int = 0
     # Median over the model's sidestep windows of how far the rover moved toward
     # the side the model asked for, from where it was when the window opened
     # (signed distance to the route); nan without sidesteps.
@@ -395,7 +410,11 @@ def plan_for_deviation(delta, goal_bearing, params):
 
 
 def simulate(scenario: Scenario, params: dict, model: RoverModel, seed: int, record=False,
-             dt=0.02, node=None, node_defaults=None, avoid=None, stop=None, override=None):
+             dt=0.02, node=None, node_defaults=None, avoid=None, stop=None, override=None,
+             local=None):
+    """local: None, or a dict of local_planner parameters -> a LocalReplanner per leg,
+    fed the perception profile at the carrot rate, exactly where
+    checkpoint_controller_node runs it."""
     node = node or load_checkpoint_node()
     cp = node_defaults or checkpoint_node_defaults()
     rng = np.random.default_rng(seed)
@@ -440,6 +459,9 @@ def simulate(scenario: Scenario, params: dict, model: RoverModel, seed: int, rec
     hit = False
     min_clearance = float('inf')
     world = list(getattr(scenario, 'obstacles', []) or [])
+    planner = None
+    replans = 0
+    local_notes = []
 
     log_t, log_out, log_true, cross, route_segments = [], [], [], [], []
     stop_resets = set()   # output indices that follow an immediate stop
@@ -464,6 +486,7 @@ def simulate(scenario: Scenario, params: dict, model: RoverModel, seed: int, rec
             route_segments = [(np.array(a), np.array(b)) for a, b in zip(points, points[1:])]
             s_proj, started, last_carrot = 0.0, False, -math.inf
             leg_started = t
+            planner = lp.LocalReplanner(pts, **local) if local is not None else None
             phase = "follow"
         if phase == "follow":
             east, north = node.latlon_to_local(frame, est_lat, est_lon)
@@ -485,6 +508,19 @@ def simulate(scenario: Scenario, params: dict, model: RoverModel, seed: int, rec
                 s_proj = node.project_forward(pts, cum, east, north, s_proj)
                 if t - last_carrot >= carrot_period:
                     last_carrot = t
+                    if planner is not None and world:
+                        # the map is built from the ESTIMATED pose, perception
+                        # from the true one -- as on the rover
+                        pb, pf, pc = obs.profile(rover.x, rover.y, rover.theta, world, rng)
+                        planner.observe(t, east, north, etheta, pb, pf, pf < pc - 1e-3)
+                        new_pts, note = planner.check(t, east, north, pts, cum, s_proj)
+                        if note:
+                            local_notes.append((round(t, 1), note))
+                        if new_pts is not None:
+                            pts = new_pts
+                            cum = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(pts, axis=0).T))])
+                            s_proj = 0.0
+                            replans += 1
                     ce, cn, _ = node.point_at(pts, cum, s_proj + cp["carrot_distance_m"])
                     new_goal = node.local_to_latlon(frame, ce, cn)
                     # goal_gps_callback: a jump means a new target
@@ -531,7 +567,7 @@ def simulate(scenario: Scenario, params: dict, model: RoverModel, seed: int, rec
                     # position, as the node would be; perception from the truth
                     ob, of, _oc = obs.profile(rover.x, rover.y, rover.theta, world, rng)
                     v, w, _note, resumed = override.step(t, etheta, (cur[0], cur[1]),
-                                                         ob, of, v, w)
+                                                         ob, of, v, w, bearing)
                     if resumed:
                         controller.reset()
                 if stop is not None and world and v > 0.0:
@@ -619,9 +655,11 @@ def simulate(scenario: Scenario, params: dict, model: RoverModel, seed: int, rec
         sidestep_m=float(np.median([best for _, best in sidestep.values()])) if sidestep else float("nan"),
         hit=hit,
         min_clearance_m=min_clearance,
+        replans=replans,
     )
+    result.trace = dict(local_notes=local_notes, planner=planner)
     if record:
-        result.trace = dict(t=T, out=out_arr, true=true_arr, ticks=ticks, leg_times=leg_times)
+        result.trace.update(t=T, out=out_arr, true=true_arr, ticks=ticks, leg_times=leg_times)
     return result
 
 
