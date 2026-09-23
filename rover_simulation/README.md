@@ -10,6 +10,7 @@ revisar los bags **después**. Aquí salieron los números de `docs/MissionCarro
 |---|---|
 | **Motor del simulador** | `../erc_inference/test/controller_sim.py` (rover, localización, bucle de misión) y `../erc_inference/test/obstacles.py` (mundos y perfil de percepción simulado). Se quedan en `test/` porque `test_controller_sim.py` y `colcon test` los importan de ahí. |
 | **Código del robot que se ejecuta** | `../erc_inference/erc_inference/`: `motion_control.py`, `sidestep.py`, `local_planner.py` y la geometría de ruta de `checkpoint_controller_node.py`. Es el mismo código del rover, no una copia. |
+| `experiment_simple.py` | **Empieza aquí.** Un experimento en imágenes: costmap global (OSM) + ruta A\*, espacio libre, costmap local al replanificar y al final, trayectoria. |
 | `common.py` | Rutas y `run()`: una misión simulada en una llamada. |
 | `sweep.py` | Barrido configuraciones × escenarios × semillas, en paralelo. |
 | `plot_run.py` | Una misión a PNG: el mapa local construido, obstáculos reales, trayectoria y replanificaciones. |
@@ -42,6 +43,7 @@ source /opt/ros/jazzy/setup.bash && source ~/lsdc_ws/install/setup.bash
 cd ~/lsdc/erc-omni-vla/omnivla_erc_inference/rover_simulation
 PY=~/lsdc/erc-omni-vla/.venv/bin/python3
 
+$PY experiment_simple.py                                          # -> experiment_simple.png
 $PY sweep.py --carrot 1.5 --seeds 8 --configs ss,lp+ss           # la tabla de MissionCarrotSidestep
 $PY sweep.py --scenarios wall --seeds 8 --ss '{"stop_distance_m": 1.0}' --fails
 $PY plot_run.py planter 0 --out /tmp/planter.png
