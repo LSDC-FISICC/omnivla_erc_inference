@@ -339,6 +339,19 @@ class Nav2RouteFollower(Node):
     def _send(self):
         frame, pts = self._route
         dense = densify(pts, float(self.get_parameter('path_step_m').value))
+        # Start the path where the rover is. MPPI looks for the rover only within
+        # prune_distance of the path's start: a leg's full route re-sent mid-leg (after
+        # an abort, or back from a local detour) put the rover beyond that, the part MPPI
+        # did look at fell outside the 8 m rolling costmap, and every goal aborted with
+        # "Resulting plan has 0 poses" -- ~180 times in e2e wall and chicane.
+        try:
+            tr = self._tf_buf.lookup_transform(frame, self.get_parameter('base_frame').value,
+                                               rclpy.time.Time())
+            rx, ry = tr.transform.translation.x, tr.transform.translation.y
+            i = int(np.argmin(np.hypot(dense[:, 0] - rx, dense[:, 1] - ry)))
+            dense = dense[i:] if len(dense) - i >= 2 else dense[-2:]
+        except Exception:
+            pass
         path = Path()
         path.header.frame_id = frame
         path.header.stamp = self.get_clock().now().to_msg()

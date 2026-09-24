@@ -72,7 +72,11 @@ controller_server:
       visualize: true
       publish_optimal_trajectory: true
       regenerate_noises: false
-      prune_distance: 3.0
+      # 6 m and the 12 m costmap below, not Nav2's 3 m / 8 m: with those MPPI lost the path
+      # once a local detour took the rover a few metres off it, and every goal aborted with
+      # "Resulting plan has 0 poses" (~180 times per e2e run in wall, hedge and chicane,
+      # none of which completed). With 6 m / 12 m: 0 aborts, all three complete.
+      prune_distance: 6.0
       transform_tolerance: 0.5
       enforce_path_inversion: false
       TrajectoryVisualizer:
@@ -102,7 +106,8 @@ controller_server:
       CostCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 3.81
+        cost_weight: 10.0                 # 3.81 (Nav2) grazed every obstacle in e2e (clearance 0.00-0.06 m);
+                                          # 10: wall 0.16, hedge 0.20, chicane 0.21 m
         critical_cost: 300.0
         consider_footprint: true
         collision_cost: 1000000.0
@@ -142,8 +147,8 @@ local_costmap:
       # where the rover will be when its command lands, ~1.3 s from now
       robot_base_frame: rover_pred
       rolling_window: true
-      width: 8
-      height: 8
+      width: 12                          # see prune_distance
+      height: 12
       resolution: 0.1
       # MINI+ is 0.25 x 0.19 m; padded 3 cm per side
       footprint: "[[0.155, 0.125], [0.155, -0.125], [-0.155, -0.125], [-0.155, 0.125]]"
