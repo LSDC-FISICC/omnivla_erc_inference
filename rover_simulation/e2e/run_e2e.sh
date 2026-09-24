@@ -24,4 +24,6 @@ ros2 action send_goal /start_mission erc_inference_msgs/action/StartMission \
   "{resume_from_latest_scanned: false}" > "$OUT.action.log" 2>&1 &
 wait $FW
 kill -INT $CN $CP 2>/dev/null; sleep 1; kill $CN $CP 2>/dev/null
+# a send_goal whose mission never finished waits forever and would start the next run
+pkill -f "action send_goal /start_mission" 2>/dev/null
 cat "$OUT.world.log"

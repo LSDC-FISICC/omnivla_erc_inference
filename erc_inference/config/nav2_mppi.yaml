@@ -1,0 +1,185 @@
+# Nav2 MPPI as the local planner/controller, on a costmap built from DA3.
+# Used by launch/mission_nav2.launch.py. See erc_inference/nav2_route_follower_node.py
+# for how the route gets here and how the command gets out.
+#
+# Frames: leg_local / rover_leg, published by checkpoint_controller_node -- the SAME
+# pose the carrot uses (/erc/gps/filtered + /erc/heading_deg), in the leg's own
+# east/north metres. Not map/odom/base_link: the global route already lives in
+# leg_local, and this keeps MPPI independent of whether the EKF's map frame is aligned.
+#
+# Speeds and horizon, from this rover (docs/MissionCarrotSidestep.md, MissionWuhanHard.md):
+#   * 0.3 m/s max; the rover does not move below ~0.25 m/s commanded -- the follower
+#     node snaps MPPI's output onto that floor, MPPI itself does not know it
+#   * 6 s horizon (60 x 0.1 s) = 1.8 m at 0.3 m/s. Nav2's default (56 x 0.05 s =
+#     2.8 s) would look only 0.8 m ahead at this speed
+#   * NOT modelled by MPPI: the ~1.3 s command->motion delay and that the rover
+#     executes ~0.36 of the commanded yaw rate while moving. Both are why the
+#     simulation comparison exists.
+
+controller_server:
+  ros__parameters:
+    controller_frequency: 10.0
+    odom_topic: /erc/odometry/local
+    enable_stamped_cmd_vel: false
+    costmap_update_timeout: 0.30
+    min_x_velocity_threshold: 0.001
+    min_y_velocity_threshold: 0.5
+    min_theta_velocity_threshold: 0.001
+    failure_tolerance: 3.0
+    progress_checker_plugins: ["progress_checker"]
+    goal_checker_plugins: ["goal_checker"]
+    controller_plugins: ["FollowPath"]
+    use_realtime_priority: false
+
+    progress_checker:
+      plugin: "nav2_controller::SimpleProgressChecker"
+      required_movement_radius: 0.3
+      movement_time_allowance: 30.0      # slow in-place turns are progress too
+    goal_checker:
+      plugin: "nav2_controller::SimpleGoalChecker"
+      xy_goal_tolerance: 0.5
+      yaw_goal_tolerance: 6.28           # heading at the checkpoint does not matter
+      stateful: true
+
+    FollowPath:
+      plugin: "nav2_mppi_controller::MPPIController"
+      time_steps: 60
+      model_dt: 0.1
+      batch_size: 1000
+      iteration_count: 1
+      vx_std: 0.15
+      vy_std: 0.0
+      wz_std: 0.3
+      vx_max: 0.30
+      vx_min: 0.0                        # no reversing: never tried on this rover
+      vy_max: 0.0
+      wz_max: 0.35                       # REAL rate: 1.18 x 0.3 in place; the follower
+                                         # divides by the measured gain before commanding
+      ax_max: 0.3
+      ax_min: -0.6
+      ay_max: 0.0
+      az_max: 0.6
+      temperature: 0.3
+      gamma: 0.015
+      motion_model: "DiffDrive"
+      # Closed loop (from odometry), on purpose. open_loop: true starts each optimisation
+      # from MPPI's OWN last output, and here that output is ~0.03 m/s that the follower
+      # raises to the 0.25 floor: MPPI then plans for a rover crawling at 0.03 m/s while
+      # it drives at 0.28, so its predicted trajectories and collision checks are ~10x too
+      # short (e2e hedge: it "worked", 0.67 m clearance, but for that reason). The ~1.3 s
+      # delay is handled by the predicted pose (robot_base_frame: rover_pred), not here.
+      open_loop: false
+      visualize: true
+      publish_optimal_trajectory: true
+      regenerate_noises: false
+      prune_distance: 3.0
+      transform_tolerance: 0.5
+      enforce_path_inversion: false
+      TrajectoryVisualizer:
+        trajectory_step: 5
+        time_step: 3
+      critics: ["ConstraintCritic", "CostCritic", "GoalCritic", "GoalAngleCritic",
+                "PathAlignCritic", "PathFollowCritic", "PathAngleCritic", "PreferForwardCritic"]
+      ConstraintCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 4.0
+      GoalCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 5.0
+        threshold_to_consider: 1.4
+      GoalAngleCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 3.0
+        threshold_to_consider: 0.5
+      PreferForwardCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 5.0
+        threshold_to_consider: 0.5
+      CostCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 3.81
+        critical_cost: 300.0
+        consider_footprint: true
+        collision_cost: 1000000.0
+        near_goal_distance: 1.0
+        trajectory_point_step: 2
+      PathAlignCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 14.0
+        max_path_occupancy_ratio: 0.05   # stop pulling onto the path where it is blocked
+        trajectory_point_step: 4
+        threshold_to_consider: 0.5
+        offset_from_furthest: 20
+        use_path_orientations: false
+      PathFollowCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 5.0
+        offset_from_furthest: 5
+        threshold_to_consider: 1.4
+      PathAngleCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 2.0
+        offset_from_furthest: 4
+        threshold_to_consider: 0.5
+        max_angle_to_furthest: 1.0
+        mode: 0
+
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      update_frequency: 5.0
+      publish_frequency: 2.0
+      global_frame: leg_local
+      # the PREDICTED pose (nav2_route_follower_node, Smith predictor): MPPI plans from
+      # where the rover will be when its command lands, ~1.3 s from now
+      robot_base_frame: rover_pred
+      rolling_window: true
+      width: 8
+      height: 8
+      resolution: 0.1
+      # MINI+ is 0.25 x 0.19 m; padded 3 cm per side
+      footprint: "[[0.155, 0.125], [0.155, -0.125], [-0.155, -0.125], [-0.155, 0.125]]"
+      transform_tolerance: 0.5
+      always_send_full_costmap: true
+      plugins: ["obstacle_layer", "inflation_layer"]
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: true
+        observation_sources: scan
+        scan:
+          # /erc/free_space (DA3 -> height above ground -> 25 bins), re-framed into
+          # rover_leg by checkpoint_controller_node, then cropped to +-40 deg (the
+          # periphery reads ~1.7 m with nothing there, TAREA5 6c.4) and with isolated
+          # misses filled by nav2_route_follower_node: this layer clears every cell a
+          # ray passes through, so one bin that misses a wall opened a hole in it and
+          # MPPI drove through the hole (e2e, wall)
+          topic: /erc/free_space_nav2
+          data_type: "LaserScan"
+          marking: true
+          clearing: true
+          # the profile reports range_max (3.0) where it found nothing: not a hit
+          obstacle_max_range: 2.9
+          obstacle_min_range: 0.0
+          raytrace_max_range: 3.0
+          raytrace_min_range: 0.0
+          inf_is_valid: false
+          max_obstacle_height: 2.0
+          min_obstacle_height: -1.0
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        inflation_radius: 1.0
+        cost_scaling_factor: 3.0
+
+lifecycle_manager_mppi:
+  ros__parameters:
+    autostart: true
+    node_names: ["controller_server"]
+    bond_timeout: 4.0

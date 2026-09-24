@@ -12,7 +12,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import numpy as np
 import rclpy
 from geometry_msgs.msg import Twist
-from nav_msgs.msg import Path
+from nav_msgs.msg import Odometry, Path
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rcl_interfaces.msg import Log
@@ -82,6 +82,8 @@ class Fake(Node):
         self.gps = self.create_publisher(NavSatFix, '/erc/gps/filtered', 10)
         self.hdg = self.create_publisher(Float32, '/erc/heading_deg', 10)
         self.scan = self.create_publisher(LaserScan, '/erc/free_space', 10)
+        # body-frame velocity, as ekf_local publishes it: MPPI starts from it
+        self.odom = self.create_publisher(Odometry, '/erc/odometry/local', 10)
         self.create_subscription(Twist, '/cmd_vel', self._cmd, 10)
         self.create_subscription(String, '/omnivla_debug', self._dbg, 10)
         self.create_subscription(Log, '/rosout', self._log, 50)
@@ -130,6 +132,11 @@ class Fake(Node):
         f.latitude, f.longitude = latlon(self.x, self.y)
         self.gps.publish(f)
         self.hdg.publish(Float32(data=float((90.0 - math.degrees(self.th)) % 360.0)))
+        o = Odometry()
+        o.header.stamp = self.get_clock().now().to_msg()
+        o.header.frame_id, o.child_frame_id = 'odom', 'base_link'
+        o.twist.twist.linear.x, o.twist.twist.angular.z = float(self.v), float(self.w)
+        self.odom.publish(o)
 
     def _pub_scan(self):
         b, free, caps = obs.profile(self.x, self.y, self.th, self.world, self.rng)

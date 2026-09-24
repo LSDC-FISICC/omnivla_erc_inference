@@ -23,6 +23,12 @@
   <exec_depend>erc_bridge</exec_depend>
   <exec_depend>erc_localization</exec_depend>
   <exec_depend>erc_static_map</exec_depend>
+  <!-- mission_nav2.launch.py only -->
+  <exec_depend>nav2_msgs</exec_depend>
+  <exec_depend>nav2_controller</exec_depend>
+  <exec_depend>nav2_mppi_controller</exec_depend>
+  <exec_depend>nav2_costmap_2d</exec_depend>
+  <exec_depend>nav2_lifecycle_manager</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

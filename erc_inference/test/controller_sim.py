@@ -142,6 +142,18 @@ class RoverModel:
     # plan turns by (0.117 fitted on mission_16sept), and optional sidesteps --
     # every avoid_every_s the plan deviates avoid_deg beyond that for avoid_s,
     # alternating sides, standing in for going around something. 0 = never.
+    # Field effects the default plant leaves out, all off by default so every
+    # earlier result stands (rover_simulation/weave_check.py, mission_wuhan_hard):
+    #   heading_extra_latency_s  the compass reaches the controller older than the
+    #                            EKF position, which is extrapolated to now
+    #   heading_hold_s           telemetry arrives in bursts every ~0.5 s, so the
+    #                            heading steps instead of moving continuously
+    #   k_w_moving_sigma         moving yaw gain varies (IQR 0.16-1.42 in the
+    #                            field): log-normal multiplier, redrawn every k_w_tau_s
+    heading_extra_latency_s: float = 0.0
+    heading_hold_s: float = 0.0
+    k_w_moving_sigma: float = 0.0
+    k_w_tau_s: float = 2.0
     model_bearing_gain: float = 0.117
     avoid_every_s: float = 0.0
     avoid_s: float = 6.0
@@ -151,12 +163,15 @@ class RoverModel:
 class Rover:
     """Unicycle with delayed, gain-scaled, first-order actuation and breakaway speeds."""
 
-    def __init__(self, model: RoverModel, x, y, theta):
+    def __init__(self, model: RoverModel, x, y, theta, rng=None):
         self.m = model
         self.x, self.y, self.theta = x, y, theta
         self.v = 0.0
         self.w = 0.0
         self._commands = deque([(-math.inf, 0.0, 0.0)])
+        self._rng = rng
+        self._kw_mult = 1.0
+        self._kw_next = 0.0
 
     def command(self, t, linear, angular):
         self._commands.append((t, linear, angular))
@@ -167,8 +182,12 @@ class Rover:
         _, linear, angular = self._commands[0]
         target_v = self.m.k_v * linear if abs(linear) >= self.m.v_breakaway else 0.0
         moving = abs(self.v) > 0.03 or target_v != 0.0
+        if self.m.k_w_moving_sigma > 0.0 and self._rng is not None and t >= self._kw_next:
+            sg = self.m.k_w_moving_sigma
+            self._kw_mult = math.exp(sg * self._rng.standard_normal() - 0.5 * sg * sg)
+            self._kw_next = t + self.m.k_w_tau_s
         if moving:
-            target_w = self.m.k_w_moving * angular
+            target_w = self.m.k_w_moving * self._kw_mult * angular
         else:
             target_w = self.m.k_w_in_place * angular if abs(angular) >= self.m.w_breakaway else 0.0
         self.v += (target_v - self.v) * min(1.0, dt / self.m.tau_v)
@@ -186,6 +205,9 @@ class Localization:
         self.rng = rng
         self.err = np.zeros(2)
         self._history = deque()
+        self._headings = deque()      # (t, heading) for heading_extra_latency_s
+        self._held = None
+        self._held_t = -math.inf
 
     def update(self, t, dt, rover: Rover):
         a = math.exp(-dt / self.m.position_tau_s)
@@ -196,12 +218,29 @@ class Localization:
                 and t % self.m.heading_freeze_every_s < self.m.heading_freeze_s):
             heading = self._history[-1][3]
         self._history.append((t, rover.x + self.err[0], rover.y + self.err[1], heading, rover.v))
+        self._now = t
+        if self.m.heading_extra_latency_s > 0.0:
+            self._headings.append((t, heading))
+            base = self.m.telemetry_latency_s if self.m.telemetry_latency_s > 0.0 else self.m.sensor_latency_s
+            while len(self._headings) > 1 and self._headings[1][0] <= t - base - self.m.heading_extra_latency_s:
+                self._headings.popleft()
         latency = self.m.telemetry_latency_s if self.m.telemetry_latency_s > 0.0 else self.m.sensor_latency_s
         while len(self._history) > 1 and self._history[1][0] <= t - latency:
             self._history.popleft()
 
+    def _heading(self, theta):
+        if self.m.heading_extra_latency_s > 0.0 and self._headings:
+            theta = self._headings[0][1]
+        if self.m.heading_hold_s > 0.0:
+            if self._held is None or self._now - self._held_t >= self.m.heading_hold_s:
+                self._held, self._held_t = theta, self._now
+            theta = self._held
+        return theta
+
     def estimate(self):
         _, x, y, theta, v = self._history[0]
+        if self.m.heading_extra_latency_s > 0.0 or self.m.heading_hold_s > 0.0:
+            theta = self._heading(theta)
         lag = self.m.telemetry_latency_s
         if lag > 0.0:
             x += v * lag * math.cos(theta)
@@ -418,7 +457,7 @@ def simulate(scenario: Scenario, params: dict, model: RoverModel, seed: int, rec
     node = node or load_checkpoint_node()
     cp = node_defaults or checkpoint_node_defaults()
     rng = np.random.default_rng(seed)
-    rover = Rover(model, *scenario.start)
+    rover = Rover(model, *scenario.start, rng=np.random.default_rng(seed + 1000))
     loc = Localization(model, rng)
     emulator = ModelEmulator(rng, model)
     controller = mc.MotionController(params)

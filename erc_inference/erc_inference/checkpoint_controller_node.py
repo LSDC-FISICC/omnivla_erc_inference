@@ -246,6 +246,8 @@ class CheckpointControllerNode(Node):
         self.declare_parameter('free_space_topic', '/erc/free_space')
         self.declare_parameter('local_costmap_topic', '/erc/local_costmap')
         self.declare_parameter('local_route_topic', '/erc/local_route')
+        # 1 Hz is enough to look at; mission_nav2 builds MPPI's costmap from it and wants ~3 Hz
+        self.declare_parameter('local_costmap_rate_hz', 1.0)
         # For RViz (config: rviz/local_planning.rviz, fixed frame leg_local). The
         # leg frame is the carrot's own east/north metres from the leg start; it
         # is not in the map->odom->base_link tree, so this node also publishes
@@ -719,7 +721,7 @@ class CheckpointControllerNode(Node):
                             cum = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(pts, axis=0).T))])
                             total, s_proj, reported_quarter = float(cum[-1]), 0.0, 0
                             self._publish_local_route(pts)
-                        if now - last_map_publish >= 1.0:
+                        if now - last_map_publish >= 1.0 / float(self._param('local_costmap_rate_hz')):
                             last_map_publish = now
                             self._publish_local_map(replanner.map)
                     if now - last_publish >= period:
