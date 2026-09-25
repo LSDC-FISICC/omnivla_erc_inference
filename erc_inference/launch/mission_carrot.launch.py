@@ -24,6 +24,9 @@ Arguments:
                                far-tree phantoms of parks (erc_perception
                                free_space_node docstring). Needs transformers in
                                .venv-depth.
+    depth_backend:=da3|unidepth  depth model of that profile. unidepth: UniDepthV2,
+                               no far compression (mission_carrot_unidepth.launch.py
+                               sets it). Needs ~/lsdc/erc-omni-vla/.venv-unidepth.
     obstacle_stop:=false|true  let carrot_controller_node BRAKE when that
                                profile sees something close straight ahead.
                                Brakes, never steers -- see its docstring. Needs
@@ -83,6 +86,9 @@ def generate_launch_description():
         DeclareLaunchArgument('obstacle_mode', default_value='height',
                               description="free_space_node: 'height' or 'contact' (segmentation + "
                                           "ground contact, against far-tree phantoms)"),
+        DeclareLaunchArgument('depth_backend', default_value='da3',
+                              description="free_space_node depth model: 'da3' or 'unidepth' "
+                                          "(UniDepthV2; see mission_*_unidepth.launch.py)"),
         DeclareLaunchArgument('obstacle_stop', default_value='false',
                               description='brake on /erc/free_space; never field-tested'),
         DeclareLaunchArgument('stop_distance_m', default_value='1.2',
@@ -127,7 +133,8 @@ def generate_launch_description():
         PythonLaunchDescriptionSource(
             os.path.join(get_package_share_directory('erc_perception'), 'launch',
                          'free_space.launch.py')),
-        launch_arguments={'obstacle_mode': LaunchConfiguration('obstacle_mode')}.items(),
+        launch_arguments={'obstacle_mode': LaunchConfiguration('obstacle_mode'),
+                          'depth_backend': LaunchConfiguration('depth_backend')}.items(),
         condition=IfCondition(LaunchConfiguration('perception')))
 
     localization = IncludeLaunchDescription(

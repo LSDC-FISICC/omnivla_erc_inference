@@ -10,7 +10,7 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        ('share/' + package_name + '/launch', ['launch/omnivla_edge.launch.py', 'launch/omnivla_original.launch.py', 'launch/mission.launch.py', 'launch/mission_omnivla.launch.py', 'launch/mission_carrot.launch.py', 'launch/mission_nav2.launch.py']),
+        ('share/' + package_name + '/launch', ['launch/omnivla_edge.launch.py', 'launch/omnivla_original.launch.py', 'launch/mission.launch.py', 'launch/mission_omnivla.launch.py', 'launch/mission_carrot.launch.py', 'launch/mission_nav2.launch.py', 'launch/mission_carrot_unidepth.launch.py', 'launch/mission_nav2_unidepth.launch.py']),
         ('share/' + package_name + '/config', ['config/controller.yaml', 'config/nav2_mppi.yaml']),
         ('share/' + package_name + '/rviz', ['rviz/local_planning.rviz']),
     ],

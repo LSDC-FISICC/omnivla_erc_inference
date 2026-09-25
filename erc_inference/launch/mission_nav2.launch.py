@@ -56,6 +56,9 @@ def generate_launch_description():
     args = [DeclareLaunchArgument('obstacle_mode', default_value='height',
                               description="free_space_node: 'height' or 'contact' (segmentation + "
                                           "ground contact, against far-tree phantoms)"),
+            DeclareLaunchArgument('depth_backend', default_value='da3',
+                              description="free_space_node depth model: 'da3' or 'unidepth' "
+                                          "(UniDepthV2; see mission_*_unidepth.launch.py)"),
             DeclareLaunchArgument('sim', default_value='false',
                                   description='only the nav2 layer + follower (rover_simulation/e2e)')]
 
@@ -70,7 +73,8 @@ def generate_launch_description():
     perception = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(get_package_share_directory('erc_perception'), 'launch', 'free_space.launch.py')),
-        launch_arguments={'obstacle_mode': LaunchConfiguration('obstacle_mode')}.items(),
+        launch_arguments={'obstacle_mode': LaunchConfiguration('obstacle_mode'),
+                          'depth_backend': LaunchConfiguration('depth_backend')}.items(),
         condition=real)
     localization = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
