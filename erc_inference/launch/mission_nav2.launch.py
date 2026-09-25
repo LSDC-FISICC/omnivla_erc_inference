@@ -53,7 +53,10 @@ def generate_launch_description():
     nav2_yaml = os.path.join(share, 'config', 'nav2_mppi.yaml')
     real = UnlessCondition(LaunchConfiguration('sim'))
 
-    args = [DeclareLaunchArgument('sim', default_value='false',
+    args = [DeclareLaunchArgument('obstacle_mode', default_value='height',
+                              description="free_space_node: 'height' or 'contact' (segmentation + "
+                                          "ground contact, against far-tree phantoms)"),
+            DeclareLaunchArgument('sim', default_value='false',
                                   description='only the nav2 layer + follower (rover_simulation/e2e)')]
 
     bridge = [
@@ -67,6 +70,7 @@ def generate_launch_description():
     perception = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(get_package_share_directory('erc_perception'), 'launch', 'free_space.launch.py')),
+        launch_arguments={'obstacle_mode': LaunchConfiguration('obstacle_mode')}.items(),
         condition=real)
     localization = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(

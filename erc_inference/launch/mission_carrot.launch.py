@@ -19,6 +19,11 @@ Arguments:
 
     perception:=true|false     run erc_perception's free-space profile. Shadow:
                                it only publishes /erc/free_space for the bag.
+    obstacle_mode:=height|contact  how that profile decides what is an obstacle.
+                               contact: segmentation + ground contact, against the
+                               far-tree phantoms of parks (erc_perception
+                               free_space_node docstring). Needs transformers in
+                               .venv-depth.
     obstacle_stop:=false|true  let carrot_controller_node BRAKE when that
                                profile sees something close straight ahead.
                                Brakes, never steers -- see its docstring. Needs
@@ -75,6 +80,9 @@ def generate_launch_description():
     args = [
         DeclareLaunchArgument('perception', default_value='true',
                               description='run erc_perception free_space_node (shadow)'),
+        DeclareLaunchArgument('obstacle_mode', default_value='height',
+                              description="free_space_node: 'height' or 'contact' (segmentation + "
+                                          "ground contact, against far-tree phantoms)"),
         DeclareLaunchArgument('obstacle_stop', default_value='false',
                               description='brake on /erc/free_space; never field-tested'),
         DeclareLaunchArgument('stop_distance_m', default_value='1.2',
@@ -119,6 +127,7 @@ def generate_launch_description():
         PythonLaunchDescriptionSource(
             os.path.join(get_package_share_directory('erc_perception'), 'launch',
                          'free_space.launch.py')),
+        launch_arguments={'obstacle_mode': LaunchConfiguration('obstacle_mode')}.items(),
         condition=IfCondition(LaunchConfiguration('perception')))
 
     localization = IncludeLaunchDescription(
