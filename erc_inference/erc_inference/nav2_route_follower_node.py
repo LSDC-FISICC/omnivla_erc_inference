@@ -184,9 +184,14 @@ class Nav2RouteFollower(Node):
         self.declare_parameter('v_stop', 0.02)
         self.declare_parameter('w_floor', 0.15)
         self.declare_parameter('retry_s', 1.0)
-        # measured plant gains (see snap_command); 1.0 disables the compensation
-        self.declare_parameter('k_w_moving', 0.36)
-        self.declare_parameter('k_w_in_place', 1.18)
+        # Measured plant gains (see snap_command); 1.0 disables the compensation. They are
+        # PER UNIT: 0.36 moving came from mission_16sept, but the Wuhan units of 22/24-sept
+        # executed 1.05-1.26 of the commanded rate moving and 0.89-0.96 in place (gyro vs
+        # /cmd_vel). With 0.36 MPPI's turns were multiplied ~3x and the rover drove circles
+        # of ~1 m radius for 70 s (mission_24sept_Nav2_circles). Measure the unit before
+        # changing these.
+        self.declare_parameter('k_w_moving', 1.0)
+        self.declare_parameter('k_w_in_place', 1.0)
         self.declare_parameter('w_max', 0.3)     # controller.yaml max_angular_vel
         # Smith predictor (see module docstring, 5); 0 publishes rover_pred = rover_leg
         self.declare_parameter('predict_delay_s', 1.3)
