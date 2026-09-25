@@ -5,6 +5,7 @@ test/obstacles.py. The SDK serves one checkpoint and accepts any arrival."""
 import collections
 import json
 import math
+import os
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -30,6 +31,9 @@ WORLDS = {
     'hedge': ([obs.Segment((4.0, -4.0), (20.0, 1.2))], (26.0, 0.0)),
     'wall': ([obs.Segment((9.0, -6.0), (9.0, 2.0))], (20.0, 0.0)),
     'chicane': ([obs.Segment((8.0, -3.0), (8.0, 0.55)), obs.Segment((13.0, -0.55), (13.0, 3.0))], (24.0, 0.0)),
+    # mission_24sept_Nav2_circles: the leg starts with the route ~70 deg off the heading, a planter
+    # alongside; that is where Nav2 circled with the follower's gain at 0.36 on a 1.23 unit
+    'corner': ([obs.Segment((-1.5, 2.0), (-1.5, 9.0)), obs.Segment((2.5, 1.0), (4.5, 1.0))], (4.0, 14.0)),
 }
 STATE = {'done': False}
 
@@ -66,6 +70,10 @@ def sdk(goal):
             self.wfile.write(data)
     srv = HTTPServer(('127.0.0.1', 8765), H)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+
+PLANT_KW_MOVING = float(os.environ.get('PLANT_KW_MOVING', 0.36))
+PLANT_KW_IN_PLACE = float(os.environ.get('PLANT_KW_IN_PLACE', 1.18))
 
 
 class Fake(Node):
@@ -117,10 +125,13 @@ class Fake(Node):
         self.t += 0.05
         self.buf.append(self.cmd)
         v, w = self.buf.popleft()
-        kw = 1.18 if abs(v) < 0.05 else 0.36
+        # measured on mission_16sept (0.36 moving); the Wuhan units measure 1.05-1.26 moving
+        # (1.23 in mission_24sept_Nav2_circles): PLANT_KW_MOVING / PLANT_KW_IN_PLACE
+        kw = PLANT_KW_IN_PLACE if abs(v) < 0.05 else PLANT_KW_MOVING
         self.v += (1.11 * v - self.v) * min(1, 0.05 / 0.47)
         self.w += (kw * w - self.w) * min(1, 0.05 / 0.35)
         self.th += self.w * 0.05
+        self.turned = getattr(self, 'turned', 0.0) + abs(self.w) * 0.05
         self.x += self.v * math.cos(self.th) * 0.05
         self.y += self.v * math.sin(self.th) * 0.05
         c = obs.clearance((self.x, self.y), self.world)
@@ -162,7 +173,9 @@ def main():
         print(f'  {e[0]:6.1f}s  {e[1]}')
     d = math.hypot(n.x - n.goal[0], n.y - n.goal[1])
     print(f'{world}: t={n.t:.0f}s final=({n.x:.1f},{n.y:.1f}) goal_dist={d:.1f}m min_clear={n.min_clear:.2f}m '
-          f'hit={n.hit} completed={STATE["done"]} local_replans={n.replans}')
+          f'hit={n.hit} completed={STATE["done"]} local_replans={n.replans} '
+          f'turned={math.degrees(getattr(n, "turned", 0.0)):.0f}deg ({math.degrees(getattr(n, "turned", 0.0)) / 360:.1f} full turns) '
+          f'plant_kw_moving={PLANT_KW_MOVING}')
     rclpy.shutdown()
 
 

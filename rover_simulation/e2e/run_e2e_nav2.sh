@@ -38,7 +38,8 @@ ros2 run nav2_controller controller_server --ros-args --params-file "$SRC/config
 sleep 3
 ros2 run nav2_lifecycle_manager lifecycle_manager --ros-args -r __node:=lifecycle_manager_mppi \
   --params-file "$SRC/config/nav2_mppi.yaml" > "$OUT.lifecycle.log" 2>&1 & LM=$!
-python3 -m erc_inference.nav2_route_follower_node > "$OUT.follower.log" 2>&1 & RF=$!
+# FOLLOWER_EXTRA: --ros-args overrides for the follower, e.g. "-p k_w_moving:=0.36" (24-sept default)
+python3 -m erc_inference.nav2_route_follower_node ${FOLLOWER_EXTRA:+--ros-args $FOLLOWER_EXTRA} > "$OUT.follower.log" 2>&1 & RF=$!
 python3 -m erc_inference.checkpoint_controller_node --ros-args \
   -p checkpoint_list_url:=http://127.0.0.1:8765/checkpoints-list \
   -p checkpoint_reached_url:=http://127.0.0.1:8765/checkpoint-reached \
