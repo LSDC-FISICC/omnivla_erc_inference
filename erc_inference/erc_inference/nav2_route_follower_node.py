@@ -34,6 +34,28 @@ This node does four things:
      of it is true (stale telemetry + short actuation, or fresh telemetry +
      long actuation; Mission16sept 7.2), the horizon to roll forward is the same.
 
+  6. YAW GAIN LEARNED ONLINE. The rover executes k_w x the commanded yaw rate, and k_w
+     is per unit: 0.36 moving on mission_16sept, 1.23 on mission_24sept_Nav2_circles.
+     With the wrong value the compensation and the predictor are both off by 3x; that
+     is what made MPPI circle there (rover_pred predicted 8 deg where the rover turned
+     26). With k_w_auto the node measures it while driving: yaw rate observed on
+     yaw_rate_topic / the command sent predict_delay_s earlier, median over the last
+     k_w_window_s, separately moving and in place.
+  7. TURN IN PLACE FIRST. Below v_floor the rover does not move, so every large
+     correction MPPI asks becomes a circle of ~1.4 m at 0.25 m/s, overshot by the
+     delay. When the route is more than turn_enter_deg off the PREDICTED heading the
+     node turns in place (as the carrot's GoalTurn does) until it is within
+     turn_exit_deg, then hands back to MPPI. In the e2e simulator with the Wuhan
+     plant (1.23) MPPI alone circled 9.6 turns (corner) and 16 (hedge) without arriving.
+  8. PREDICTED VELOCITY. rover_pred gives MPPI the pose 1.3 s ahead, but its velocity
+     state came from the measured odometry -- 1.3 s old against that pose. After an
+     in-place turn it still read ~0.28 rad/s, MPPI (bound by az_max) planned to keep
+     turning, and overshot the route by ~70 deg every time, alternating (e2e corner,
+     Wuhan plant: 26 segments, 4.4 turns). This node publishes pred_odom_topic -- the
+     predicted pose plus the velocity the command in force will produce -- and MPPI's
+     odom_topic points to it. With 6-8 on the Wuhan plant: corner 41 s / 0.4 turns,
+     hedge 82 s / 0.9 turns; on the 16-sept plant (0.36): 42 s and 75 s, 0.3 turns.
+
 Never run in the field.
 """
 import math
@@ -41,7 +63,7 @@ import math
 import numpy as np
 import rclpy
 from geometry_msgs.msg import PoseStamped, Twist
-from nav_msgs.msg import Path
+from nav_msgs.msg import Odometry, Path
 from rclpy.action import ActionClient
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
@@ -126,6 +148,39 @@ def predict_pose(x, y, yaw, commands, now, delay_s, k_v=1.11, k_w_moving=0.36,
     return x, y, yaw
 
 
+def estimate_k_w(commands, yaw_rates, now, delay_s, window_s, v_moving):
+    """Median observed/commanded yaw rate over the last window_s, moving and in place.
+
+    commands: [(t, v, w)] sent to the rover (each holds until the next); yaw_rates:
+    [(t, w_observed)]. A command sent at t shows at t + delay_s, so each observation
+    is paired with the command in force delay_s earlier; only clear turns count
+    (|w_cmd| >= 0.1 rad/s, and |w_obs| is not near zero by accident of a transient).
+    Returns {'moving': (ratio, n), 'in_place': (ratio, n)}.
+    """
+    ct = np.array([c[0] for c in commands])
+    cv = np.array([c[1] for c in commands])
+    cw = np.array([c[2] for c in commands])
+    out = {'moving': [], 'in_place': []}
+    for t, wo in yaw_rates:
+        if t < now - window_s:
+            continue
+        # the command in force over the 0.5 s before t - delay_s (MPPI changes it every 0.1 s):
+        # its mean, and only if it held roughly steady -- a transient pairs badly with the delay
+        a = int(np.searchsorted(ct, t - delay_s - 0.5, side='right')) - 1
+        b = int(np.searchsorted(ct, t - delay_s, side='right'))
+        if a < 0 or b - a < 1:
+            continue
+        seg_w = cw[a:b]
+        wc = float(seg_w.mean())
+        vc = float(cv[a:b].min())
+        if abs(wc) < 0.1 or float(seg_w.max() - seg_w.min()) > 0.3 * abs(wc):
+            continue
+        state = 'moving' if vc >= v_moving else ('in_place' if vc == 0.0 else None)
+        if state:
+            out[state].append(wo / wc)
+    return {k: (float(np.median(v)) if v else float('nan'), len(v)) for k, v in out.items()}
+
+
 def fill_isolated_misses(ranges, range_max, eps=0.05):
     """A bin that reports nothing (range_max) between two bins that both see
     something takes the nearer neighbour's range.
@@ -200,6 +255,23 @@ class Nav2RouteFollower(Node):
         self.declare_parameter('base_frame', 'rover_leg')
         self.declare_parameter('pred_frame', 'rover_pred')
         self.declare_parameter('executed_cmd_topic', '/cmd_vel')
+        # the velocity MPPI starts from, at the predicted pose's time: what the command in force
+        # now will make the rover do (config/nav2_mppi.yaml odom_topic points here). The measured
+        # odometry is 1.3 s old against rover_pred: after an in-place turn it still said 0.28 rad/s,
+        # and MPPI, bound by its acceleration limits, planned to keep turning -- 70 deg past the
+        # route every time (e2e corner, Wuhan plant)
+        self.declare_parameter('pred_odom_topic', '/erc/odometry/pred')
+        # yaw gain learned online (module docstring, 6); k_w_moving/_in_place are the start values
+        self.declare_parameter('k_w_auto', True)
+        self.declare_parameter('yaw_rate_topic', '/erc/odometry/local')
+        self.declare_parameter('k_w_window_s', 20.0)
+        self.declare_parameter('k_w_min_samples', 15)
+        self.declare_parameter('k_w_bounds', [0.2, 2.0])
+        # turn in place first (module docstring, 7); 0 disables
+        self.declare_parameter('turn_enter_deg', 50.0)
+        self.declare_parameter('turn_exit_deg', 20.0)
+        self.declare_parameter('turn_rate', 0.3)          # rad/s the rover should HAVE in place
+        self.declare_parameter('turn_lookahead_m', 1.0)
         p = self.get_parameter
 
         # nav2_msgs is only needed here; imported late so the error says what is missing
@@ -234,7 +306,15 @@ class Nav2RouteFollower(Node):
         self._tf_buf = Buffer()
         self._tf_listener = TransformListener(self._tf_buf, self)
         self._tf_pub = TransformBroadcaster(self)
+        self._odom_pub = self.create_publisher(Odometry, p('pred_odom_topic').value, 10)
         self._sent = []                 # (t, v, w) actually sent to the rover
+        self._yaw_rates = []            # (t, observed yaw rate)
+        self._k_w = {'moving': float(p('k_w_moving').value), 'in_place': float(p('k_w_in_place').value)}
+        self._dense = None              # (frame, (N, 3)) the path last sent to MPPI
+        self._pred = None               # (x, y, yaw) last predicted pose
+        self._turning = 0.0             # sign of the in-place turn in progress, 0 = MPPI drives
+        self.create_subscription(Odometry, p('yaw_rate_topic').value, self._on_yaw_rate, 10)
+        self.create_timer(1.0, self._update_k_w)
         self.create_subscription(Twist, p('executed_cmd_topic').value, self._on_executed, 10)
         self.create_timer(0.05, self._publish_prediction)
         self.get_logger().info('Nav2 route follower ready: route -> FollowPath (MPPI), '
@@ -285,8 +365,20 @@ class Nav2RouteFollower(Node):
 
     def _on_cmd(self, msg):
         g = lambda n: float(self.get_parameter(n).value)  # noqa: E731
-        v, w = snap_command(msg.linear.x, msg.angular.z, g('v_floor'), g('v_stop'), g('w_floor'),
-                            k_w_moving=g('k_w_moving'), k_w_in_place=g('k_w_in_place'), w_max=g('w_max'))
+        vin, win, source = msg.linear.x, msg.angular.z, 'mppi'
+        err = self._heading_error()
+        if err is not None and g('turn_enter_deg') > 0.0:
+            if self._turning == 0.0 and abs(err) > math.radians(g('turn_enter_deg')):
+                self._turning = math.copysign(1.0, err)
+            elif self._turning != 0.0 and abs(err) < math.radians(g('turn_exit_deg')):
+                self._turning = 0.0
+        else:
+            self._turning = 0.0
+        if self._turning != 0.0:
+            vin, win, source = 0.0, self._turning * g('turn_rate'), 'turn-in-place'
+        v, w = snap_command(vin, win, g('v_floor'), g('v_stop'), g('w_floor'),
+                            k_w_moving=self._k_w['moving'], k_w_in_place=self._k_w['in_place'],
+                            w_max=g('w_max'))
         if not self._enabled:
             v, w = 0.0, 0.0
         out = Twist()
@@ -294,7 +386,9 @@ class Nav2RouteFollower(Node):
         self._cmd_pub.publish(out)
         self._dbg_pub.publish(String(data=(
             f'[mppi] v_raw={msg.linear.x:.3f} w_raw={msg.angular.z:.3f} | '
-            f'linear_cmd={v:.4f} angular_cmd={w:.4f} | source=mppi')))
+            f'linear_cmd={v:.4f} angular_cmd={w:.4f} | source={source} | '
+            f'k_w moving={self._k_w["moving"]:.2f} in_place={self._k_w["in_place"]:.2f}'
+            + (f' | route_err={math.degrees(err):+.0f}deg' if err is not None else ''))))
 
     # -- the predicted pose -------------------------------------------------
     def _now(self):
@@ -319,13 +413,62 @@ class Nav2RouteFollower(Node):
         d = float(g('predict_delay_s'))
         if d > 0.0:
             x, y, yaw = predict_pose(x, y, yaw, self._sent, self._now(), d, float(g('k_v')),
-                                     float(g('k_w_moving')), float(g('k_w_in_place')))
+                                     self._k_w['moving'], self._k_w['in_place'])
+        self._pred = (x, y, yaw)
         out = TransformStamped()
         out.header.stamp = self.get_clock().now().to_msg()
         out.header.frame_id, out.child_frame_id = g('global_frame'), g('pred_frame')
         out.transform.translation.x, out.transform.translation.y = float(x), float(y)
         out.transform.rotation.z, out.transform.rotation.w = math.sin(yaw / 2), math.cos(yaw / 2)
         self._tf_pub.sendTransform(out)
+        od = Odometry()
+        od.header.stamp = out.header.stamp
+        od.header.frame_id, od.child_frame_id = g('global_frame'), g('pred_frame')
+        od.pose.pose.position.x, od.pose.pose.position.y = float(x), float(y)
+        od.pose.pose.orientation = out.transform.rotation
+        if self._sent:
+            _t, vc, wc = self._sent[-1]
+            vr = float(g('k_v')) * vc if abs(vc) >= 0.15 else 0.0
+            od.twist.twist.linear.x = float(vr)
+            od.twist.twist.angular.z = float((self._k_w['moving'] if vr else self._k_w['in_place']) * wc)
+        self._odom_pub.publish(od)
+
+    # -- learned yaw gain and turn-in-place ---------------------------------
+    def _on_yaw_rate(self, msg):
+        now = self._now()
+        self._yaw_rates.append((now, float(msg.twist.twist.angular.z)))
+        keep = now - float(self.get_parameter('k_w_window_s').value) - 5.0
+        while self._yaw_rates and self._yaw_rates[0][0] < keep:
+            self._yaw_rates.pop(0)
+
+    def _update_k_w(self):
+        g = lambda n: self.get_parameter(n).value  # noqa: E731
+        if not g('k_w_auto') or len(self._sent) < 2 or not self._yaw_rates:
+            return
+        k = estimate_k_w(self._sent, self._yaw_rates, self._now(), float(g('predict_delay_s')),
+                         float(g('k_w_window_s')), float(g('v_floor')) * 0.8)
+        lo, hi = [float(b) for b in g('k_w_bounds')]
+        for state, (ratio, n) in k.items():
+            if n >= int(g('k_w_min_samples')) and np.isfinite(ratio):
+                new = min(hi, max(lo, ratio))
+                if abs(new - self._k_w[state]) > 0.1:
+                    self.get_logger().info(f'yaw gain {state}: {self._k_w[state]:.2f} -> {new:.2f} '
+                                           f'(median of {n} samples)')
+                self._k_w[state] = new
+
+    def _heading_error(self):
+        """Signed angle from the PREDICTED heading to the path point turn_lookahead_m ahead."""
+        if self._pred is None or self._dense is None:
+            return None
+        _frame, d = self._dense
+        x, y, yaw = self._pred
+        i = int(np.argmin(np.hypot(d[:, 0] - x, d[:, 1] - y)))
+        j = min(len(d) - 1, i + max(1, int(float(self.get_parameter('turn_lookahead_m').value)
+                                           / float(self.get_parameter('path_step_m').value))))
+        if math.hypot(d[j, 0] - x, d[j, 1] - y) < 0.3:
+            return None               # at the end of the path: nothing to face
+        a = math.atan2(d[j, 1] - y, d[j, 0] - x) - yaw
+        return (a + math.pi) % (2 * math.pi) - math.pi
 
     # -- the goal ---------------------------------------------------------
     def _tick(self):
@@ -357,6 +500,7 @@ class Nav2RouteFollower(Node):
             dense = dense[i:] if len(dense) - i >= 2 else dense[-2:]
         except Exception:
             pass
+        self._dense = (frame, dense)
         path = Path()
         path.header.frame_id = frame
         path.header.stamp = self.get_clock().now().to_msg()
