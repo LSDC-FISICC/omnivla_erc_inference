@@ -757,8 +757,11 @@ class CheckpointControllerNode(Node):
             r = np.where(np.isfinite(r), r, scan.range_max)
             replanner.observe(_t, east, north, math.radians(90.0 - heading_deg), bearings, r, hit)
         new_pts, note = replanner.check(now, east, north, pts, cum, s_proj, extra_lethal)
-        if note:
-            (self.get_logger().info if new_pts is not None else self.get_logger().warn)(note)
+        # two call sites: rclpy raises if one call site changes severity
+        if note and new_pts is not None:
+            self.get_logger().info(note)
+        elif note:
+            self.get_logger().warn(note)
         return new_pts
 
     def _static_lethal(self, frame):

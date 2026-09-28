@@ -73,5 +73,8 @@ def generate_launch_description():
                 share('erc_perception'), 'launch', 'free_space.launch.py')),
             launch_arguments={'depth_backend': 'unidepth',
                               'obstacle_mode': 'height',
+                              # off on purpose: on rolling grass it would stop at every hill
+                              # top and descent (the camera cannot tell them from a drop)
+                              'drop_detection': 'false',
                               'clearance_m': LaunchConfiguration('clearance_m')}.items()),
     ])

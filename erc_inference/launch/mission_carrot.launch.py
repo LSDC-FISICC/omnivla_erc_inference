@@ -27,6 +27,10 @@ Arguments:
     depth_backend:=da3|unidepth  depth model of that profile. unidepth: UniDepthV2,
                                no far compression (mission_carrot_unidepth.launch.py
                                sets it). Needs ~/lsdc/erc-omni-vla/.venv-unidepth.
+    drop_detection:=false|true  (unidepth) also report where the ground ends
+                               abruptly -- raised edges, stairs going down -- as
+                               an obstacle. Stops at the top of descents and
+                               hills too: for parks/plazas, not rolling grass.
     obstacle_stop:=false|true  let carrot_controller_node BRAKE when that
                                profile sees something close straight ahead.
                                Brakes, never steers -- see its docstring. Needs
@@ -89,6 +93,9 @@ def generate_launch_description():
         DeclareLaunchArgument('depth_backend', default_value='da3',
                               description="free_space_node depth model: 'da3' or 'unidepth' "
                                           "(UniDepthV2; see mission_*_unidepth.launch.py)"),
+        DeclareLaunchArgument('drop_detection', default_value='false',
+                              description='free_space_node (unidepth): report drop-offs / stairs '
+                                          'going down; also stops at descents and hill tops'),
         DeclareLaunchArgument('obstacle_stop', default_value='false',
                               description='brake on /erc/free_space; never field-tested'),
         DeclareLaunchArgument('stop_distance_m', default_value='1.2',
@@ -134,7 +141,8 @@ def generate_launch_description():
             os.path.join(get_package_share_directory('erc_perception'), 'launch',
                          'free_space.launch.py')),
         launch_arguments={'obstacle_mode': LaunchConfiguration('obstacle_mode'),
-                          'depth_backend': LaunchConfiguration('depth_backend')}.items(),
+                          'depth_backend': LaunchConfiguration('depth_backend'),
+                          'drop_detection': LaunchConfiguration('drop_detection')}.items(),
         condition=IfCondition(LaunchConfiguration('perception')))
 
     localization = IncludeLaunchDescription(

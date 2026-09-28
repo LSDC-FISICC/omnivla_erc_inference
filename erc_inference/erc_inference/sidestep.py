@@ -44,7 +44,12 @@ ADVANCE, field ~100). Hence 60 deg, lead_s 2.4 (measured 2.0 = 37 / 18.6), settl
   -> FOLLOW. The carrot then pulls the rover back onto the route; the
            controller must be reset (step() says when) because its delay
            compensation recorded turns it never commanded.
-  GIVE_UP  v = w = 0 and stay. An operator takes over.
+  GIVE_UP  v = w = 0 for giveup_retry_s, then back to FOLLOW with the attempt
+           count cleared (0: stay until an operator takes over). A route through
+           a garden bed OSM calls open (Panama, 28-sept) ended every mission in a
+           permanent give-up; in controller_sim retrying after 15 s completes 8 of
+           12 garden missions instead of 4, with no hits, and changes nothing in
+           the scenarios that never give up.
 
 Repeated side-steps keep the SAME side within retry_window_s, so a long wall
 is walked along in steps instead of alternating sides; more than max_attempts
@@ -86,6 +91,7 @@ DEFAULTS = dict(
     side_open_m=0.6,         # best direction on a side must reach this
     retry_window_s=60.0,
     max_attempts=4,
+    giveup_retry_s=15.0,     # held still this long in GIVE_UP, then try again; 0 = hold forever
 )
 
 
@@ -111,6 +117,7 @@ class SideStep:
         self._hist = []              # (t, heading) while turning, for the rate
         self._target = self.p['turn_deg']
         self._extra = 0
+        self._giveup_t = None        # when the current give-up started holding
 
     # -- profile helpers --------------------------------------------------
     def _sector_min(self, bearings, free, lo, hi):
@@ -272,4 +279,11 @@ class SideStep:
                 return 0.0, 0.0, f'[side-step] resume after {moved:.2f}m', True
             return p['advance_v'], 0.0, f'[side-step] advance {moved:.2f}m', False
 
+        # GIVE_UP
+        if self._giveup_t is None:
+            self._giveup_t = now
+        if p['giveup_retry_s'] > 0.0 and now - self._giveup_t >= p['giveup_retry_s']:
+            self._giveup_t, self._attempts, self._n = None, [], 0
+            self.state = FOLLOW
+            return 0.0, 0.0, f'[side-step] retry after {p["giveup_retry_s"]:.0f}s give-up', True
         return 0.0, 0.0, '[side-step] give up (holding)', False
