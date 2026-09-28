@@ -40,6 +40,9 @@ ros2 run nav2_lifecycle_manager lifecycle_manager --ros-args -r __node:=lifecycl
   --params-file "$SRC/config/nav2_mppi.yaml" > "$OUT.lifecycle.log" 2>&1 & LM=$!
 # FOLLOWER_EXTRA: --ros-args overrides for the follower, e.g. "-p k_w_moving:=0.36" (24-sept default)
 python3 -m erc_inference.nav2_route_follower_node ${FOLLOWER_EXTRA:+--ros-args $FOLLOWER_EXTRA} > "$OUT.follower.log" 2>&1 & RF=$!
+# CP_DELAY: seconds before the checkpoint controller (terminal 3 in the field) comes up. In the field
+# it is launched by hand, often a minute or more after the mission launch (27-sept bring-up abort)
+sleep ${CP_DELAY:-0}
 python3 -m erc_inference.checkpoint_controller_node --ros-args \
   -p checkpoint_list_url:=http://127.0.0.1:8765/checkpoints-list \
   -p checkpoint_reached_url:=http://127.0.0.1:8765/checkpoint-reached \

@@ -261,6 +261,9 @@ class Nav2RouteFollower(Node):
         # and MPPI, bound by its acceleration limits, planned to keep turning -- 70 deg past the
         # route every time (e2e corner, Wuhan plant)
         self.declare_parameter('pred_odom_topic', '/erc/odometry/pred')
+        # before the first leg, publish rover_pred at the origin so the costmap can activate
+        # (see _publish_prediction); false = the pre-27-sept behaviour
+        self.declare_parameter('bringup_placeholder', True)
         # yaw gain learned online (module docstring, 6); k_w_moving/_in_place are the start values
         self.declare_parameter('k_w_auto', True)
         self.declare_parameter('yaw_rate_topic', '/erc/odometry/local')
@@ -406,15 +409,28 @@ class Nav2RouteFollower(Node):
         try:
             tr = self._tf_buf.lookup_transform(g('global_frame'), g('base_frame'), rclpy.time.Time())
         except Exception:
-            return
-        q = tr.transform.rotation
-        x, y = tr.transform.translation.x, tr.transform.translation.y
-        yaw = 2.0 * math.atan2(q.z, q.w)
+            tr = None
+        if tr is None:
+            if self._pred is not None or not g('bringup_placeholder'):
+                return            # a leg has run: keep the last real prediction, do not jump to 0
+            # No leg yet: checkpoint_controller_node (terminal 3, launched by hand) publishes
+            # leg_local only while it navigates a leg. The costmap needs rover_pred -> leg_local
+            # to ACTIVATE, and gave up after ~60 s -- "Failed to activate local_costmap ... Aborting
+            # bringup" (field, 27-sept, strategy 6), so MPPI never came up. A placeholder at the
+            # origin lets it activate; nothing can move: no route, no goal, enable_inference false.
+            x = y = yaw = 0.0
+            placeholder = True
+        else:
+            placeholder = False
+            q = tr.transform.rotation
+            x, y = tr.transform.translation.x, tr.transform.translation.y
+            yaw = 2.0 * math.atan2(q.z, q.w)
         d = float(g('predict_delay_s'))
-        if d > 0.0:
+        if d > 0.0 and not placeholder:
             x, y, yaw = predict_pose(x, y, yaw, self._sent, self._now(), d, float(g('k_v')),
                                      self._k_w['moving'], self._k_w['in_place'])
-        self._pred = (x, y, yaw)
+        if not placeholder:
+            self._pred = (x, y, yaw)
         out = TransformStamped()
         out.header.stamp = self.get_clock().now().to_msg()
         out.header.frame_id, out.child_frame_id = g('global_frame'), g('pred_frame')
