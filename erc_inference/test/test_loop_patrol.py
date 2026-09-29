@@ -225,3 +225,57 @@ def test_state_round_trip_resumes_at_the_next_goal_with_the_cone_map():
     m3 = mission()
     m3.import_state(state, first_goal_index=2)            # the SDK says CP2 is scanned too
     assert m3.goal.name == 'CP3'
+
+
+# -- the organisers' mechanics (29-sept): seen from <= 3 m, any order, judged on the video ----------
+
+def competition():
+    from erc_inference.loop_patrol import PATROL_COMPETITION
+    goals = [Goal('CP1', 'red_orange', 1), Goal('CP2', 'blue', 2), Goal('CP3', 'green', 3),
+             Goal('CP4', 'yellow', 4), Goal('Finish', 'red_orange', 5, is_start_cone=True)]
+    kw = dict(PATROL_COMPETITION, start_scan=False)
+    return LoopPatrolMission(goals, known(), (0.0, 0.0), 'red_orange', {'inflate_m': 0.35}, None, **kw)
+
+
+def show_through(m, t, x, y, yaw):
+    step = m.update(t, x, y, yaw)
+    while not step.arrived and t < 60.0:
+        t += 0.5
+        step = m.update(t, x, y, yaw)
+    return t, step
+
+
+def test_any_order_goes_to_the_nearest_cone_whatever_its_colour_and_shows_it():
+    m = competition()
+    for k in range(3):
+        m.observe_cone(20.0, -0.2, 0.0, 'green', 0.0, 1.5, t=0.1 * k)     # CP3's colour, first seen
+        m.observe_cone(20.0, -0.2, 0.0, 'blue', 0.0, 6.0, t=0.1 * k)
+    step = m.update(1.0, 20.0, -0.2, 0.0)
+    assert m.target is not None and m.target.cls == 'green'
+    assert step.state == 'show' and not step.arrived
+    t, step = show_through(m, 1.0, 20.0, -0.2, 0.0)
+    assert step.arrived and t - 1.0 >= m.p['show_s'] - 0.5          # held still for the judges
+    m.confirm(t, True)
+    assert m.index == 1 and not m.done
+
+
+def test_a_colour_is_shown_only_as_often_as_the_goal_images_have_it():
+    """A cone mapped twice (drift) must not be shown twice: blue once, red/orange twice."""
+    m = competition()
+    for k in range(3):
+        m.observe_cone(20.0, -0.2, 0.0, 'blue', 0.0, 1.5, t=0.1 * k)
+    t, _ = show_through(m, 1.0, 20.0, -0.2, 0.0)
+    m.confirm(t, True)
+    for k in range(3):                                                  # the same blue cone, 2.6 m off
+        m.observe_cone(24.0, -0.2, 0.0, 'blue', 0.0, 1.5, t=t + 0.1 * k)
+    m.update(t + 1.0, 24.0, -0.2, 0.0)
+    assert m.target is None
+
+
+def test_the_start_cone_is_not_assumed_in_any_order():
+    m = competition()
+    assert not any(c.name == 'start' for c in m.cones.clusters)
+    state = json.loads(json.dumps(m.export_state()))
+    m2 = competition()
+    m2.import_state(state)
+    assert not any(c.name == 'start' for c in m2.cones.clusters)

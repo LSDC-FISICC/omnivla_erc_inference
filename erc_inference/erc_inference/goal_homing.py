@@ -108,6 +108,7 @@ class GoalMatcher:
         if abs(w / h - aspect_cam) > 0.02:
             self.warning = (f'goal image is {w}x{h}, the camera {self.cam.width}x{self.cam.height_px}: '
                             'a different camera? its intrinsics are unknown, estimates will be biased')
+        self.goal_w = w
         self.goal_kp, self.goal_des, self.goal_size = self._features(goal_rgb)
         self.goal_n = self._normalize(self.goal_kp, w)
 
@@ -303,3 +304,32 @@ def _rotation_fit(a, b, iters=3):
         res = np.arccos(np.clip(np.sum((a @ R.T) * b, axis=1), -1.0, 1.0))
         keep = res <= max(3.0 * float(np.median(res)), 1e-4)
     return R, res
+
+
+def photo_scores(matchers, rgb, ransac_px=2.0):
+    """How well one frame matches each goal photo, taken with ANY camera: SIFT inliers of a
+    fundamental matrix (pixels, no intrinsics), and where in the frame they are (median bearing,
+    degrees, left-positive, through the rover's camera model): one (inliers, bearing) per
+    matcher. The frame's features are computed once."""
+    if not matchers:
+        return []
+    cv2 = matchers[0].cv2
+    kp, des, _ = matchers[0]._features(rgb)
+    out = []
+    cur_n = matchers[0]._normalize(kp, rgb.shape[1]) if len(kp) else np.zeros((0, 2))
+    for m in matchers:
+        pairs = m._match(des)
+        if len(pairs) < 8:
+            out.append((0, float('nan')))
+            continue
+        ww = float(m.p['work_width'])     # both images at the width they were matched at
+        a = kp[pairs[:, 0]] * (ww / rgb.shape[1])
+        b = m.goal_kp[pairs[:, 1]] * (ww / m.goal_w)
+        F, mask = cv2.findFundamentalMat(a, b, cv2.FM_RANSAC, ransac_px, 0.999)
+        if F is None or mask is None or not mask.any():
+            out.append((0, float('nan')))
+            continue
+        inl = mask.ravel().astype(bool)
+        brg = float(np.degrees(np.median(-np.arctan(cur_n[pairs[inl, 0], 0]))))
+        out.append((int(inl.sum()), brg))
+    return out

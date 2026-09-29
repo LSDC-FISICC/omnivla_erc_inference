@@ -14,9 +14,15 @@ Earth-rover-ros2-bridge/docs/PLAN_OFFROAD.md.
                       turn-in-place from 45 deg, reading the mission's pseudo-fix; or an
                       OmniVLA node (model:=edge|original) remapped the same way.
 
+    erc_perception    flag_detector_node -> /erc/flags: the blue checkpoint flags (CPU).
+
 Not here, by hand -- it is the only writer of /cmd_vel, so killing it takes the rover back.
-The goal image is its parameter (a path; several separated by commas, visited in order; or a
-directory), read again at every start_mission:
+The organisers (29-sept): three blue flags are the checkpoints, within 1 m of each:
+
+    ros2 run erc_inference flag_checkpoint_node --ros-args -p goal_image:=cp1.jpg,cp2.jpg,cp3.jpg
+
+(the photos are optional hints of which flag is which; without them -p checkpoints:=3). The
+earlier photo-homing mission, for a goal that is a view and not a flag:
 
     ros2 run erc_inference image_goal_offroad_node --ros-args -p goal_image:=/path/goal.jpg
     ros2 action send_goal --feedback /start_mission erc_inference_msgs/action/StartMission \\
@@ -26,6 +32,7 @@ goal_image here only goes into the reminder printed at the end, so the command c
 
 Arguments: model:=none|edge|original, depth_backend:=unidepth|da3, drop_detection:=true|false,
 clearance_m:= (empty: perception.yaml's 0.045 m, the rover's ground clearance),
+flag_height_m:=0.15 (the flag cloth's vertical extent, assumed; the mission refits it),
 goal_image:=/path.jpg (reminder only).
 
 LIVE operation only; it starts the SDK bridge.
@@ -40,6 +47,7 @@ from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import EqualsSubstitution, LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 # Must match indoor_mission_node's fix_topic / heading_topic defaults (the off-road node
 # publishes the same pseudo-fix).
@@ -62,6 +70,9 @@ def generate_launch_description():
         DeclareLaunchArgument('clearance_m', default_value='',
                               description="lowest height (m) that counts as an obstacle; empty = perception.yaml "
                                           "(0.045, the rover's ground clearance)"),
+        DeclareLaunchArgument('flag_height_m', default_value='0.15',
+                              description="the flag cloth's vertical extent (m): ASSUMED; ranges scale with it "
+                                          "until the mission fits it from odometry"),
         DeclareLaunchArgument('goal_image', default_value='/path/to/goal.jpg',
                               description='only for the reminder printed at the end: the mission node takes it'),
     ]
@@ -100,11 +111,15 @@ def generate_launch_description():
                           'drop_detection': LaunchConfiguration('drop_detection'),
                           'clearance_m': LaunchConfiguration('clearance_m')}.items())
 
+    flags = Node(package='erc_perception', executable='flag_detector_node', name='flag_detector_node',
+                 output='screen',
+                 parameters=[{'flag_height_m': ParameterValue(LaunchConfiguration('flag_height_m'), value_type=float)}])
+
     reminder = LogInfo(msg=(
         'mission_offroad up (model=', LaunchConfiguration('model'), ', drop_detection=',
-        LaunchConfiguration('drop_detection'), '). Then: ros2 run erc_inference image_goal_offroad_node '
+        LaunchConfiguration('drop_detection'), '). Then: ros2 run erc_inference flag_checkpoint_node '
         '--ros-args -p goal_image:=', LaunchConfiguration('goal_image'),
         '  and  ros2 action send_goal --feedback /start_mission erc_inference_msgs/action/StartMission '
         '"{resume_from_latest_scanned: false}"'))
 
-    return LaunchDescription(args + bridge + inference + [localization, perception, reminder])
+    return LaunchDescription(args + bridge + inference + [localization, perception, flags, reminder])

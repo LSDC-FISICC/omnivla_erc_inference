@@ -69,7 +69,8 @@ from erc_inference.image_goal_mission import Goal
 from erc_inference.indoor_mission_node import IndoorMissionNode, yaw_from_quaternion
 from erc_inference.indoor_track import Pose2D, anchor
 from erc_inference.loop_patrol import DEFAULTS as PATROL_DEFAULTS
-from erc_inference.loop_patrol import LOCAL_INDOOR, SAFETY_INDOOR, KnownMap, LoopPatrolMission, WallLocalizer
+from erc_inference.loop_patrol import (LOCAL_INDOOR, PATROL_COMPETITION, SAFETY_INDOOR, KnownMap, LoopPatrolMission,
+                                      WallLocalizer)
 from erc_inference.safety_envelope import DEFAULTS as SAFETY_DEFAULTS
 from erc_inference.safety_envelope import SafetyEnvelope, parameter_errors as safety_errors
 
@@ -101,7 +102,9 @@ def load_goals(path, logger):
 class ImageCheckpointControllerNode(IndoorMissionNode):
 
     def __init__(self):
-        super().__init__('image_checkpoint_controller_node')
+        # the organisers (29-sept): points are judged by eye on the video (a cone seen from <= 3 m), not by
+        # the SDK -- no checkpoint-reached by default (a rejection would make it drop a good cone)
+        super().__init__('image_checkpoint_controller_node', confirm_with_sdk=False)
         share = get_package_share_directory('erc_inference')
         self.declare_parameter('goals_file', os.path.join(share, 'config', 'indoor_nyu_goals.yaml'))
         self.declare_parameter('cones_topic', '/erc/cones')
@@ -115,7 +118,7 @@ class ImageCheckpointControllerNode(IndoorMissionNode):
         self.declare_parameter('localize', True)
         self.declare_parameter('tick_rate_hz', 3.0)
         for name, default in PATROL_DEFAULTS.items():
-            self.declare_parameter(f'patrol.{name}', default)
+            self.declare_parameter(f'patrol.{name}', PATROL_COMPETITION.get(name, default))
         for name, default in SAFETY_DEFAULTS.items():
             self.declare_parameter(name, SAFETY_INDOOR.get(name, default))
         for name, default in LOCAL_INDOOR.items():
@@ -480,7 +483,8 @@ class ImageCheckpointControllerNode(IndoorMissionNode):
                         m.confirm(self._now(), accepted)
                     if accepted:
                         result.last_checkpoint_sequence = g.sequence
-                        self.get_logger().info(f'{g.name} confirmed ({m.index}/{len(self.goals)}).')
+                        self.get_logger().info(f'cone {m.index}/{len(self.goals)} shown.' if m.p['any_order'] else
+                                               f'{g.name} confirmed ({m.index}/{len(self.goals)}).')
                     if completed:
                         break
                     continue

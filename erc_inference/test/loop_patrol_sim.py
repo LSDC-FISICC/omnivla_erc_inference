@@ -108,7 +108,9 @@ def walls_with_doors(rng, n=3):
 def run(layout='loop', world='chairs', seed=0, drift=(0.01, 0.01, 0.5), k_w=1.1, image_lag_s=0.8,
         localize=True, stop=False, stop_distance_m=0.7, max_linear=0.25, gt45=True, direction=1,
         mission_params=None, lp_params=None, rec_params=None, t_limit=2400.0, leg_limit_s=700.0,
-        goals=None, stuck=True, record=False):
+        goals=None, stuck=True, record=False, competition=False, see_m=3.0):
+    """competition: the organisers' mechanics (29-sept) -- a cone scores when the rover shows it
+    from <= see_m (in the camera's view), any order, no SDK; the mission in PATROL_COMPETITION mode."""
     """goals: override the mission (e.g. [Goal('X', 'never')] to patrol only)."""
     rng = np.random.default_rng(seed)
     if world in ('doors', 'chairs+doors'):
@@ -142,6 +144,10 @@ def run(layout='loop', world='chairs', seed=0, drift=(0.01, 0.01, 0.5), k_w=1.1,
     wl = WallLocalizer(km)
     goals = goals or [Goal(n, c, i + 1, is_start_cone=(n == 'Finish')) for i, (n, c, _) in enumerate(MISSION)]
     mp = dict(direction=direction)
+    if competition:
+        from erc_inference.loop_patrol import PATROL_COMPETITION
+        mp.update(PATROL_COMPETITION)
+    scored = {}
     mp.update(mission_params or {})
     lpp = dict(LOCAL_INDOOR)
     lpp.update(lp_params or {})
@@ -198,7 +204,24 @@ def run(layout='loop', world='chairs', seed=0, drift=(0.01, 0.01, 0.5), k_w=1.1,
             rate = 0.0
             if len(yaws) >= 2 and yaws[-1][0] - yaws[0][0] > 0.3:
                 rate = abs(cs.mc.clip_angle(yaws[-1][1] - yaws[0][1])) / (yaws[-1][0] - yaws[0][0])
-            if confirm_at is not None:
+            if confirm_at is not None and competition:
+                if t >= confirm_at:
+                    best, best_d = None, math.inf
+                    for n, cpos in cone_xy.items():
+                        d = float(np.hypot(rover.x - cpos[0], rover.y - cpos[1]))
+                        brg = math.degrees(cs.mc.clip_angle(math.atan2(cpos[1] - rover.y, cpos[0] - rover.x)
+                                                            - rover.theta))
+                        if d <= see_m and abs(brg) <= 55.0 and n not in scored and d < best_d:
+                            best, best_d = n, d
+                    if best is not None:
+                        scored[best] = (round(t, 1), round(best_d, 2))
+                        results.append(dict(name=best, reached=True, err=round(best_d, 2), time=round(t - leg_t0, 1)))
+                        leg_t0 = t
+                    mission.confirm(t, True)
+                    confirm_at = None
+                    controller.reset()
+                model_cmd, pending = (0.0, 0.0), None
+            elif confirm_at is not None:
                 if t >= confirm_at:
                     g = mission.goal
                     err = float(np.hypot(rover.x - cone_xy[g.name][0], rover.y - cone_xy[g.name][1])) if g.name in cone_xy else 99.0
@@ -217,7 +240,7 @@ def run(layout='loop', world='chairs', seed=0, drift=(0.01, 0.01, 0.5), k_w=1.1,
                 if step.arrived:
                     confirm_at = t + 1.5
                     model_cmd, pending = (0.0, 0.0), None
-                elif t - leg_t0 > leg_limit_s:
+                elif t - leg_t0 > leg_limit_s and not competition:
                     g = mission.goal
                     err = float(np.hypot(rover.x - cone_xy[g.name][0], rover.y - cone_xy[g.name][1])) if g.name in cone_xy else 99.0
                     results.append(dict(name=g.name, reached=False, err=round(err, 2), time=round(t - leg_t0, 1)))
@@ -255,7 +278,7 @@ def run(layout='loop', world='chairs', seed=0, drift=(0.01, 0.01, 0.5), k_w=1.1,
             hits.append((round(t, 1), round(rover.x, 1), round(rover.y, 1)))
         hit_now = now_hit
         t += dt
-    while len(results) < len(goals):
+    while len(results) < len(goals) and not competition:
         results.append(dict(name=goals[len(results)].name, reached=False, err=float('nan'), time=float('nan')))
     return dict(layout=layout, world=world, seed=seed, reached=sum(r['reached'] for r in results),
                 legs=len(goals), hits=len(hits), hit_at=hits, min_clear=min_clear, time=round(t, 1),

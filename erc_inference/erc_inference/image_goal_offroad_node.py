@@ -96,15 +96,16 @@ def image_to_rgb(msg: Image) -> np.ndarray:
 
 class ImageGoalOffroadNode(IndoorMissionNode):
 
-    def __init__(self):
-        # the arena file only gives the start pose, (0, 0, 0): the odometry frame where the goal is sent
-        super().__init__('image_goal_offroad_node', route_file='offroad_arena.yaml')
+    def __init__(self, node_name='image_goal_offroad_node', mission_timeout_s=900.0):
+        # the arena file only gives the start pose, (0, 0, 0): the odometry frame where the goal is sent.
+        # No SDK confirmation by default: the organisers judge by eye on the video (29-sept).
+        super().__init__(node_name, route_file='offroad_arena.yaml', confirm_with_sdk=False)
         self.declare_parameter('goal_image', '')
         self.declare_parameter('image_topic', '/erc/front_camera')
         self.declare_parameter('free_space_topic', '/erc/free_space')
         self.declare_parameter('attitude_topic', '/erc/imu_attitude')
         self.declare_parameter('homing_topic', '/erc/homing')
-        self.declare_parameter('mission_timeout_s', 900.0)
+        self.declare_parameter('mission_timeout_s', float(mission_timeout_s))
         self.declare_parameter('tick_rate_hz', 3.0)
         self.declare_parameter('homing_rate_hz', 3.0)
         # the picture is older than its stamp (TAREA1 6.2: 0.3-0.6 s); stop-and-go makes it

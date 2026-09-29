@@ -288,6 +288,196 @@ def run(seed=0, n_boulders=10, drift=(0.02, 0.02, 1.0), k_w=1.1, image_lag_s=0.8
                 min_clear=round(min_clear, 2), notes=mission.notes, trace=trace)
 
 
+def occluded(scene, x, y, px, py, pz):
+    """Is the point (px, py, pz) hidden from the camera at (x, y) by a boulder?"""
+    d = np.array([px - x, py - y])
+    dist = float(np.hypot(*d))
+    for b in scene.boulders:
+        bc = b.c - (x, y)
+        t = float(d @ bc) / max(dist, 1e-9)
+        perp = abs(d[0] * bc[1] - d[1] * bc[0]) / max(dist, 1e-9)
+        if 0 < t < dist - 0.05 and perp < b.r and CAM_H + (pz - CAM_H) * t / dist < b.r:
+            return True
+    return False
+
+
+def run_flags(seed=0, n_boulders=10, drift=(0.02, 0.02, 1.0), k_w=1.1, image_lag_s=0.8, t_limit=1800.0,
+              flag_h=None, photos=True, mission_params=None, record=False, judge_m=1.0, competition=False,
+              see_m=3.0):
+    """The organisers' version (29-sept): three blue flags are the checkpoints, within 1 m of
+    each, in order; goal photos from another camera. The SDK is emulated: an arrival is
+    accepted within judge_m of the current checkpoint's flag."""
+    from erc_inference.flag_mission import FlagMission
+    rng = np.random.default_rng(seed)
+    scene = Scene(rng, n_boulders)
+    flags = []
+    while len(flags) < 3:
+        f = scene.free_pose(rng)
+        if np.hypot(*f) > 1.0 and all(np.hypot(*(f - g)) > 1.5 for g in flags):
+            flags.append(f)
+    H = float(flag_h if flag_h is not None else rng.uniform(0.10, 0.22))
+    H0, Z = 0.15, 0.25                    # the detector's assumed height; the cloth's bottom
+    from erc_inference.goal_homing import _undistort as _und
+
+    def matcher_n(u):                     # pixel column -> undistorted normalized x (row at the centre)
+        xd = (np.asarray(u, float) - CAM.cx) / CAM.f
+        return _und(xd, np.zeros_like(xd), CAM.lam)[0]
+    photo = []
+    for f in flags:                       # each photo: ~1.5 m from its flag, facing it
+        a = rng.uniform(-math.pi, math.pi)
+        pp = (f[0] + 1.5 * math.cos(a), f[1] + 1.5 * math.sin(a), a + math.pi)
+        photo.append((pp, scene.view(*pp)))
+
+    params = cs.controller_params({'polar.steering_source': 'carrot', 'max_linear_vel': 0.25,
+                                   'goal_turn.enter_deg': 45.0, 'goal_turn.exit_deg': 15.0})
+    model = replace(cs.RoverModel(), k_w_moving=k_w, heading_bias_deg=0.0)
+    cone_sim.Drift.wheel_scale, cone_sim.Drift.gyro_scale, cone_sim.Drift.gyro_bias_deg_min = drift
+    rover = cs.Rover(model, 0.0, 0.0, 0.0, rng=np.random.default_rng(seed + 1000))
+    loc = cone_sim.Drift(model, rng)
+    controller = mc.MotionController(params)
+    shaper = mc.CommandShaper(0.3, 0.6, 0.6, 1.2)
+    envelope = SafetyEnvelope()
+    safety = dict(SAFETY, **SAFETY_OFFROAD)
+    mp = {}
+    if competition:                       # the organisers' mechanics: seen from <= see_m, any order
+        from erc_inference.flag_mission import FLAG_COMPETITION
+        mp.update(FLAG_COMPETITION)
+    mp.update(mission_params or {})
+    mission = FlagMission(3, (0.0, 0.0), dict(LOCAL_OFFROAD), None, **mp)
+    scored = set()
+
+    straight = [(0.4 * (i + 1), 0.0, 1.0, 0.0) for i in range(8)]
+    tick, out_period, cam_period, latency = 1.0 / params['tick_rate'], 0.1, 1.0 / 3.0, 0.17
+    history, yaws = deque(), deque()
+    hits, hit_now, flag_hits = [], False, 0
+    next_tick = next_out = next_cam = next_photo = 0.0
+    pending, model_cmd = None, (0.0, 0.0)
+    confirm_at = None
+    results, rejections = [], 0
+    leg_t0 = 0.0
+    trace = []
+    t, dt = 0.0, 0.02
+    loc.update(t, dt, rover)
+    while t < t_limit and not mission.done and not (competition and len(scored) == len(flags)):
+        loc.update(t, dt, rover)
+        ex, ey, eth = loc.estimate()
+        history.append((t, rover.x, rover.y, rover.theta, ex, ey, eth))
+        while len(history) > 1 and history[1][0] <= t - image_lag_s:
+            history.popleft()
+        yaws.append((t, eth))
+        while len(yaws) > 1 and yaws[0][0] < t - 1.0:
+            yaws.popleft()
+        if t >= next_cam:
+            next_cam += cam_period
+            tl, lx, ly, lth, lex, ley, leth = history[0]
+            pb, pf, pc = obs.profile(lx, ly, lth, scene.world, rng)
+            hit = pf < pc - 1e-3
+            mission.observe_scan(t, lex, ley, leth, pb, pf, hit)
+            envelope.observe_free_space(t, pb, np.where(hit, pf, 3.0), 3.0)
+            for f in flags:
+                d = float(np.hypot(f[0] - lx, f[1] - ly))
+                brg = math.degrees(cs.mc.clip_angle(math.atan2(f[1] - ly, f[0] - lx) - lth))
+                if abs(brg) > 55.0 or d < 0.35 or d > 8.0 or rng.random() > (0.9 if d < 5 else 0.6):
+                    continue
+                if occluded(scene, lx, ly, f[0], f[1], Z + 0.5 * H):
+                    continue
+                ang = H / d * (1 + rng.normal(0, 0.04)) + rng.normal(0, 0.7 / CAM.f)
+                if ang <= 0:
+                    continue
+                mission.observe_cone(lex, ley, leth, 'blue', brg + rng.normal(0, 0.7), H0 / ang, t=tl,
+                                     ang_height=ang)
+        if photos and t >= next_photo:
+            next_photo += 1.0
+            tl, lx, ly, lth, lex, ley, leth = history[0]
+            cu, cidx = scene.view(lx, ly, lth)
+            sc = []
+            for (pp, (gu, gidx)) in photo:
+                common = np.intersect1d(gidx, cidx)
+                dyaw = abs(math.degrees(cs.mc.clip_angle(lth - pp[2])))
+                dd = math.hypot(lx - pp[0], ly - pp[1])
+                keep = 0.3 * math.exp(-dyaw / 50.0) * math.exp(-dd / 6.0)   # another camera: half as good
+                sel = common[rng.random(len(common)) < np.where(scene.owner[common] == -2, 0.3, 1.0) * keep]
+                if len(sel):
+                    u = cu[np.searchsorted(cidx, sel), 0]
+                    xn = matcher_n(u)
+                    sc.append((len(sel), float(np.degrees(np.median(-np.arctan(xn))))))
+                else:
+                    sc.append((0, float('nan')))
+            mission.observe_scene(tl, lex, ley, leth, sc)
+        if t >= next_tick:
+            next_tick += tick
+            rate = 0.0
+            if len(yaws) >= 2 and yaws[-1][0] - yaws[0][0] > 0.3:
+                rate = abs(cs.mc.clip_angle(yaws[-1][1] - yaws[0][1])) / (yaws[-1][0] - yaws[0][0])
+            if confirm_at is not None:
+                if t >= confirm_at and competition:
+                    # the judges: every flag in view from <= see_m while the rover shows (not hidden by a boulder)
+                    for k, f in enumerate(flags):
+                        d = float(np.hypot(rover.x - f[0], rover.y - f[1]))
+                        brg = math.degrees(cs.mc.clip_angle(math.atan2(f[1] - rover.y, f[0] - rover.x) - rover.theta))
+                        if d <= see_m and abs(brg) <= 55.0 and k not in scored \
+                                and not occluded(scene, rover.x, rover.y, f[0], f[1], Z + 0.5 * H):
+                            scored.add(k)
+                            results.append(dict(cp=k + 1, err=round(d, 2), time=round(t - leg_t0, 1)))
+                            leg_t0 = t
+                    mission.confirm(t, True)
+                    confirm_at = None
+                    controller.reset()
+                elif t >= confirm_at:
+                    k = mission.index
+                    err = float(np.hypot(rover.x - flags[k][0], rover.y - flags[k][1]))
+                    ok = err <= judge_m
+                    if ok:
+                        results.append(dict(cp=k + 1, err=round(err, 2), time=round(t - leg_t0, 1)))
+                        leg_t0 = t
+                    else:
+                        rejections += 1
+                    mission.confirm(t, ok)
+                    confirm_at = None
+                    controller.reset()
+                model_cmd, pending = (0.0, 0.0), None
+            else:
+                step = mission.update(t, ex, ey, eth, rate)
+                if step.arrived:
+                    confirm_at = t + 1.5
+                    model_cmd, pending = (0.0, 0.0), None
+                elif step.command is not None:
+                    controller.note_idle(t)
+                    vv, ww, _h, _n = envelope.limit(t, step.command[0], step.command[1], safety)
+                    pending = (t + latency, (vv, ww))
+                elif step.carrot is not None:
+                    cx, cy, _ = step.carrot
+                    rel_x, rel_y = mc.robot_frame_offset(cx - ex, cy - ey, 90.0 - math.degrees(eth))
+                    bearing = mc.goal_bearing_from_offset(rel_x, rel_y)
+                    _m, vv, ww, _ = controller.command(t + latency, params, bearing, math.hypot(rel_x, rel_y),
+                                                       straight, 4, True)
+                    vv, ww, _h, _n = envelope.limit(t, vv, ww, safety)
+                    pending = (t + latency, (vv, ww))
+        if pending is not None and t >= pending[0]:
+            model_cmd, pending = pending[1], None
+        if t >= next_out:
+            next_out += out_period
+            lin, ang_ = shaper.step(model_cmd[0], model_cmd[1], out_period)
+            rover.command(t, lin, ang_)
+        if record and (not trace or t - trace[-1][0] >= 0.5):
+            trace.append((round(t, 1), mission.index, mission.state, round(rover.x, 2), round(rover.y, 2)))
+        px, py = rover.x, rover.y
+        rover.step(t, dt)
+        if obs.clearance((rover.x, rover.y), scene.world) <= obs.FOOTPRINT_W / 2 - 0.02:
+            rover.x, rover.y = px, py
+        c = obs.clearance((rover.x, rover.y), scene.world)
+        now_hit = c <= obs.FOOTPRINT_W / 2
+        if now_hit and not hit_now:
+            hits.append((round(t, 1), round(rover.x, 1), round(rover.y, 1)))
+        hit_now = now_hit
+        flag_hits += int(any(np.hypot(rover.x - f[0], rover.y - f[1]) < 0.12 for f in flags))
+        t += dt
+    return dict(seed=seed, H=round(H, 3), reached=len(results), time=round(t, 1), results=results,
+                rejections=rejections, hits=len(hits), flag_contact_s=round(flag_hits * dt, 1),
+                stucks=mission.stucks, fitted=[round(f.height, 3) for f in mission.flags if math.isfinite(f.height)],
+                n_flags_mapped=len(mission.flags), notes=mission.notes, trace=trace)
+
+
 def _job(a):
     return run(**a)
 

@@ -77,7 +77,7 @@ def yaw_from_quaternion(q) -> float:
 
 class IndoorMissionNode(Node):
 
-    def __init__(self, node_name='indoor_mission_node', route_file='indoor_nyu_track.yaml'):
+    def __init__(self, node_name='indoor_mission_node', route_file='indoor_nyu_track.yaml', confirm_with_sdk=True):
         super().__init__(node_name)
 
         self.declare_parameter('route_file', os.path.join(
@@ -91,7 +91,7 @@ class IndoorMissionNode(Node):
         self.declare_parameter('checkpoint_reached_url', 'http://localhost:8000/checkpoint-reached')
         # How the SDK validates a checkpoint indoors is not in the NYU PDF. True
         # asks it exactly as outdoors; false accepts the dead-reckoned arrival.
-        self.declare_parameter('confirm_with_sdk', True)
+        self.declare_parameter('confirm_with_sdk', bool(confirm_with_sdk))
         self.declare_parameter('model_cmd_vel_topic', '/omnivla/cmd_vel')
         self.declare_parameter('cmd_vel_topic', '/cmd_vel')
         self.declare_parameter('goal_gps_topic', '/goal_gps')

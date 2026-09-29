@@ -43,6 +43,7 @@ setup(
             'indoor_mission_node = erc_inference.indoor_mission_node:main',
             'image_checkpoint_controller_node = erc_inference.image_checkpoint_controller_node:main',
             'image_goal_offroad_node = erc_inference.image_goal_offroad_node:main',
+            'flag_checkpoint_node = erc_inference.flag_checkpoint_node:main',
         ],
     },
 )

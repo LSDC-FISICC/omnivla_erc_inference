@@ -46,9 +46,19 @@ from erc_inference import local_planner as lp
 from erc_inference import local_recovery as lr
 from erc_inference.image_goal_mission import Goal, _cumlen, _wrap, point_at, project_forward
 
-PATROL, GOTO, SCAN, ARRIVED, DONE = 'patrol', 'goto', 'scan', 'arrived', 'done'
+PATROL, GOTO, SCAN, ARRIVED, DONE, SHOW = 'patrol', 'goto', 'scan', 'arrived', 'done', 'show'
 
 DEFAULTS = dict(
+    # competition mechanics (organisers, 29-sept): a cone scores when the rover SEES it from 3 m or
+    # less, judged by eye on the video, in any order. any_order: visit the nearest unvisited cone of
+    # any colour (the orange start cone too, after a scan at the start); show_s: at arrive_m, face
+    # it and hold still that long for the judges. Off by default (the ordered, SDK-checked mission).
+    any_order=False,
+    show_s=0.0,
+    show_face_deg=30.0,         # turn to the cone if it is further off the camera axis than this
+    start_scan=False,           # a full turn at the start (the start cone may be beside or behind)
+    same_class_apart_m=3.0,     # any order: a second cone of a class (red and orange are one) must be this far
+                                # from the one already shown -- otherwise it is that cone mapped twice
     direction=1,                # +1: the ring's own order (CCW on NYU), -1: the other way
     patrol_ahead_m=25.0,        # patrol route length ahead of the rover, rebuilt as it goes
     patrol_rebuild_m=10.0,
@@ -119,6 +129,10 @@ DEFAULTS = dict(
 # from finishing -- 74/180 cones and 5/36 missions with it alone, 158/180 and 27/36 with it plus
 # the stuck recovery, 174/180 and 32/36 without it (the recovery on). The cost is ~3-8 contacts
 # per mission at 0.25 m/s, which the team accepts; tipping over is what must not happen.
+# the organisers' mechanics (29-sept): points for SEEING each cone from <= 3 m, any order, judged on
+# the video; no SDK checkpoints. The node's defaults.
+PATROL_COMPETITION = {'any_order': True, 'show_s': 5.0, 'start_scan': True, 'arrive_m': 1.8}
+
 SAFETY_INDOOR = {'safety.max_linear_vel': 0.25, 'safety.stop_distance_m': 0.7,
                  'safety.obstacle_enabled': False, 'safety.tilt_enabled': True,
                  'safety.stop_if_attitude_stale': False, 'safety.max_reverse_vel': 0.25}
@@ -507,9 +521,12 @@ class LoopPatrolMission:
         self.recovery = lr.BlockedRecovery(**rec)
         self.lethal = known.lethal_fn(self.p['wall_tolerance_m'])
         self.cones = ConeMap(self.p)
-        start = ConeCluster(start_cone_class, [self.start.copy()] * self.p['min_confirm'], name='start',
-                            times=[-math.inf] * self.p['min_confirm'])
-        self.cones.clusters.append(start)
+        if not self.p['any_order']:
+            # the ordered mission's Finish is the start cone, assumed next to the start pose; in any
+            # order it is just a cone, found by looking
+            start = ConeCluster(start_cone_class, [self.start.copy()] * self.p['min_confirm'], name='start',
+                                times=[-math.inf] * self.p['min_confirm'])
+            self.cones.clusters.append(start)
         self.direction = int(self.p['direction'])
         self.index = 0
         self._arrive0 = self.p['arrive_m']
@@ -539,6 +556,14 @@ class LoopPatrolMission:
         self._stuck_at = []              # (t, x, y, direction) of recent stuck events
         self._avoid_dir = None           # (direction, until): the way round that got stuck
         self.stucks = 0
+        self._show_phase, self._show_t0 = None, 0.0
+        if self.p['start_scan']:
+            # there and back, not a full circle: views at 0, +90, 180, -90 deg, but the turns cancel,
+            # and with them the gyro's scale error (3% of a 360 deg turn is 11 deg of heading, before
+            # any wall has corrected anything -- the full circle lost the pose in high-drift runs)
+            h = math.pi / 2
+            self._scan_queue = [h, 2 * h, h, 0.0, -h, 0.0]
+            self.state = SCAN
 
     @property
     def goal(self) -> Optional[Goal]:
@@ -592,6 +617,8 @@ class LoopPatrolMission:
             if self.target is not None:
                 self.target.visited = True
                 self.target.name = self.goal.name if self.target.name != 'start' else 'start'
+                if self.p['any_order']:
+                    self.target.name = f'cone{self.index + 1}'
                 self._mark(self.target.estimate(self.p['fuse_n']))
             self.notes.append(f'{t:.1f} {self.goal.name} confirmed')
             self.index += 1
@@ -706,7 +733,7 @@ class LoopPatrolMission:
             self.cones.clusters.append(cl)
             if cl.visited and cl.name not in ('start', 'rejected'):
                 self._mark(cl.estimate(self.p['fuse_n']))
-        if not any(c.name == 'start' for c in self.cones.clusters):
+        if not self.p['any_order'] and not any(c.name == 'start' for c in self.cones.clusters):
             self.cones.clusters.append(ConeCluster(self.goals[-1].cone_class if self.goals else 'red_orange',
                                                    [self.start.copy()] * self.p['min_confirm'], name='start',
                                                    times=[-math.inf] * self.p['min_confirm']))
@@ -824,7 +851,30 @@ class LoopPatrolMission:
         self._s_ring = s_now
         g = self.goal
         # the target: the goal's cone on the cone map (the start cone for the Finish)
-        if self.target is None:
+        if self.target is None and p['any_order']:
+            # each colour as many times as the goal images have it (red_orange twice: red + orange);
+            # with drift one cone can land twice on the map, and showing it twice scores nothing
+            quota = {}
+            for gg in self.goals:
+                quota[gg.cone_class] = quota.get(gg.cone_class, 0) + 1
+            shown = [c for c in self.cones.clusters if c.visited and c.name.startswith('cone')]
+            for c in shown:
+                quota[c.cls] = quota.get(c.cls, 0) - 1
+
+            def fresh(c):
+                if quota.get(c.cls, 0) <= 0:
+                    return False
+                e = c.estimate()
+                return all(v.cls != c.cls or float(np.hypot(*(v.estimate() - e))) > p['same_class_apart_m']
+                           for v in shown)
+            cands = [c for c in self.cones.clusters if not c.visited and c.name != 'rejected'
+                     and len(c.points) >= p['min_confirm'] and fresh(c)]
+            if cands:
+                self.target = min(cands, key=lambda c: float(np.hypot(*(c.estimate() - (x, y)))))
+                e = self.target.estimate()
+                self.notes.append(f'{t:.1f} cone {self.index + 1}/{len(self.goals)}: {self.target.cls} cone at '
+                                  f'({e[0]:.1f},{e[1]:.1f})')
+        elif self.target is None:
             if g.is_start_cone:
                 self.target = next(c for c in self.cones.clusters if c.name == 'start')
             else:
@@ -840,9 +890,17 @@ class LoopPatrolMission:
                 est = self.target.estimate(p['fuse_n'])
         if self.state == ARRIVED:
             return Step(None, (0.0, 0.0), True, ARRIVED)
+        if self.state == SHOW:
+            return self._show(t, x, y, yaw, est, rate)
         if est is not None and math.hypot(est[0] - x, est[1] - y) <= p['arrive_m']:
+            name = g.name if not p['any_order'] else f'{self.target.cls} cone'
+            note = f'{name}: {math.hypot(est[0] - x, est[1] - y):.1f} m from the cone'
+            if p['show_s'] > 0:
+                self.state = SHOW
+                self._show_phase, self._show_t0 = 'face', t
+                self.notes.append(f'{t:.1f} at {note}; showing it')
+                return self._show(t, x, y, yaw, est, rate)
             self.state = ARRIVED
-            note = f'{g.name}: {math.hypot(est[0] - x, est[1] - y):.1f} m from the cone'
             self.notes.append(f'{t:.1f} arrived {note}')
             return Step(None, (0.0, 0.0), True, ARRIVED, note)
         if self._backoff_until is not None:
@@ -905,6 +963,24 @@ class LoopPatrolMission:
             self.block_ahead(t, x, y, yaw, 'stuck')
             return Step(None, (p['backoff_v'], 0.0), False, self.state, 'backing off')
         return Step(self._carrot(), None, False, self.state, '', self.pts)
+
+    def _show(self, t, x, y, yaw, est, rate):
+        """Face the cone (it must be well inside the image), then hold still show_s for the judges."""
+        p = self.p
+        if self._show_phase == 'face' and est is not None:
+            err = _wrap(math.atan2(est[1] - y, est[0] - x) - yaw)
+            lead = abs(rate or 0.0) * p['scan_lead_s']
+            if abs(err) > max(math.radians(p['show_face_deg']), lead) and t - self._show_t0 < 10.0:
+                return Step(None, (0.0, math.copysign(p['scan_w'], err)), False, SHOW, 'facing the cone')
+            self._show_phase, self._show_t0 = 'hold', t
+        if self._show_phase == 'face':
+            self._show_phase, self._show_t0 = 'hold', t
+        if t - self._show_t0 < p['show_s']:
+            return Step(None, (0.0, 0.0), False, SHOW, 'showing the cone')
+        self.state = ARRIVED
+        note = f'{self.target.cls if self.target else "?"} cone shown'
+        self.notes.append(f'{t:.1f} {note}')
+        return Step(None, (0.0, 0.0), True, ARRIVED, note)
 
     def _carrot(self):
         return point_at(self.pts, self.cum, self.s_proj + self.p['carrot_distance_m'])
