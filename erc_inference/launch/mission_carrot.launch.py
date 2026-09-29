@@ -39,6 +39,12 @@ Arguments:
                                deg in place (route's side if open), advance 1.3 m,
                                back to the carrot. Replaces obstacle_stop.
                                Needs perception:=true. Never run in the field.
+    heading_source:=gyro_gps   heading from gyro + GPS, no magnetometer (units whose
+                               magnetometer does not see the rover turn: mission_botswana).
+                               Declared by erc_localization's localization_global.launch.py;
+                               reaches it from any mission launch. The first leg then starts
+                               with checkpoint_controller_node driving ~5 m straight ahead
+                               to anchor it (see heading_node.py).
 
 Still by hand, exactly as with mission.launch.py -- and this is where the carrot
 distance and the local obstacle map go, because both are

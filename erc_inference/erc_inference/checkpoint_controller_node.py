@@ -271,6 +271,15 @@ class CheckpointControllerNode(Node):
             self.declare_parameter(f'recovery.{name}', False if name in ('look', 'explore') else default)
         # the carrot's side-step says what it is doing here; recovery waits while it manoeuvres
         self.declare_parameter('debug_topic', '/omnivla_debug')
+        # heading_node's source gyro_gps (heading = gyro + GPS, for units whose magnetometer does
+        # not see the rover turn: mission_botswana) only knows the absolute heading once the
+        # rover has driven a few metres. Until /erc/heading_anchored says true, a leg starts by
+        # driving straight ahead -- the carrot on a goal dead ahead, side-step and obstacle stop
+        # active -- up to anchor_drive_max_m. Any other source says true at once: nothing changes.
+        # 0 disables the drive.
+        self.declare_parameter('heading_anchored_topic', '/erc/heading_anchored')
+        self.declare_parameter('anchor_drive_max_m', 10.0)
+        self.declare_parameter('anchor_drive_timeout_s', 60.0)
 
         self._lock = threading.RLock()
         self._gps_condition = threading.Condition(self._lock)
@@ -290,6 +299,8 @@ class CheckpointControllerNode(Node):
         self._reflex_busy_t = -math.inf  # last time the side-step reported a manoeuvre
         self._reenable_at = None       # re-enable the carrot after a recovery (reset)
         self._static_map = None        # this leg's OSM costmap, for the local planner
+        self._heading_anchored: Optional[bool] = None   # None: nobody said (old heading_node)
+        self._anchor_epoch = 0         # anchor / re-anchor events seen: the heading jumped
 
         self._model_cmd_sub = self.create_subscription(
             Twist, self._param('model_cmd_vel_topic'), self._model_cmd_callback, 10
@@ -303,6 +314,8 @@ class CheckpointControllerNode(Node):
             LaserScan, self._param('free_space_topic'), self._scan_callback, 10)
         self._debug_sub = self.create_subscription(
             String, self._param('debug_topic'), self._debug_callback, 10)
+        self._anchored_sub = self.create_subscription(
+            Bool, self._param('heading_anchored_topic'), self._anchored_callback, LATCHED_QOS)
         self._local_map_pub = self.create_publisher(OccupancyGrid, self._param('local_costmap_topic'), 1)
         self._local_route_pub = self.create_publisher(Path, self._param('local_route_topic'), LATCHED_QOS)
         self._global_route_pub = self.create_publisher(Path, self._param('global_route_topic'), LATCHED_QOS)
@@ -363,6 +376,13 @@ class CheckpointControllerNode(Node):
     def _heading_callback(self, msg: Float32):
         with self._lock:
             self._heading_deg = float(msg.data)
+
+    def _anchored_callback(self, msg: Bool):
+        with self._gps_condition:
+            if msg.data:
+                self._anchor_epoch += 1
+            self._heading_anchored = bool(msg.data)
+            self._gps_condition.notify_all()
 
     def _scan_callback(self, msg: LaserScan):
         with self._lock:
@@ -735,11 +755,20 @@ class CheckpointControllerNode(Node):
         last_publish = 0.0
         reported_quarter = 0
         with self._gps_condition:
+            anchor_epoch = self._anchor_epoch
             try:
                 while not goal_handle.is_cancel_requested:
                     if self._reenable_at is not None and time.monotonic() >= self._reenable_at:
                         self._reenable_at = None
                         self._enable_pub.publish(Bool(data=True))
+                    if self._anchor_epoch != anchor_epoch:
+                        anchor_epoch = self._anchor_epoch
+                        if replanner is not None:
+                            # everything in it was placed with the heading before the jump
+                            replanner = local_planner.LocalReplanner(
+                                pts, **{n: self._param(f'local.{n}') for n in local_planner.DEFAULTS})
+                            self._scans.clear()
+                            self.get_logger().warn('Heading (re-)anchored mid-leg: local map cleared.')
                     if self._current_lat is not None and self._current_lon is not None:
                         east, north = latlon_to_local(frame, self._current_lat, self._current_lon)
                         remaining = math.hypot(goal_e - east, goal_n - north)
@@ -794,6 +823,65 @@ class CheckpointControllerNode(Node):
                 if self._reenable_at is not None:
                     self._reenable_at = None
                     self._enable_pub.publish(Bool(data=True))
+
+    def _within(self, checkpoint: Checkpoint, radius_m: float) -> bool:
+        with self._lock:
+            if self._current_lat is None:
+                return False
+            frame, _pts, _cum = route_to_local([(self._current_lat, self._current_lon)])
+        east, north = latlon_to_local(frame, checkpoint.latitude, checkpoint.longitude)
+        return math.hypot(east, north) <= radius_m
+
+    def _anchor_drive(self, goal_handle, checkpoint: Checkpoint) -> bool:
+        """Drive straight ahead until heading_node's gyro_gps heading is anchored.
+
+        The goal is dead ahead by the provisional heading, so the carrot drives straight
+        whatever that heading's error; its side-step and obstacle stop stay active. Ends
+        when anchored, after anchor_drive_max_m or anchor_drive_timeout_s -- then the leg
+        goes on with the provisional heading and heading_node keeps trying on the way.
+        Returns False only if the mission was canceled.
+        """
+        max_m = float(self._param('anchor_drive_max_m'))
+        timeout = float(self._param('anchor_drive_timeout_s'))
+        with self._gps_condition:
+            t0 = time.monotonic()
+            while self._current_lat is None or self._heading_deg is None:
+                if goal_handle.is_cancel_requested or time.monotonic() - t0 > 10.0:
+                    self.get_logger().warn('Anchor drive skipped: no position or heading yet.')
+                    return not goal_handle.is_cancel_requested
+                self._gps_condition.wait(timeout=0.5)
+            frame, _pts, _cum = route_to_local([(self._current_lat, self._current_lon)])
+            heading = self._heading_deg
+        yaw = math.radians(90.0 - heading)
+        # well past the end, so the carrot never slows down for it
+        ahead = max_m + 10.0
+        goal = local_to_latlon(frame, ahead * math.cos(yaw), ahead * math.sin(yaw))
+        self.get_logger().warn(
+            f'Heading not anchored yet (heading_node gyro_gps): driving straight ahead, up to '
+            f'{max_m:.0f} m, so the GPS can anchor it.')
+        self._publish_carrot(goal[0], goal[1], heading)
+        self._start_motion(checkpoint.sequence)
+        t0 = time.monotonic()
+        last_feedback = 0.0
+        with self._gps_condition:
+            while not goal_handle.is_cancel_requested:
+                east, north = latlon_to_local(frame, self._current_lat, self._current_lon)
+                driven = math.hypot(east, north)
+                if self._heading_anchored:
+                    self.get_logger().info(f'Heading anchored after {driven:.1f} m of anchor drive.')
+                    break
+                if driven >= max_m or time.monotonic() - t0 > timeout:
+                    self.get_logger().warn(
+                        f'Heading still not anchored after {driven:.1f} m / {time.monotonic() - t0:.0f} s: '
+                        f'going on with the provisional heading; heading_node keeps trying on the way.')
+                    break
+                if time.monotonic() - last_feedback > 1.0:
+                    last_feedback = time.monotonic()
+                    self._publish_feedback(goal_handle, checkpoint.sequence, self._current_distance_m,
+                                           'anchoring_heading')
+                self._gps_condition.wait(timeout=0.3)
+        self._request_stop()
+        return not goal_handle.is_cancel_requested
 
     def _recovery_step(self, recovery, note, now, east, north, goal_e, goal_n, replanner, pts, cum, s_proj,
                        extra_lethal=None):
@@ -970,13 +1058,21 @@ class CheckpointControllerNode(Node):
                     return result
 
                 checkpoint = checkpoints[checkpoint_index]
-                with self._lock:
-                    start_lat = self._current_lat if self._current_lat is not None else checkpoint.latitude
-                    start_lon = self._current_lon if self._current_lon is not None else checkpoint.longitude
-                
                 if arrival_for_sequence != checkpoint.sequence:
                     arrival_for_sequence = checkpoint.sequence
                     arrival_threshold_m = float(self._param('checkpoint_proximity_m'))
+                # heading_node gyro_gps not anchored yet: drive straight ahead first -- unless this
+                # checkpoint is already within reach (the start one, mission_botswana), which needs
+                # no heading; the next leg anchors then
+                if self._heading_anchored is False and float(self._param('anchor_drive_max_m')) > 0.0 \
+                        and not self._within(checkpoint, arrival_threshold_m):
+                    if not self._anchor_drive(goal_handle, checkpoint):
+                        goal_handle.canceled()
+                        result.message = 'Mission canceled.'
+                        return result
+                with self._lock:
+                    start_lat = self._current_lat if self._current_lat is not None else checkpoint.latitude
+                    start_lon = self._current_lon if self._current_lon is not None else checkpoint.longitude
 
                 route = self._generate_route(start_lat, start_lon, checkpoint.latitude, checkpoint.longitude)
                 self.get_logger().info(
