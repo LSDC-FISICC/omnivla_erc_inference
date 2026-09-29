@@ -57,6 +57,7 @@ sys.path.insert(0, PACKAGE_ROOT)
 
 from erc_inference import motion_control as mc  # noqa: E402
 from erc_inference import local_planner as lp  # noqa: E402
+from erc_inference import local_recovery as lrec  # noqa: E402
 
 NODE_PATH = os.path.join(PACKAGE_ROOT, "erc_inference", "checkpoint_controller_node.py")
 CONFIG_PATH = os.path.join(PACKAGE_ROOT, "config", "controller.yaml")
@@ -450,10 +451,12 @@ def plan_for_deviation(delta, goal_bearing, params):
 
 def simulate(scenario: Scenario, params: dict, model: RoverModel, seed: int, record=False,
              dt=0.02, node=None, node_defaults=None, avoid=None, stop=None, override=None,
-             local=None):
+             local=None, recovery=None):
     """local: None, or a dict of local_planner parameters -> a LocalReplanner per leg,
     fed the perception profile at the carrot rate, exactly where
-    checkpoint_controller_node runs it."""
+    checkpoint_controller_node runs it.
+    recovery: None, or a dict of local_recovery parameters -> a BlockedRecovery (needs local)
+    that takes the rover's command when the planner reports a blockage."""
     node = node or load_checkpoint_node()
     cp = node_defaults or checkpoint_node_defaults()
     rng = np.random.default_rng(seed)
@@ -501,6 +504,8 @@ def simulate(scenario: Scenario, params: dict, model: RoverModel, seed: int, rec
     planner = None
     replans = 0
     local_notes = []
+    rec = lrec.BlockedRecovery(**recovery) if (recovery is not None and local is not None) else None
+    rec_cmd = None
 
     log_t, log_out, log_true, cross, route_segments = [], [], [], [], []
     stop_resets = set()   # output indices that follow an immediate stop
@@ -552,7 +557,8 @@ def simulate(scenario: Scenario, params: dict, model: RoverModel, seed: int, rec
                         # from the true one -- as on the rover
                         pb, pf, pc = obs.profile(rover.x, rover.y, rover.theta, world, rng)
                         planner.observe(t, east, north, etheta, pb, pf, pf < pc - 1e-3)
-                        new_pts, note = planner.check(t, east, north, pts, cum, s_proj)
+                        new_pts, note = (None, '') if (rec is not None and rec.active) else \
+                            planner.check(t, east, north, pts, cum, s_proj)
                         if note:
                             local_notes.append((round(t, 1), note))
                         if new_pts is not None:
@@ -560,6 +566,30 @@ def simulate(scenario: Scenario, params: dict, model: RoverModel, seed: int, rec
                             cum = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(pts, axis=0).T))])
                             s_proj = 0.0
                             replans += 1
+                        if rec is not None:
+                            # the checkpoint controller owns the map, the route and /cmd_vel
+                            if note.startswith('[local-plan] blocked'):
+                                gb = math.atan2(goal_n - north, goal_e - east) - etheta
+                                gb = (gb + math.pi) % (2 * math.pi) - math.pi
+                                idle = override is None or override.state == 'follow'
+                                if rec.trigger(t, etheta, gb, reflex_idle=idle, no_path='no path' in note):
+                                    local_notes.append((round(t, 1), '[recover] blocked: recovery started'))
+                            was_active = rec.active
+                            rec_cmd, rnew, rnote = rec.step(t, east, north, etheta, planner, pts, cum,
+                                                            s_proj, (goal_e, goal_n))
+                            if rnote:
+                                local_notes.append((round(t, 1), rnote))
+                            if rnew is not None:
+                                pts = rnew
+                                cum = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(pts, axis=0).T))])
+                                s_proj = 0.0
+                                replans += 1
+                            if was_active and not rec.active:
+                                # back to the carrot: its delay compensation recorded commands
+                                # that never reached the rover, and the reflex's state is stale
+                                controller.reset()
+                                if override is not None:
+                                    override.reset()
                     ce, cn, _ = node.point_at(pts, cum, s_proj + cp["carrot_distance_m"])
                     new_goal = node.local_to_latlon(frame, ce, cn)
                     # goal_gps_callback: a jump means a new target
@@ -627,6 +657,8 @@ def simulate(scenario: Scenario, params: dict, model: RoverModel, seed: int, rec
         if t >= next_output:
             next_output += output_period
             target = model_cmd if motion_allowed else (0.0, 0.0)
+            if motion_allowed and rec is not None and rec.active and rec_cmd is not None:
+                target = rec_cmd
             out = shaper.step(target[0], target[1], output_period)
             rover.command(t, *out)
             log_t.append(t)
@@ -696,7 +728,7 @@ def simulate(scenario: Scenario, params: dict, model: RoverModel, seed: int, rec
         min_clearance_m=min_clearance,
         replans=replans,
     )
-    result.trace = dict(local_notes=local_notes, planner=planner)
+    result.trace = dict(local_notes=local_notes, planner=planner, recovery=rec)
     if record:
         result.trace.update(t=T, out=out_arr, true=true_arr, ticks=ticks, leg_times=leg_times)
     return result

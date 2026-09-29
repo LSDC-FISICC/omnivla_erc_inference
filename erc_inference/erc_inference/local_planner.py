@@ -75,6 +75,11 @@ DEFAULTS = dict(
                               # put it inside a planter whose back was not yet seen
     window_margin_m=8.0,      # A* window around rover + target
     ignore_within_m=0.6,      # a block nearer than this is the reflex's business
+    rejoin_respects_unseen=False,  # choose the rejoin point with A*'s own rule: unseen ground
+                              # within inflate_m + unseen_extend_m of a seen wall is not a
+                              # rejoin point either. Without it the target landed inside the
+                              # unseen part of a flower bed and A* answered "no path" over and
+                              # over (controller_sim gardens, 28-sept: np up to 42 per run)
 )
 
 
@@ -162,6 +167,15 @@ class LocalCostmap:
         ok = self._inside(rows, cols)
         out[ok] = self.distance()[rows[ok], cols[ok]]
         return out
+
+    def unseen_near_wall(self, x, y):
+        """True where A* treats the cell as lethal for being unseen next to a seen wall."""
+        rows, cols = self.cell(x, y)
+        rows, cols = np.atleast_1d(rows), np.atleast_1d(cols)
+        ok = self._inside(rows, cols)
+        seen = np.ones(rows.shape, bool)
+        seen[ok] = self.seen[rows[ok], cols[ok]]
+        return ~seen & (self.clearance_at(x, y) <= self.p['inflate_m'] + self.p['unseen_extend_m'])
 
     # -- planning ----------------------------------------------------------
     def plan(self, start, goal, extra_lethal=None):
@@ -335,6 +349,8 @@ class LocalReplanner:
         # the first route point past the blockage that is itself clear
         far, s_far = route_points(pts, cum, s[first], s_proj + p['search_beyond_m'], 0.1)
         clear = self.map.clearance_at(far[:, 0], far[:, 1]) > p['soft_m']
+        if p['rejoin_respects_unseen']:
+            clear &= ~self.map.unseen_near_wall(far[:, 0], far[:, 1])
         k = None
         for i in range(len(clear)):
             if not clear[i]:

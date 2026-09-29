@@ -61,7 +61,7 @@ from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPo
 from geometry_msgs.msg import PointStamped, PoseStamped, TransformStamped, Twist
 from nav_msgs.msg import OccupancyGrid, Path
 from sensor_msgs.msg import LaserScan, NavSatFix
-from std_msgs.msg import Bool, Float32
+from std_msgs.msg import Bool, Float32, String
 
 from erc_inference_msgs.action import StartMission
 from erc_static_map_msgs.srv import GenerateCostmap, PlanPath
@@ -69,6 +69,7 @@ from erc_static_map_msgs.srv import GenerateCostmap, PlanPath
 from tf2_ros import TransformBroadcaster
 
 from erc_inference import local_planner
+from erc_inference import local_recovery
 from erc_inference.motion_control import CommandShaper
 
 
@@ -259,6 +260,17 @@ class CheckpointControllerNode(Node):
         self.declare_parameter('free_space_leg_topic', '/erc/free_space_leg')
         for name, default in local_planner.DEFAULTS.items():
             self.declare_parameter(f'local.{name}', default)
+        # What to do when that map says the route ahead is blocked (local_recovery.py):
+        # recovery.look stops and looks before trusting a replan; recovery.explore drives to
+        # a frontier when there is no path. Both off by default; they need local_replan.
+        # controller_sim (28-sept, 14 scenarios x 6 seeds, Wuhan turn gain 1.23): today's
+        # local_replan 75/84 missions with 6 hits; + local.rejoin_respects_unseen,
+        # local.unseen_extend_m 2.5 and recovery.explore 84/84, no hit. recovery.look added
+        # 30-40 s per mission and, on the older plant, led the side-step into a bench gap.
+        for name, default in local_recovery.DEFAULTS.items():
+            self.declare_parameter(f'recovery.{name}', False if name in ('look', 'explore') else default)
+        # the carrot's side-step says what it is doing here; recovery waits while it manoeuvres
+        self.declare_parameter('debug_topic', '/omnivla_debug')
 
         self._lock = threading.RLock()
         self._gps_condition = threading.Condition(self._lock)
@@ -274,6 +286,9 @@ class CheckpointControllerNode(Node):
         self._last_output_time = None
         self._heading_deg: Optional[float] = None
         self._scans = []               # LaserScans not yet folded into the local map
+        self._recovery_cmd = None      # (v, w) while local_recovery holds the rover
+        self._reflex_busy_t = -math.inf  # last time the side-step reported a manoeuvre
+        self._reenable_at = None       # re-enable the carrot after a recovery (reset)
         self._static_map = None        # this leg's OSM costmap, for the local planner
 
         self._model_cmd_sub = self.create_subscription(
@@ -286,6 +301,8 @@ class CheckpointControllerNode(Node):
             Float32, self._param('heading_topic'), self._heading_callback, 10)
         self._scan_sub = self.create_subscription(
             LaserScan, self._param('free_space_topic'), self._scan_callback, 10)
+        self._debug_sub = self.create_subscription(
+            String, self._param('debug_topic'), self._debug_callback, 10)
         self._local_map_pub = self.create_publisher(OccupancyGrid, self._param('local_costmap_topic'), 1)
         self._local_route_pub = self.create_publisher(Path, self._param('local_route_topic'), LATCHED_QOS)
         self._global_route_pub = self.create_publisher(Path, self._param('global_route_topic'), LATCHED_QOS)
@@ -338,6 +355,11 @@ class CheckpointControllerNode(Node):
             self._current_lon = msg.longitude
             self._gps_condition.notify_all()
 
+    def _debug_callback(self, msg: String):
+        if '[side-step]' in msg.data:
+            with self._lock:
+                self._reflex_busy_t = time.monotonic()
+
     def _heading_callback(self, msg: Float32):
         with self._lock:
             self._heading_deg = float(msg.data)
@@ -368,6 +390,10 @@ class CheckpointControllerNode(Node):
             target = self._last_model_cmd if (
                 self._mission_active and self._motion_allowed and not self._stop_requested
             ) else Twist()
+            if self._recovery_cmd is not None and self._mission_active and self._motion_allowed \
+                    and not self._stop_requested:
+                target = Twist()
+                target.linear.x, target.angular.z = self._recovery_cmd
             dt = 0.0 if self._last_output_time is None else now - self._last_output_time
             self._last_output_time = now
             self._shaper.configure(*self._shaper_limits())
@@ -693,6 +719,12 @@ class CheckpointControllerNode(Node):
                 f'map {replanner.map.w}x{replanner.map.h} cells, static OSM costmap '
                 f'{"used" if extra_lethal else "not available"}.')
             self._publish_local_route(pts)
+        recovery = None
+        if replanner is not None and (self._param('recovery.look') or self._param('recovery.explore')):
+            recovery = local_recovery.BlockedRecovery(
+                **{n: self._param(f'recovery.{n}') for n in local_recovery.DEFAULTS})
+            self.get_logger().info(f"Blocked-route recovery ON (look={self._param('recovery.look')}, "
+                                   f"explore={self._param('recovery.explore')}).")
         self._publish_path(self._global_route_pub, pts)
         last_map_publish = 0.0
         lookahead = float(self._param('carrot_distance_m'))
@@ -703,49 +735,95 @@ class CheckpointControllerNode(Node):
         last_publish = 0.0
         reported_quarter = 0
         with self._gps_condition:
-            while not goal_handle.is_cancel_requested:
-                if self._current_lat is not None and self._current_lon is not None:
-                    east, north = latlon_to_local(frame, self._current_lat, self._current_lon)
-                    remaining = math.hypot(goal_e - east, goal_n - north)
-                    self._current_distance_m = remaining
-                    if remaining <= arrival_threshold_m:
-                        return True
-                    s_proj = project_forward(pts, cum, east, north, s_proj)
-                    now = time.monotonic()
-                    self._publish_rover_leg(east, north)
-                    if replanner is not None:
-                        new_pts = self._local_step(replanner, now, east, north, pts, cum, s_proj,
-                                                   extra_lethal)
-                        if new_pts is not None:
-                            pts = new_pts
-                            cum = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(pts, axis=0).T))])
-                            total, s_proj, reported_quarter = float(cum[-1]), 0.0, 0
-                            self._publish_local_route(pts)
-                        if now - last_map_publish >= 1.0 / float(self._param('local_costmap_rate_hz')):
-                            last_map_publish = now
-                            self._publish_local_map(replanner.map)
-                    if now - last_publish >= period:
-                        last_publish = now
-                        carrot_e, carrot_n, carrot_bearing = point_at(pts, cum, s_proj + lookahead)
-                        self._publish_carrot_point(carrot_e, carrot_n)
-                        self._publish_carrot(*local_to_latlon(frame, carrot_e, carrot_n), carrot_bearing)
-                        if not started:
-                            # Only once a goal is out: the inference node will
-                            # not drive a pose goal it has not received.
-                            self._start_motion(checkpoint.sequence)
-                            started = True
-                        self._publish_feedback(goal_handle, checkpoint.sequence, remaining, 'navigating')
-                    quarter = int(4 * s_proj / total) if total > 0.0 else 0
-                    if quarter > reported_quarter:
-                        reported_quarter = quarter
-                        self.get_logger().info(
-                            f'  {100 * s_proj / total:.0f}% of the route ({s_proj:.1f}/{total:.1f} m), '
-                            f'{remaining:.1f} m to the checkpoint')
-                self._gps_condition.wait(timeout=period)
-        return False
+            try:
+                while not goal_handle.is_cancel_requested:
+                    if self._reenable_at is not None and time.monotonic() >= self._reenable_at:
+                        self._reenable_at = None
+                        self._enable_pub.publish(Bool(data=True))
+                    if self._current_lat is not None and self._current_lon is not None:
+                        east, north = latlon_to_local(frame, self._current_lat, self._current_lon)
+                        remaining = math.hypot(goal_e - east, goal_n - north)
+                        self._current_distance_m = remaining
+                        if remaining <= arrival_threshold_m:
+                            return True
+                        s_proj = project_forward(pts, cum, east, north, s_proj)
+                        now = time.monotonic()
+                        self._publish_rover_leg(east, north)
+                        if replanner is not None:
+                            new_pts, note = self._local_step(replanner, now, east, north, pts, cum, s_proj,
+                                                             extra_lethal,
+                                                             check=recovery is None or not recovery.active)
+                            if new_pts is not None:
+                                pts = new_pts
+                                cum = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(pts, axis=0).T))])
+                                total, s_proj, reported_quarter = float(cum[-1]), 0.0, 0
+                                self._publish_local_route(pts)
+                            if recovery is not None and self._heading_deg is not None:
+                                new_pts = self._recovery_step(recovery, note, now, east, north, goal_e, goal_n,
+                                                              replanner, pts, cum, s_proj, extra_lethal)
+                                if new_pts is not None:
+                                    pts = new_pts
+                                    cum = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(pts, axis=0).T))])
+                                    total, s_proj, reported_quarter = float(cum[-1]), 0.0, 0
+                                    self._publish_local_route(pts)
+                            if now - last_map_publish >= 1.0 / float(self._param('local_costmap_rate_hz')):
+                                last_map_publish = now
+                                self._publish_local_map(replanner.map)
+                        if now - last_publish >= period:
+                            last_publish = now
+                            carrot_e, carrot_n, carrot_bearing = point_at(pts, cum, s_proj + lookahead)
+                            self._publish_carrot_point(carrot_e, carrot_n)
+                            self._publish_carrot(*local_to_latlon(frame, carrot_e, carrot_n), carrot_bearing)
+                            if not started:
+                                # Only once a goal is out: the inference node will
+                                # not drive a pose goal it has not received.
+                                self._start_motion(checkpoint.sequence)
+                                started = True
+                            self._publish_feedback(goal_handle, checkpoint.sequence, remaining, 'navigating')
+                        quarter = int(4 * s_proj / total) if total > 0.0 else 0
+                        if quarter > reported_quarter:
+                            reported_quarter = quarter
+                            self.get_logger().info(
+                                f'  {100 * s_proj / total:.0f}% of the route ({s_proj:.1f}/{total:.1f} m), '
+                                f'{remaining:.1f} m to the checkpoint')
+                    self._gps_condition.wait(timeout=period)
+                return False
+            finally:
+                # a leg never ends with the rover held by a recovery or the carrot left disabled
+                self._recovery_cmd = None
+                if self._reenable_at is not None:
+                    self._reenable_at = None
+                    self._enable_pub.publish(Bool(data=True))
 
-    def _local_step(self, replanner, now, east, north, pts, cum, s_proj, extra_lethal):
-        """Fold pending scans into the map, then maybe replan. Called with the lock held."""
+    def _recovery_step(self, recovery, note, now, east, north, goal_e, goal_n, replanner, pts, cum, s_proj,
+                       extra_lethal=None):
+        """Blocked-route recovery (local_recovery.py). -> new route pts or None. Lock held."""
+        yaw = math.radians(90.0 - self._heading_deg)
+        if note.startswith('[local-plan] blocked'):
+            gb = math.atan2(goal_n - north, goal_e - east) - yaw
+            gb = (gb + math.pi) % (2 * math.pi) - math.pi
+            idle = now - self._reflex_busy_t > 1.0
+            if recovery.trigger(now, yaw, gb, reflex_idle=idle, no_path='no path' in note):
+                self.get_logger().info('[recover] route blocked: taking the rover '
+                                       + ('(look)' if recovery.p['look'] else '(explore)'))
+        was_active = recovery.active
+        cmd, new_pts, rnote = recovery.step(now, east, north, yaw, replanner, pts, cum, s_proj,
+                                            (goal_e, goal_n), extra_lethal)
+        if rnote:
+            self.get_logger().info(rnote)
+        self._recovery_cmd = cmd if recovery.active else None
+        if was_active and not recovery.active:
+            # back to the carrot: toggling enable resets its controller (whose delay
+            # compensation recorded commands that never reached the rover) and its side-step.
+            # 0.3 s apart: the topic is latched with depth 1, and false+true published together
+            # can reach the carrot as a single true -- no transition, no reset
+            self._enable_pub.publish(Bool(data=False))
+            self._reenable_at = now + 0.3
+        return new_pts
+
+    def _local_step(self, replanner, now, east, north, pts, cum, s_proj, extra_lethal, check=True):
+        """Fold pending scans into the map, then maybe replan. Called with the lock held.
+        -> (new route pts or None, the planner's note)."""
         scans, self._scans = self._scans, []
         for _t, scan, heading_deg in scans:
             if heading_deg is None:
@@ -756,13 +834,15 @@ class CheckpointControllerNode(Node):
             hit = np.isfinite(r) & (r < scan.range_max - 0.05)
             r = np.where(np.isfinite(r), r, scan.range_max)
             replanner.observe(_t, east, north, math.radians(90.0 - heading_deg), bearings, r, hit)
+        if not check:
+            return None, ''
         new_pts, note = replanner.check(now, east, north, pts, cum, s_proj, extra_lethal)
         # two call sites: rclpy raises if one call site changes severity
         if note and new_pts is not None:
             self.get_logger().info(note)
         elif note:
             self.get_logger().warn(note)
-        return new_pts
+        return new_pts, note
 
     def _static_lethal(self, frame):
         """xs, ys in the leg frame -> lethal in this leg's OSM costmap (building

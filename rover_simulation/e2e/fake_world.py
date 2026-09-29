@@ -34,6 +34,13 @@ WORLDS = {
     # mission_24sept_Nav2_circles: the leg starts with the route ~70 deg off the heading, a planter
     # alongside; that is where Nav2 circled with the follower's gain at 0.36 on a 1.23 unit
     'corner': ([obs.Segment((-1.5, 2.0), (-1.5, 9.0)), obs.Segment((2.5, 1.0), (4.5, 1.0))], (4.0, 14.0)),
+    # park beds OSM does not have (controller_sim park scenarios, 28-sept): a 10 x 8 m bed on the
+    # route, and a 2 m sidewalk with a bench that leaves a 1.2 m gap
+    'garden_10x8': ([obs.Segment((7, -4), (17, -4)), obs.Segment((17, -4), (17, 4)),
+                     obs.Segment((17, 4), (7, 4)), obs.Segment((7, 4), (7, -4))], (30.0, 0.0)),
+    'sidewalk_2_bench': ([obs.Segment((-2, 1.0), (28, 1.0)), obs.Segment((-2, -1.0), (28, -1.0)),
+                          obs.Segment((10, 0.2), (11.5, 0.2)), obs.Segment((11.5, 0.2), (11.5, 1.0)),
+                          obs.Segment((10, 0.2), (10, 1.0))], (28.0, 0.0)),
 }
 STATE = {'done': False}
 

@@ -26,7 +26,7 @@ CONFIGS = ('carrot', 'ss', 'lp', 'lp+ss')
 
 
 def run(scenario, seed, config='lp+ss', carrot_m=1.5, ss=None, lp=None, model=None,
-        record=False, override=None):
+        record=False, override=None, recovery=None):
     """One mission. ss / lp: parameter overrides for SideStep / LocalReplanner.
 
     Returns (Result, SideStep or None). Result.trace['planner'] is the last leg's
@@ -40,5 +40,5 @@ def run(scenario, seed, config='lp+ss', carrot_m=1.5, ss=None, lp=None, model=No
     local = dict(lp or {}) if 'lp' in config else None
     result = cs.simulate(cs.SCENARIOS[scenario], params, model or cs.RoverModel(), seed=seed,
                          node=node, node_defaults=defaults, override=sidestep, local=local,
-                         record=record)
+                         record=record, recovery=recovery)
     return result, sidestep
