@@ -40,7 +40,7 @@ from erc_inference.goal_homing import GoalMatcher, photo_scores
 from erc_inference.image_goal_offroad_node import LOCAL_OFFROAD, ImageGoalOffroadNode, goal_paths
 
 # the image_goal_mission parameters worth exposing here (the rest keep flag_mission's defaults)
-BASE_EXPOSED = {'arrive_m': 0.5, 'standoff_m': 0.55}
+BASE_EXPOSED = {'arrive_m': 0.5, 'standoff_m': 0.55, 'min_confirm': 2}
 
 
 class FlagCheckpointNode(ImageGoalOffroadNode):
@@ -197,6 +197,19 @@ class FlagCheckpointNode(ImageGoalOffroadNode):
                 t = self._now()
                 if t - t_start > float(self._param('mission_timeout_s')):
                     raise RuntimeError(f'mission timeout ({self._param("mission_timeout_s"):.0f} s)')
+                stale = self.telemetry_stale()
+                if stale:
+                    # the rover's data stopped: odometry is only predicting from commands. Frozen, not steered.
+                    if not self._stale_logged:
+                        self.get_logger().warn(f'telemetry stale ({stale:.0f} s without IMU): mission frozen, rover held')
+                        self._stale_logged = True
+                    g0 = self.mission.goal
+                    self._feedback(goal_handle, g0.sequence if g0 else 0, -1.0, 'holding: telemetry stale')
+                    time.sleep(period)
+                    continue
+                if self._stale_logged:
+                    self.get_logger().info('telemetry back: mission resumed')
+                    self._stale_logged = False
                 with self._lock:
                     pose = self._track_pose
                 with self._mission_lock:

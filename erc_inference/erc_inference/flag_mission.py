@@ -36,10 +36,17 @@ SHOW = 'show'
 
 # the organisers' mechanics (29-sept): a flag scores when the rover SEES it from 3 m or less, judged
 # by eye on the video, in any order (3 + 3 + 4 points); no SDK checkpoints. The node's defaults.
-FLAG_COMPETITION = {'any_order': True, 'show_s': 5.0, 'arrive_m': 1.5, 'max_shows': 6}
+# Also from the indoor run (29-sept), where false cones 4-12 m away (behind walls, outside) filled the map and a
+# target behind a step was chased for minutes: only sightings within 6 m (the arena is 8 x 8 m), 4 of them to
+# believe a flag, and 90 s per flag.
+FLAG_COMPETITION = {'any_order': True, 'show_s': 5.0, 'arrive_m': 1.5, 'max_shows': 6,
+                    'max_detection_m': 6.0, 'min_confirm': 4, 'target_timeout_s': 90.0}
 
 FLAG_DEFAULTS = dict(
     any_order=False,            # the nearest unvisited flag, no photo ranking, no SDK sorting
+    max_detection_m=10.0,       # sightings further than this are ignored
+    target_timeout_s=0.0,       # leave a flag after this long as the target without showing it (0: never) ...
+    skip_s=180.0,               # ... for this long
     show_s=0.0,                 # at arrive_m: face it and hold still this long for the judges
     show_face_deg=30.0,
     max_shows=0,                # any order: keep showing new flags up to this many (not only 3: a show
@@ -102,6 +109,7 @@ class Flag:
     height: float = float('nan')                            # fitted cloth height
     fit_xy: Optional[np.ndarray] = None
     marked: Optional[tuple] = None                          # the map cell it is marked in
+    skip_until: float = -math.inf                           # left (not reached in time) until then
     live_pt: Optional[np.ndarray] = None                    # where the latest sighting puts it
 
     def estimate(self, n=8):
@@ -137,6 +145,7 @@ class FlagMission(igm.ImageGoalMission):
         self._pulse_until = None
         self._show_phase, self._show_t0 = None, 0.0
         self._shown = []
+        self._timed, self._timed_t0 = None, 0.0
         self._on_flag_t = -math.inf
         self._poses = []
         self._approach_trail = []
@@ -172,7 +181,7 @@ class FlagMission(igm.ImageGoalMission):
 
     def observe_cone(self, x, y, yaw, cone_class, bearing_deg, range_m, t=0.0, ang_height=None) -> bool:
         """One flag sighting from the estimated pose (the cone interface: /erc/flags has its shape)."""
-        if cone_class != 'blue' or not math.isfinite(range_m):
+        if cone_class != 'blue' or not math.isfinite(range_m) or range_m > self.p['max_detection_m']:
             return False
         p = self.p
         self._t = max(self._t, t)
@@ -316,7 +325,8 @@ class FlagMission(igm.ImageGoalMission):
                 if not f.visited and any(float(np.hypot(*(self.est(f) - q))) <= self.p['shown_apart_m']
                                          for q in self._shown):
                     f.visited = True             # the one already shown, mapped twice
-            c = [f for f in self.flags if not f.visited and len(f.points) >= self.p['min_confirm']]
+            c = [f for f in self.flags if not f.visited and len(f.points) >= self.p['min_confirm']
+                 and f.skip_until <= self._t]
             c.sort(key=lambda f: float(np.hypot(*(self.est(f) - (x, y)))))
             return c
         k = self.index
@@ -453,7 +463,23 @@ class FlagMission(igm.ImageGoalMission):
         if self._poses[-1][0] - self._poses[0][0] > 0.4:
             v = math.hypot(x - self._poses[0][1], y - self._poses[0][2]) / (self._poses[-1][0] - self._poses[0][0])
         self._pick_target(t, x, y)
+        if self.target is not self._timed:
+            self._timed, self._timed_t0 = self.target, t
         f = self.target
+        if (f is not None and p['target_timeout_s'] > 0 and t - self._timed_t0 > p['target_timeout_s']
+                and self.state not in (SHOW, ARRIVED)):
+            # unreachable from here (behind a rock, up a slope it cannot take) or not a flag at all: leave it
+            # for skip_s -- another flag first; it may be reachable from elsewhere later
+            e = self.est(f)
+            f.skip_until = t + p['skip_s']
+            self.notes.append(f'{t:.1f} flag at ({e[0]:.1f},{e[1]:.1f}): not reached in {p["target_timeout_s"]:.0f} s; '
+                              f'leaving it for {p["skip_s"]:.0f} s')
+            self.target, self._timed = None, None
+            self.p['arrive_m'], self.p['standoff_m'] = self._arrive0, self._standoff0
+            self.state = SCAN
+            self._full_scan_pending = False
+            self._scan_queue, self._scan_target = [], None
+            return Step(None, (0.0, 0.0), False, SCAN, 'target given up')
         rest = f.live_range - v * (max(0.0, t - f.live_t) + p['stop_lag_s']) if f is not None else math.inf
         if self.state == SHOW:
             return self._show(t, x, y, yaw, rate)

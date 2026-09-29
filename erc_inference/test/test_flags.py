@@ -188,7 +188,7 @@ def competition():
 
 def test_competition_shows_the_nearest_flag_from_about_a_metre_and_a_half():
     m = competition()
-    for k in range(3):
+    for k in range(5):                              # competition mode wants 4 sightings of a flag
         sight(m, 0.1 * k, 0.0, 0.0, 0.0, 1.4, 0.0)
         sight(m, 0.1 * k, 0.0, 0.0, 0.0, 4.0, 2.0)
     step = m.update(0.5, 0.0, 0.0, 0.0)
@@ -205,7 +205,7 @@ def test_competition_shows_the_nearest_flag_from_about_a_metre_and_a_half():
 
 def test_a_flag_near_where_one_was_shown_is_that_one():
     m = competition()
-    for k in range(3):
+    for k in range(5):
         sight(m, 0.1 * k, 0.0, 0.0, 0.0, 1.4, 0.0)
     step = m.update(0.5, 0.0, 0.0, 0.0)
     t = 0.5
@@ -214,7 +214,36 @@ def test_a_flag_near_where_one_was_shown_is_that_one():
         sight(m, t, 0.0, 0.0, 0.0, 1.4, 0.0)
         step = m.update(t, 0.0, 0.0, 0.0)
     m.confirm(t, True)
-    for k in range(3):                              # the same flag, mapped again 1.0 m off
+    for k in range(5):                              # the same flag, mapped again 1.0 m off
         sight(m, t + 0.1 * k, 2.0, 1.0, math.pi, 1.4, 1.0)
     m.update(t + 1.0, 2.0, 1.0, math.pi)
     assert m.target is None
+
+
+def test_competition_ignores_far_sightings_and_needs_four():
+    """Indoor run (29-sept): false targets 4-12 m away filled the map."""
+    m = competition()
+    for k in range(6):
+        sight(m, 0.1 * k, 0.0, 0.0, 0.0, 7.0, 0.0)     # beyond 6 m: ignored
+    for k in range(3):
+        sight(m, 0.1 * k, 0.0, 0.0, 0.0, 3.0, 2.0)     # three sightings: not yet a flag
+    m.update(1.0, 0.0, 0.0, 0.0)
+    assert m.target is None
+    sight(m, 1.1, 0.0, 0.0, 0.0, 3.0, 2.0)
+    m.update(1.2, 0.0, 0.0, 0.0)
+    assert m.target is not None and np.hypot(*(m.est(m.target) - (3.0, 2.0))) < 0.2
+
+
+def test_a_flag_not_reached_in_time_is_left_for_a_while():
+    """Indoor run: a target behind a step was chased for minutes."""
+    m = competition()
+    for k in range(5):
+        sight(m, 0.1 * k, 0.0, 0.0, 0.0, 4.0, 0.0)
+        sight(m, 0.1 * k, 0.0, 0.0, 0.0, 1.0, 4.5)
+    m.update(1.0, 0.0, 0.0, 0.0)
+    first = m.target
+    assert first is not None
+    m.update(1.0 + m.p['target_timeout_s'] + 1.0, 0.0, 0.0, 0.0)     # still not there
+    assert m.target is not first and first.skip_until > 1.0
+    m.update(1.0 + m.p['target_timeout_s'] + 2.0, 0.0, 0.0, 0.0)
+    assert m.target is not None and m.target is not first            # the other flag now

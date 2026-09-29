@@ -70,8 +70,11 @@ from erc_inference.safety_envelope import SafetyEnvelope, parameter_errors as sa
 # ON (it is what stands between a boulder and a rolled rover), no obstacle stop (the planner
 # goes round what free space maps; a stop in clutter deadlocked indoors, loop_patrol_sim). A
 # missing attitude topic does not freeze the rover.
+# Tilt stop at 20 deg, not the outdoor 15: the rover has to climb rocks and slopes to see the flags. On the
+# indoor run (29-sept) it reached 22 deg on a step, was stopped and backed off, and did not flip.
 SAFETY_OFFROAD = {'safety.max_linear_vel': 0.25, 'safety.max_reverse_vel': 0.25, 'safety.obstacle_enabled': False,
-                  'safety.tilt_enabled': True, 'safety.stop_if_attitude_stale': False}
+                  'safety.tilt_enabled': True, 'safety.stop_if_attitude_stale': False,
+                  'safety.max_tilt_deg': 20.0, 'safety.tilt_resume_deg': 10.0}
 LOCAL_OFFROAD = {'inflate_m': 0.3, 'unseen_extend_m': 0.1}
 
 IMAGE_EXT = ('.jpg', '.jpeg', '.png', '.bmp')
@@ -151,6 +154,15 @@ class ImageGoalOffroadNode(IndoorMissionNode):
         self.create_subscription(LaserScan, self._param('free_space_topic'), self._scan_callback, 10,
                                  callback_group=self._sensor_group)
         self.create_subscription(Imu, self._param('attitude_topic'), self._attitude_callback, 20,
+                                 callback_group=self._sensor_group)
+        # telemetry watch: on the indoor run (29-sept) the rover's data stopped for ~90 s while the video went
+        # on; ekf_local then dead-reckoned the commands the rover was not executing and the pose was lost.
+        # Now: no IMU for telemetry_timeout_s -> zero command and the mission frozen until it is back.
+        self.declare_parameter('telemetry_topic', '/erc/imu')
+        self.declare_parameter('telemetry_timeout_s', 2.0)
+        self._telemetry_t = None
+        self._stale_logged = False
+        self.create_subscription(Imu, self._param('telemetry_topic'), self._telemetry_callback, 20,
                                  callback_group=self._sensor_group)
         self._homing_pub = self.create_publisher(String, self._param('homing_topic'), 10)
         threading.Thread(target=self._homing_loop, daemon=True, name='homing').start()
@@ -348,6 +360,14 @@ class ImageGoalOffroadNode(IndoorMissionNode):
             if self.mission is not None:
                 self.mission.observe_scan(t, pose.x, pose.y, pose.yaw, b, r, hit)
 
+    def _telemetry_callback(self, _msg: Imu):
+        self._telemetry_t = time.monotonic()
+
+    def telemetry_stale(self):
+        """Seconds since the last IMU message (inf before the first), when over the timeout; else 0."""
+        age = math.inf if self._telemetry_t is None else time.monotonic() - self._telemetry_t
+        return age if age > float(self._param('telemetry_timeout_s')) else 0.0
+
     def _attitude_callback(self, msg: Imu):
         q = msg.orientation
         self.envelope.observe_attitude(self._now(), q.x, q.y, q.z, q.w)
@@ -380,7 +400,10 @@ class ImageGoalOffroadNode(IndoorMissionNode):
             else:
                 v, w = self._last_model_cmd.linear.x, self._last_model_cmd.angular.z
             hard, note = False, ''
-            if active and (v != 0.0 or w != 0.0):
+            stale = self.telemetry_stale() if active else 0.0
+            if stale:
+                v, w, hard, note = 0.0, 0.0, True, '[telemetry] no IMU from the rover: holding still'
+            elif active and (v != 0.0 or w != 0.0):
                 v, w, hard, note = self.envelope.limit(now, v, w, self._safety())
             dt = 0.0 if self._last_output_time is None else now - self._last_output_time
             self._last_output_time = now
