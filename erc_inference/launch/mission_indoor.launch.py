@@ -27,7 +27,7 @@ mission:=track -- the older indoor_mission_node (checkpoint coordinates from the
 dead reckoning only); run `ros2 run erc_inference indoor_mission_node` instead.
 
 Arguments: mission:=images|track, model:=none|edge|original, perception:=false|true
-(forced on with mission:=images), depth_backend:=unidepth|da3.
+(forced on with mission:=images), depth_backend:=unidepth|da3, cone_height_m:=0.23.
 
 LIVE operation only; it starts the SDK bridge.
 """
@@ -42,6 +42,7 @@ from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import EqualsSubstitution, LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 # Must match indoor_mission_node's fix_topic / heading_topic defaults.
 INDOOR_FIX_TOPIC = '/erc/indoor/fix'
@@ -63,6 +64,9 @@ def generate_launch_description():
                               description='run erc_perception free_space_node; forced on with mission:=images'),
         DeclareLaunchArgument('depth_backend', default_value='unidepth',
                               description="free_space_node depth model: 'unidepth' (UniDepthV2) or 'da3'"),
+        DeclareLaunchArgument('cone_height_m', default_value='0.23',
+                              description="the cones' real height (m); the detector's range comes from it "
+                                          "(9-inch sports cone assumed; nobody could measure the organisers')"),
     ]
     images = IfCondition(EqualsSubstitution(LaunchConfiguration('mission'), 'images'))
 
@@ -118,7 +122,8 @@ def generate_launch_description():
 
     # The cones the goal images show (CPU, ~10 ms/frame): /erc/cones for the mission node.
     cones = Node(package='erc_perception', executable='cone_detector_node', name='cone_detector_node',
-                 output='screen', condition=images)
+                 output='screen', condition=images,
+                 parameters=[{'cone_height_m': ParameterValue(LaunchConfiguration('cone_height_m'), value_type=float)}])
 
     reminder = LogInfo(msg=(
         'mission_indoor up (mission=', LaunchConfiguration('mission'), ', model=', LaunchConfiguration('model'),

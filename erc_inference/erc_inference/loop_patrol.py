@@ -676,6 +676,45 @@ class LoopPatrolMission:
         ys = np.array([e[2] for e in self._trail])
         return float(np.hypot(xs - xs[0], ys - ys[0]).max()) < p['stuck_min_move_m']
 
+    # -- resume: what survives a restart of the node -----------------------------
+
+    def export_state(self):
+        """The mission's memory as plain data (JSON-able): which goal is next, the patrol direction,
+        and every cone seen. With the node's anchor and wall correction this is what lets a
+        restarted controller carry on instead of starting over from CP1."""
+        return {
+            'index': self.index,
+            'direction': self.direction,
+            'cones': [{'cls': c.cls, 'name': c.name, 'visited': c.visited, 'rejections': c.rejections,
+                       'points': [list(map(float, pt)) for pt in c.points[-self.p['fuse_n']:]]}
+                      for c in self.cones.clusters if c.points],
+        }
+
+    def import_state(self, state, first_goal_index=None):
+        """Restore export_state(). first_goal_index (e.g. from the SDK's latest scanned
+        checkpoint) wins when it is further on. Confirmed cones are marked in the map again."""
+        self.direction = int(state.get('direction', self.direction))
+        idx = int(state.get('index', 0))
+        if first_goal_index is not None:
+            idx = max(idx, int(first_goal_index))
+        self.index = min(idx, len(self.goals))
+        self.cones.clusters = []
+        for c in state.get('cones', []):
+            pts = [np.asarray(p, float) for p in c['points']]
+            cl = ConeCluster(c['cls'], pts, name=c.get('name', ''), visited=bool(c.get('visited', False)),
+                             times=[-math.inf] * len(pts), rejections=int(c.get('rejections', 0)))
+            self.cones.clusters.append(cl)
+            if cl.visited and cl.name not in ('start', 'rejected'):
+                self._mark(cl.estimate(self.p['fuse_n']))
+        if not any(c.name == 'start' for c in self.cones.clusters):
+            self.cones.clusters.append(ConeCluster(self.goals[-1].cone_class if self.goals else 'red_orange',
+                                                   [self.start.copy()] * self.p['min_confirm'], name='start',
+                                                   times=[-math.inf] * self.p['min_confirm']))
+        self.target = None
+        self.state = PATROL if not self.done else DONE
+        self._route_kind = None
+        self.notes.append(f'resumed at goal {self.index + 1}/{len(self.goals)} with {len(self.cones.clusters)} cones mapped')
+
     def _mark(self, xy):
         m = self.replanner.map
         rows, cols = m.cell([xy[0]], [xy[1]])

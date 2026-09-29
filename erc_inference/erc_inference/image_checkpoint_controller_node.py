@@ -35,6 +35,13 @@ a rejection makes the mission close in.
 The rover must stand on the start pose of the track file when the goal is sent (NYU:
 next to the orange cone, facing the south corridor's east end). This node is the only
 writer of /cmd_vel: killing it takes the rover back.
+
+Resume: the node saves its anchor, wall correction, cone map and next goal to state_file
+every 2 s. After killing it (an intervention; the rover may be driven by hand meanwhile --
+ekf_local keeps tracking it as long as the launch keeps running), restart it and send
+resume_from_latest_scanned: true to carry on. The SDK's latest scanned checkpoint wins if it
+is further on. Without a usable state (none, too old, odometry restarted) it anchors at the
+start pose and says so.
 """
 import collections
 import json
@@ -101,6 +108,10 @@ class ImageCheckpointControllerNode(IndoorMissionNode):
         self.declare_parameter('free_space_topic', '/erc/free_space')
         self.declare_parameter('attitude_topic', '/erc/imu_attitude')
         self.declare_parameter('mission_timeout_s', 1800.0)        # the competition's 30 minutes
+        # Where the mission's memory is saved every 2 s (anchor, wall correction, cone map, next
+        # goal), so resume_from_latest_scanned: true can carry on after the node is restarted.
+        self.declare_parameter('state_file', os.path.expanduser('~/.ros/erc_indoor_mission_state.json'))
+        self.declare_parameter('state_max_age_s', 7200.0)
         self.declare_parameter('localize', True)
         self.declare_parameter('tick_rate_hz', 3.0)
         for name, default in PATROL_DEFAULTS.items():
@@ -129,6 +140,7 @@ class ImageCheckpointControllerNode(IndoorMissionNode):
         self._scan_ages = []
         self._last_age_log = 0.0
         self._mission_lock = threading.RLock()
+        self._last_save = -1e9
         self._last_note, self._last_note_t = '', -1e9
 
         self._t0 = time.monotonic()
@@ -315,6 +327,73 @@ class ImageCheckpointControllerNode(IndoorMissionNode):
         self._use_image_pub.publish(Bool(data=False))
         self._use_lan_pub.publish(Bool(data=False))
 
+    # -- resume ---------------------------------------------------------------
+
+    def _sdk_latest(self):
+        if not self._param('confirm_with_sdk'):
+            return None
+        try:
+            return self._fetch_latest_scanned()
+        except Exception as exc:
+            self.get_logger().warn(f'checkpoints-list failed ({exc}); resuming from the saved state alone')
+            return None
+
+    def _save_state(self):
+        self._last_save = self._now()
+        with self._lock:
+            anchor_ = self._track_from_odom
+            odom = self._odom_pose
+        with self._mission_lock:
+            if self.mission is None or anchor_ is None or odom is None:
+                return
+            doc = {'saved_at': time.time(), 'mission': self.mission.export_state(),
+                   'anchor': [anchor_.x, anchor_.y, anchor_.yaw],
+                   'localizer': [self.localizer.dx, self.localizer.dy, self.localizer.dyaw],
+                   'odom': [odom.x, odom.y, odom.yaw]}
+        path = self._param('state_file')
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(doc, f)
+        os.replace(tmp, path)                   # never a half-written file
+
+    def _resume(self) -> bool:
+        """Carry on from the saved state. False (and why, logged) when there is none to trust."""
+        path = self._param('state_file')
+        try:
+            with open(path) as f:
+                doc = json.load(f)
+        except (OSError, ValueError) as exc:
+            self.get_logger().warn(f'no saved mission state ({path}: {exc})')
+            return False
+        age = time.time() - float(doc.get('saved_at', 0.0))
+        if age > float(self._param('state_max_age_s')):
+            self.get_logger().warn(f'saved mission state is {age / 60:.0f} min old: not used')
+            return False
+        with self._lock:
+            odom = self._odom_pose
+        if odom is None:
+            return False
+        so = doc['odom']
+        # ekf_local restarted (terminal 2 relaunched): its frame starts again at the origin, and the
+        # saved anchor would put the rover somewhere it is not
+        if math.hypot(so[0], so[1]) > 1.0 and math.hypot(odom.x, odom.y) < 0.3:
+            self.get_logger().warn('the odometry was restarted since the state was saved: not used')
+            return False
+        with self._lock:
+            self._track_from_odom = Pose2D(*doc['anchor'])
+        self.localizer = WallLocalizer(self.known)
+        self.localizer.dx, self.localizer.dy, self.localizer.dyaw = doc['localizer']
+        latest = self._sdk_latest()
+        first = latest if latest else None
+        with self._mission_lock:
+            self.mission.import_state(doc['mission'], first)
+            idx = self.mission.index
+        self.get_logger().info(f'Resumed from {path} ({age:.0f} s old): goal {idx + 1}/{len(self.goals)}'
+                               + (f', SDK latest scanned {latest}' if latest is not None else '')
+                               + f', {len(doc["mission"]["cones"])} cones mapped.')
+        return True
+
     def _confirm_with_sdk(self, goal_handle):
         """-> (accepted, mission_completed). Local acceptance when confirm_with_sdk is false."""
         if not self._param('confirm_with_sdk'):
@@ -344,12 +423,21 @@ class ImageCheckpointControllerNode(IndoorMissionNode):
         result = StartMission.Result()
         t_start = self._now()
         try:
-            if not self._anchor_at(self.track.start):
-                raise RuntimeError(f'no odometry on {self._param("odom_topic")}: is ekf_local running?')
             lp_params = {n: self.get_parameter(f'local.{n}').value for n in LOCAL_INDOOR}
             with self._mission_lock:
                 self.mission = LoopPatrolMission(self.goals, self.known, (self.track.start.x, self.track.start.y),
                                                  'red_orange', lp_params, None, **self._patrol())
+            if not (goal_handle.request.resume_from_latest_scanned and self._resume()):
+                if not self._anchor_at(self.track.start):
+                    raise RuntimeError(f'no odometry on {self._param("odom_topic")}: is ekf_local running?')
+                if goal_handle.request.resume_from_latest_scanned:
+                    latest = self._sdk_latest()
+                    if latest:
+                        with self._mission_lock:
+                            self.mission.index = min(latest, len(self.goals))
+                    self.get_logger().warn(
+                        f'Resume WITHOUT saved state: anchored at the start pose, continuing at goal '
+                        f'{self.mission.index + 1}. The rover must be at the start, facing the corridor.')
             self.envelope.arm()
             with self._lock:
                 self._mission_active = True
@@ -370,6 +458,8 @@ class ImageCheckpointControllerNode(IndoorMissionNode):
                     raise RuntimeError(f'mission timeout ({self._param("mission_timeout_s"):.0f} s)')
                 with self._lock:
                     pose = self._track_pose
+                if t - self._last_save >= 2.0:
+                    self._save_state()
                 with self._mission_lock:
                     m = self.mission
                     step = m.update(t, pose.x, pose.y, pose.yaw, math.radians(self._turn_rate_dps()))
@@ -421,6 +511,10 @@ class ImageCheckpointControllerNode(IndoorMissionNode):
             result.message = str(exc)
             return result
         finally:
+            try:
+                self._save_state()
+            except Exception as exc:  # never let saving mask the mission's own outcome
+                self.get_logger().warn(f'could not save the mission state: {exc}')
             self._enable_pub.publish(Bool(data=False))
             with self._lock:
                 self._mission_active = False

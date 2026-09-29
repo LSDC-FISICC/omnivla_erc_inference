@@ -3,6 +3,7 @@
 Runs without ROS (test/indoor_sim.py and test/obstacles.py for the world). The goal-image
 test needs erc_perception on the path (the sibling source tree is tried).
 """
+import json
 import math
 import os
 import sys
@@ -199,3 +200,28 @@ def test_repeated_rejection_drops_the_cone_and_patrols_on():
     assert m.target is None and wrong.visited and wrong.name == 'rejected'
     assert m.goal.name == 'CP1'                       # still looking for CP1
     assert wrong not in m.cones.candidates('red_orange')
+
+
+def test_state_round_trip_resumes_at_the_next_goal_with_the_cone_map():
+    """A restarted controller carries on: next goal, patrol direction and every cone seen."""
+    m = mission()
+    for k in range(3):
+        m.observe_cone(20.0, -0.2, 0.0, 'red_orange', 0.0, 3.0, t=0.1 * k)
+        m.observe_cone(20.0, -0.2, 0.0, 'green', 5.0, 8.0, t=0.1 * k)
+    m.update(1.0, 20.0, -0.2, 0.0)
+    assert m.update(2.0, 22.0, -0.2, 0.0).arrived
+    m.confirm(2.5, True)                       # CP1 done
+    m.direction = -1
+    state = json.loads(json.dumps(m.export_state()))     # it must survive JSON
+
+    m2 = mission()
+    m2.import_state(state)
+    assert m2.goal.name == 'CP2' and m2.direction == -1
+    assert any(c.cls == 'green' for c in m2.cones.clusters)
+    cp1 = next(c for c in m2.cones.clusters if c.visited and c.cls == 'red_orange')
+    assert m2.replanner.map.occupied()[m2.replanner.map.cell(*cp1.estimate())]   # still an obstacle
+    assert any(c.name == 'start' for c in m2.cones.clusters)
+
+    m3 = mission()
+    m3.import_state(state, first_goal_index=2)            # the SDK says CP2 is scanned too
+    assert m3.goal.name == 'CP3'
