@@ -5,6 +5,7 @@
 # free space and cone detections, fake SDK). Parameters as mission_indoor.launch.py sets them.
 #   ./run_e2e_images.sh <seconds> <seed> [layout loop|random] [world tables|chairs|chairs+doors] [tag]
 # env: PLANT_KW_MOVING WHEEL_SCALE GYRO_SCALE GYRO_BIAS_DEG_MIN IMAGE_LAG_S SDK_PORT ROS_DOMAIN_ID_E2E
+#      EXTRA_NODE_ARGS (more -p name:=value for the mission node)
 HERE=$(cd "$(dirname "$0")" && pwd)
 SRC=$(cd "$HERE/../../erc_inference" && pwd)
 PERC=${PERC:-$(cd "$HERE/../../../erc_perception" 2>/dev/null && pwd)}
@@ -23,7 +24,7 @@ python3 -m erc_inference.image_checkpoint_controller_node --ros-args \
   -p route_file:="$SRC/config/indoor_nyu_track.yaml" -p goals_file:="$SRC/config/indoor_nyu_goals.yaml" \
   -p checkpoint_reached_url:=http://127.0.0.1:$SDK_PORT/checkpoint-reached \
   -p checkpoint_list_url:=http://127.0.0.1:$SDK_PORT/checkpoints-list \
-  -p safety.stop_if_attitude_stale:=false > "$OUT.mission.log" 2>&1 & MN=$!
+  -p safety.stop_if_attitude_stale:=false ${EXTRA_NODE_ARGS:-} > "$OUT.mission.log" 2>&1 & MN=$!
 sleep 5
 ros2 action send_goal /start_mission erc_inference_msgs/action/StartMission \
   "{resume_from_latest_scanned: false}" > "$OUT.action.log" 2>&1 &

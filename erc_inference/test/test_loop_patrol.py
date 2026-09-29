@@ -182,3 +182,20 @@ def test_stuck_with_nothing_ahead_backs_off_without_marking():
     assert m.stucks == 1
     assert step.command is not None and step.command[0] < 0.0
     assert not m.replanner.map.occupied()[m.replanner.map.cell(20.1, -0.2)]
+
+
+def test_repeated_rejection_drops_the_cone_and_patrols_on():
+    """A red/orange cone the SDK keeps rejecting is not CP1 (a ROS run looped 752 times on the
+    start cone's stray detection): after reject_blacklist_after it is dropped."""
+    m = mission()
+    for k in range(3):
+        m.observe_cone(20.0, -0.2, 0.0, 'red_orange', 0.0, 3.0, t=0.1 * k)
+    m.update(1.0, 20.0, -0.2, 0.0)
+    wrong = m.target
+    assert wrong is not None
+    for k in range(m.p['reject_blacklist_after']):
+        assert m.update(2.0 + k, 22.0, -0.2, 0.0).arrived
+        m.confirm(2.5 + k, False)
+    assert m.target is None and wrong.visited and wrong.name == 'rejected'
+    assert m.goal.name == 'CP1'                       # still looking for CP1
+    assert wrong not in m.cones.candidates('red_orange')

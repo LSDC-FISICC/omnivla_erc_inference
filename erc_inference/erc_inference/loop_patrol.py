@@ -90,6 +90,10 @@ DEFAULTS = dict(
     target_gate_m=4.0,
     live_s=3.0,
     keep_after_reject=3,        # a rejection keeps only the last few points, then scans again
+    reject_blacklist_after=3,   # rejected this many times: it is not that goal's cone (a stray
+                                # detection of another cone of the same colour class, e.g. the
+                                # orange start cone taken for red CP1): drop it, patrol on.
+                                # A ROS run looped 752 times on one before this (28-sept).
     # Stuck: the priority is to keep going (a bump at 0.25 m/s costs nothing, a deadlock ends the
     # run). Commanded to drive but less than stuck_min_move_m in stuck_window_s -> back off,
     # mark what is ahead as an obstacle, reroute; stuck twice within stuck_same_m -> the other way.
@@ -420,6 +424,7 @@ class ConeCluster:
     name: str = ''              # the goal it was confirmed as
     visited: bool = False
     times: List[float] = field(default_factory=list)
+    rejections: int = 0
 
     def estimate(self, n=9):
         return np.median(np.array(self.points[-n:]), axis=0)
@@ -596,6 +601,19 @@ class LoopPatrolMission:
             self._route_kind = None
         else:
             self.p['arrive_m'] = max(self.p['standoff_m'] + 0.1, 0.5 * self.p['arrive_m'])
+            if self.target is not None and self.target.name != 'start':
+                self.target.rejections += 1
+                if self.target.rejections >= self.p['reject_blacklist_after']:
+                    self.target.visited = True
+                    self.target.name = 'rejected'
+                    self.notes.append(f'{t:.1f} {self.goal.name}: rejected {self.target.rejections} times at '
+                                      f'({self.target.estimate()[0]:.1f},{self.target.estimate()[1]:.1f}): '
+                                      f'not this goal\'s cone; patrolling on')
+                    self.target = None
+                    self.p['arrive_m'] = self._arrive0
+                    self.state = PATROL
+                    self._route_kind = None
+                    return
             if self.target is not None and self.target.name != 'start':
                 k = self.p['keep_after_reject']
                 self.target.points = self.target.points[-k:]

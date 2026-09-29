@@ -36,6 +36,7 @@ The rover must stand on the start pose of the track file when the goal is sent (
 next to the orange cone, facing the south corridor's east end). This node is the only
 writer of /cmd_vel: killing it takes the rover back.
 """
+import collections
 import json
 import math
 import os
@@ -121,6 +122,12 @@ class ImageCheckpointControllerNode(IndoorMissionNode):
         self._override: Optional[tuple] = None
         self._raw_pose: Optional[Pose2D] = None
         self._yaws = []
+        # (ros time s, corrected pose) for the last few seconds: perception is matched against
+        # the pose at its own stamp, not at whenever its callback got to run (the executor
+        # delayed callbacks by up to ~1 s; mid-turn that is ~20 deg of error in the matching)
+        self._pose_hist = collections.deque()
+        self._scan_ages = []
+        self._last_age_log = 0.0
         self._mission_lock = threading.RLock()
         self._last_note, self._last_note_t = '', -1e9
 
@@ -173,8 +180,25 @@ class ImageCheckpointControllerNode(IndoorMissionNode):
             pose = self._track_pose
             t = self._now()
             self._yaws = [(tt, a) for tt, a in self._yaws if t - tt <= 1.0] + [(t, yaw)]
+            ts = self._ros_s()
+            self._pose_hist.append((ts, pose))
+            while self._pose_hist and ts - self._pose_hist[0][0] > 5.0:
+                self._pose_hist.popleft()
             self._odom_condition.notify_all()
         self._publish_pose(pose, msg.header.stamp)
+
+    def _ros_s(self):
+        return self.get_clock().now().nanoseconds * 1e-9
+
+    def _pose_at(self, stamp_s):
+        """The corrected pose at a ROS stamp (nearest sample within the last 5 s), else the latest."""
+        with self._lock:
+            hist = list(self._pose_hist)
+            latest = self._track_pose
+        if not hist or stamp_s <= 0.0:
+            return latest
+        i = min(range(len(hist)), key=lambda k: abs(hist[k][0] - stamp_s))
+        return hist[i][1] if abs(hist[i][0] - stamp_s) < 0.5 else latest
 
     def _turn_rate_dps(self):
         h = self._yaws
@@ -198,8 +222,16 @@ class ImageCheckpointControllerNode(IndoorMissionNode):
         r = np.where(np.isfinite(r), r, msg.range_max)
         t = self._now()
         self.envelope.observe_free_space(t, b, np.where(hit, r, msg.range_max), msg.range_max)
-        with self._lock:
-            pose = self._track_pose
+        stamp = msg.header.stamp.sec + 1e-9 * msg.header.stamp.nanosec
+        age = self._ros_s() - stamp if stamp > 0 else float('nan')
+        self._scan_ages.append(age)
+        if t - self._last_age_log >= 30.0 and self._scan_ages:
+            a = np.array([v for v in self._scan_ages if np.isfinite(v)])
+            if len(a):
+                self.get_logger().info(f'free space age on arrival: p50 {np.median(a):.2f} s, max {a.max():.2f} s '
+                                       f'({len(a)} profiles)')
+            self._scan_ages, self._last_age_log = [], t
+        pose = self._pose_at(stamp)
         if pose is None:
             return
         with self._mission_lock:
@@ -210,11 +242,11 @@ class ImageCheckpointControllerNode(IndoorMissionNode):
 
     def _cones_callback(self, msg: String):
         try:
-            dets = json.loads(msg.data).get('detections', [])
+            doc = json.loads(msg.data)
+            dets = doc.get('detections', [])
         except (ValueError, AttributeError):
             return
-        with self._lock:
-            pose = self._track_pose
+        pose = self._pose_at(float(doc.get('stamp', 0.0)))
         if pose is None:
             return
         t = self._now()
