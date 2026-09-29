@@ -1,0 +1,19 @@
+# The NYU indoor mission (Earth-rover-ros2-bridge/docs/NYU Indoor - ERC 2026.pdf): reach, in this
+# order, the cone each image shows. Read by image_checkpoint_controller_node (param goals_file).
+#
+# The images are the organisers' own cone photos, extracted from the PDF (page 1: orange, red;
+# page 2: green, yellow, blue) and downscaled to 384x512. The node reads each image's cone colour
+# from the image itself (erc_perception.cones.classify_goal_image) and refuses to start if one is
+# ambiguous. Checked 28-sept: each cone covers 19.6-32.7% of its image, 0.0% any other class.
+#
+# Orange and red are ONE colour class for the detector (their hues are 1-2 apart on OpenCV's
+# 0-179 scale). start_cone marks the goal that is the Start/Finish cone, next to the rover at the
+# start: that is what separates the Finish (orange) from CP1 (red).
+#
+# Paths are relative to this file.
+goals:
+  - {name: CP1, image: goal_images/nyu/cp1.jpg}
+  - {name: CP2, image: goal_images/nyu/cp2.jpg}
+  - {name: CP3, image: goal_images/nyu/cp3.jpg}
+  - {name: CP4, image: goal_images/nyu/cp4.jpg}
+  - {name: Finish, image: goal_images/nyu/start_finish.jpg, start_cone: true}

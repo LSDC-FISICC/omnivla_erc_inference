@@ -68,3 +68,14 @@ python3 -m pytest test/test_motion_control.py test/test_controller_sim.py   # al
 `checkpoint_controller_node` plans each leg with A\* and drives it with a carrot: a goal `carrot_distance_m` (default 1.5 m) ahead of the rover's projection on the route, re-published at `carrot_rate_hz`, with the route's direction as `/goal_compass`. A checkpoint counts as reached within `checkpoint_proximity_m` (default 6 m); if the SDK rejects it, the radius halves, down to `min_checkpoint_proximity_m`, and the rover closes in.
 
 Both nodes read position from `/erc/gps/filtered`, so `erc_localization`'s `localization_global.launch.py` must be running.
+## Indoor missions (no GPS)
+
+`launch/mission_indoor.launch.py` (default `mission:=images model:=none`) runs the ERC 2026 NYU indoor mission: reach, in order, the cones the goal images show (`config/indoor_nyu_goals.yaml`) on the known corridor loop (`config/indoor_nyu_track.yaml`). `image_checkpoint_controller_node` (by hand, the only writer of `/cmd_vel`) runs [`erc_inference/loop_patrol.py`](erc_inference/loop_patrol.py):
+- patrol the loop and map every cone seen, of any colour (erc_perception's `cone_detector_node`);
+- visit the cones in the images' order, the shorter way round, finishing the approach on the live view of the cone;
+- correct the odometry's drift against the known walls;
+- back off and reroute when stuck.
+
+Speed is 0.25 m/s. There is no obstacle stop; the tilt stop backs the rover off. The same StartMission action and `/checkpoint-reached` loop as outdoors.
+
+Checks: `test/test_loop_patrol.py` (unit), `test/loop_patrol_sim.py` (30-minute missions, the robot's own code), `rover_simulation/e2e/run_e2e_images.sh` (the real nodes in ROS against a fake world and SDK). Plan, evidence and known limits: `Earth-rover-ros2-bridge/docs/PLAN_INDOOR_NYU.md`. The older track-file mission (`mission:=track`, `indoor_mission_node`) and its dead-reckoning study (`test/indoor_sim.py`) are still there.

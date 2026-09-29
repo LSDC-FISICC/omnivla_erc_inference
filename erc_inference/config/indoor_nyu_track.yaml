@@ -1,0 +1,100 @@
+# NYU Indoor track, ERC 2026 (Earth-rover-ros2-bridge/docs/NYU Indoor - ERC 2026.pdf).
+# Read by indoor_mission_node (param route_file) and test/indoor_sim.py.
+#
+# Frame "track": origin at the Start/Finish cone, +x along the south corridor
+# toward CP1 (map right), +y toward the north corridor (map up), meters,
+# yaw counter-clockwise from +x. Direction of travel CCW: CP1 south corridor,
+# CP2 east, CP3 north, CP4 west, back to Start/Finish.
+#
+# MEASURED FROM THE MAP IMAGE, not surveyed. Scale from the "28 m" bar along the
+# west corridor (34.8 px/m on the 2048 px image), map rotated 2.96 deg to the
+# corridor axes; each checkpoint is its magenta marker. Cross-checks:
+#   west side 28.0 m (bar: 28 m); south side SW->SE 27.1 m (label: 28 m);
+#   Start->CP1 21.4 m (label "20m", which is where it sits);
+#   loop 128.4 m against "Total Circumference: 132m", 3% short.
+# So expect ~1 m errors per point. Where the cones actually stand on the day
+# is what counts: correct these after a walk-through if there is one.
+#
+# Corridor widths, floor run across 23 profiles per side (for the simulator
+# only): median south 4.0 m (curved inner wall), west 1.9, north 2.0, east 1.9.
+# SE corner: the south corridor continues to x = 41.6 (a furnished area);
+# NW corner: the north corridor continues to x = 5.2. Five white discs ringed by
+# red points (likely round tables + chairs) sit at y ~ -1.35 between x = 27.8 and
+# 35.9, ~1.1 m right of the south centerline.
+#
+# via: corners the leg passes through before the checkpoint, on corridor
+# centerlines (south y = -0.2, east x = 36.2, north y = 27.8, west x = 9.1).
+# prompt: only used with indoor_mission_node use_language:=true (modality 8,
+# pose + language). Never tested.
+
+name: nyu_indoor_erc2026
+start: {x: 0.0, y: 0.0, yaw_deg: 0.0}   # on the orange cone, facing CP1 -- ASSUMED, confirm on site
+
+# The FIXED part of the map (walls do not move; chairs and open doors may be added
+# on the day). Used by image_checkpoint_controller_node / loop_patrol.py: the patrol
+# route, the known walls for the planner, and the wall-based drift correction.
+# Each corridor: centerline from -> to, and half its width (measured medians above).
+corridors:
+  - {name: south, from: [-3.0, -0.2], to: [41.6, -0.2], half_width: 2.2}   # incl. the start spur and the SE stub;
+                              # outer wall straight at -2.35, inner curved 1.2-2.9 (see walls)
+  - {name: east,  from: [36.2, -0.2], to: [36.2, 27.8], half_width: 0.95}
+  - {name: north, from: [36.2, 27.8], to: [5.2, 27.8],  half_width: 1.0}   # incl. the NW stub
+  - {name: west,  from: [9.1, 27.8],  to: [9.1, -0.2],  half_width: 0.95}
+# The patrol ring on those centerlines, counter-clockwise (the PDF's numbering order): the
+# closed loop only, from the SW corner. The start spur (x < 9.1) is not on it -- it would be
+# on it twice, out and back, and the rover could not tell which (loop_patrol_sim, 28-sept).
+loop: [[9.1, -0.2], [36.2, -0.2], [36.2, 27.8], [9.1, 27.8], [9.1, -0.2]]
+# Where to stop and look both ways (corners, T-junctions, stubs): cones may stand off the ring.
+# Also three along the south corridor: from its centerline the straight outer wall (2.15 m away)
+# is out of the depth profile's view, so drift is never corrected there unless the rover turns
+# to face it -- which the scan does (loop_patrol_sim, 28-sept: pose diverged there otherwise).
+# Not at x ~ 30: there the scan looked at the tables instead of the wall (see furniture).
+scan_points: [[9.1, -0.2], [16.0, -0.2], [23.0, -0.2], [36.2, -0.2], [36.2, 27.8], [9.1, 27.8]]
+# Furniture seen on the map that is NOT a wall: depth hits near it are never matched against
+# the walls. Five white discs ringed by red points along the south corridor's outer wall, most
+# likely round tables with chairs (measured 28-sept). In simulation, a scan facing them read
+# them as the outer wall 1 m closer and shifted the pose 0.7 m: that is where the pose diverged
+# in 9 of 10 high-drift runs. If they are gone on the day nothing is lost.
+furniture:
+  - {at: [27.8, -1.3], r: 0.35}
+  - {at: [30.0, -1.3], r: 0.35}
+  - {at: [31.7, -1.3], r: 0.35}
+  - {at: [33.8, -1.4], r: 0.35}
+  - {at: [35.9, -1.4], r: 0.35}
+
+# Wall segments of the fixed map, for the planner and the drift correction's point-to-wall
+# matching. Tables, chairs, cones and doors are NOT here. reliable: false = kept as a boundary
+# but never matched against (the south corridor's curved courtyard wall, y 1.2-2.9 along it,
+# and the spur's north side, which the map shows only in part). The south OUTER wall was
+# measured straight at y ~ -2.35 (floor run every 0.5 m, x 11-34 m; 28-sept).
+walls:
+  - {from: [-3.00, -2.35], to: [41.60, -2.35]}                  # south, outer (straight)
+  - {from: [41.60, -2.35], to: [41.60, 1.35]}                   # SE stub end
+  - {from: [41.60, 1.35], to: [37.15, 1.35], reliable: false}   # SE stub, north side
+  - {from: [37.15, 1.35], to: [37.15, 28.80]}                   # east, outer
+  - {from: [37.15, 28.80], to: [5.20, 28.80]}                   # north, outer
+  - {from: [5.20, 28.80], to: [5.20, 26.80]}                    # NW stub end
+  - {from: [5.20, 26.80], to: [8.15, 26.80], reliable: false}   # NW stub, south side
+  - {from: [8.15, 26.80], to: [8.15, 1.35]}                     # west, outer
+  - {from: [8.15, 1.35], to: [-3.00, 1.35], reliable: false}    # start spur, north side
+  - {from: [-3.00, 1.35], to: [-3.00, -2.35], reliable: false}  # start spur end (beyond the scan)
+  - {from: [10.05, 2.60], to: [35.25, 1.30], reliable: false}   # south, inner: CURVED, not matched
+  - {from: [35.25, 1.30], to: [35.25, 26.80]}                   # east, inner
+  - {from: [35.25, 26.80], to: [10.05, 26.80]}                  # north, inner
+  - {from: [10.05, 26.80], to: [10.05, 2.60]}                   # west, inner
+
+# EXAMPLE checkpoint positions from the PDF map. THEY CHANGE ON THE DAY: the image
+# checkpoint controller ignores them (the mission is the cone images, see
+# indoor_nyu_goals.yaml). indoor_mission_node's track mode still reads them.
+checkpoints:
+  - {sequence: 1, name: CP1, cone: red, x: 21.4, y: -0.4,
+     prompt: "go to the red cone"}
+  - {sequence: 2, name: CP2, cone: blue, x: 36.2, y: 12.4, via: [[36.2, -0.2]],
+     prompt: "go to the blue cone"}
+  - {sequence: 3, name: CP3, cone: green, x: 21.7, y: 27.8, via: [[36.2, 27.8]],
+     prompt: "go to the green cone"}
+  - {sequence: 4, name: CP4, cone: yellow, x: 9.1, y: 14.4, via: [[9.1, 27.8]],
+     prompt: "go to the yellow cone"}
+  # Whether the SDK counts the finish as its own checkpoint is not in the PDF.
+  - {sequence: 5, name: Finish, cone: orange, x: 0.0, y: 0.0, via: [[9.1, -0.2]],
+     prompt: "go to the orange cone"}
