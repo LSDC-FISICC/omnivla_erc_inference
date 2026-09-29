@@ -77,11 +77,11 @@ def yaw_from_quaternion(q) -> float:
 
 class IndoorMissionNode(Node):
 
-    def __init__(self, node_name='indoor_mission_node'):
+    def __init__(self, node_name='indoor_mission_node', route_file='indoor_nyu_track.yaml'):
         super().__init__(node_name)
 
         self.declare_parameter('route_file', os.path.join(
-            get_package_share_directory('erc_inference'), 'config', 'indoor_nyu_track.yaml'))
+            get_package_share_directory('erc_inference'), 'config', route_file))
         self.declare_parameter('odom_topic', '/erc/odometry/local')
         # Must match mission_indoor.launch.py's remap of the model node.
         self.declare_parameter('fix_topic', '/erc/indoor/fix')

@@ -1,0 +1,6 @@
+# Off-road image-goal missions (image_goal_offroad_node): no map, no checkpoints. The start is
+# the odometry frame's origin wherever the rover stands when start_mission is sent; the goal
+# comes from the goal image (goal_image parameter), not from here.
+name: offroad
+start: {x: 0.0, y: 0.0, yaw_deg: 0.0}
+checkpoints: []
