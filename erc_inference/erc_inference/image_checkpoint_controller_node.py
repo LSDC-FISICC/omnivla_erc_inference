@@ -57,14 +57,17 @@ import yaml
 import rclpy
 from ament_index_python.packages import get_package_share_directory
 from geometry_msgs.msg import Twist
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import OccupancyGrid, Odometry
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from sensor_msgs.msg import Imu, LaserScan
 from std_msgs.msg import Bool, String
+from visualization_msgs.msg import Marker, MarkerArray
 
 from erc_inference_msgs.action import StartMission
 
+from erc_inference.explore_search import DEFAULTS as EXPLORE_DEFAULTS
+from erc_inference.explore_search import ExploreSearchMission
 from erc_inference.image_goal_mission import Goal
 from erc_inference.indoor_mission_node import IndoorMissionNode, yaw_from_quaternion
 from erc_inference.indoor_track import Pose2D, anchor
@@ -85,6 +88,11 @@ def load_goals(path, logger):
     base = os.path.dirname(os.path.abspath(path))
     goals = []
     for i, item in enumerate(doc['goals']):
+        if 'class' in item:
+            # no image: the class is given (an object class of object_detector_node, e.g. 'potted plant')
+            goals.append(Goal(str(item['name']), str(item['class']), i + 1))
+            logger.info(f"goal {i + 1} {item['name']}: class {item['class']!r}")
+            continue
         img_path = item['image'] if os.path.isabs(item['image']) else os.path.join(base, item['image'])
         img = cv2.imread(img_path)
         if img is None:
@@ -108,6 +116,23 @@ class ImageCheckpointControllerNode(IndoorMissionNode):
         share = get_package_share_directory('erc_inference')
         self.declare_parameter('goals_file', os.path.join(share, 'config', 'indoor_nyu_goals.yaml'))
         self.declare_parameter('cones_topic', '/erc/cones')
+        self.declare_parameter('cones_trust_size_m', 5.0)     # beyond, a cone must be range-consistent
+        # erc_perception's object_detector_node (YOLO26), JSON: its detections of these classes go on the
+        # cone map under their label and are visited like cones (a search mission: goals with `class:`).
+        # '' = not used. cones_topic may be '' too, so that only objects are searched for.
+        self.declare_parameter('objects_topic', '')
+        self.declare_parameter('object_classes', ['potted plant'])
+        # No known corridors: explore_search.ExploreSearchMission builds the map from /erc/free_space,
+        # explores it and visits the objects it finds. route_file is then only the start pose, and the
+        # wall-based drift correction is off (there are no known walls). The map (OccupancyGrid) and
+        # the objects on it (MarkerArray) are published in the odometry frame, to look at.
+        self.declare_parameter('explore', False)
+        self.declare_parameter('explore_map_topic', '/erc/explore/map')
+        self.declare_parameter('explore_objects_topic', '/erc/explore/objects')
+        self.declare_parameter('explore_map_rate_hz', 1.0)
+        self.declare_parameter('odom_frame', 'odom')
+        for name, default in EXPLORE_DEFAULTS.items():
+            self.declare_parameter(f'explore.{name}', list(default) if isinstance(default, tuple) else default)
         self.declare_parameter('free_space_topic', '/erc/free_space')
         self.declare_parameter('attitude_topic', '/erc/imu_attitude')
         self.declare_parameter('mission_timeout_s', 1800.0)        # the competition's 30 minutes
@@ -157,8 +182,15 @@ class ImageCheckpointControllerNode(IndoorMissionNode):
         # perception in its own group: it waits on the mission lock while the mission plans,
         # and must not hold up odometry or the /cmd_vel timer (see indoor_mission_node)
         self._sensor_group = MutuallyExclusiveCallbackGroup()
-        self.create_subscription(String, self._param('cones_topic'), self._cones_callback, 10,
-                                 callback_group=self._sensor_group)
+        self._map_pub = self.create_publisher(OccupancyGrid, self._param('explore_map_topic'), 1)
+        self._objects_pub = self.create_publisher(MarkerArray, self._param('explore_objects_topic'), 1)
+        self._last_map_pub = -1e9
+        if self._param('cones_topic'):
+            self.create_subscription(String, self._param('cones_topic'), self._cones_callback, 10,
+                                     callback_group=self._sensor_group)
+        if self._param('objects_topic'):
+            self.create_subscription(String, self._param('objects_topic'), self._objects_callback, 10,
+                                     callback_group=self._sensor_group)
         self.create_subscription(LaserScan, self._param('free_space_topic'), self._scan_callback, 10,
                                  callback_group=self._sensor_group)
         self.create_subscription(Imu, self._param('attitude_topic'), self._attitude_callback, 20,
@@ -252,7 +284,7 @@ class ImageCheckpointControllerNode(IndoorMissionNode):
         with self._mission_lock:
             if self.mission is not None:
                 self.mission.observe_scan(t, pose.x, pose.y, pose.yaw, b, r, hit)
-            if self._param('localize'):
+            if self._param('localize') and not self._param('explore'):
                 self.localizer.observe(pose.x, pose.y, pose.yaw, b, r, hit, self._turn_rate_dps())
 
     def _cones_callback(self, msg: String):
@@ -269,8 +301,33 @@ class ImageCheckpointControllerNode(IndoorMissionNode):
             if self.mission is None:
                 return
             for d in dets:
+                # far and inconsistent (size range vs ground-contact range) is not a cone standing on this
+                # floor: blue graffiti and blue clothes on the horizon read as cones 6-12 m away on
+                # mission_0929_urban_1235, every one inconsistent. Near, the size range is trusted.
+                if not d.get('consistent', True) and float(d['range_m']) > float(self._param('cones_trust_size_m')):
+                    continue
                 self.mission.observe_cone(pose.x, pose.y, pose.yaw, d['color'], float(d['bearing_deg']),
                                           float(d['range_m']), t)
+
+    def _objects_callback(self, msg: String):
+        try:
+            doc = json.loads(msg.data)
+            dets = doc.get('detections', [])
+        except (ValueError, AttributeError):
+            return
+        pose = self._pose_at(float(doc.get('stamp', 0.0)))
+        if pose is None:
+            return
+        wanted = set(self._param('object_classes'))
+        t = self._now()
+        with self._mission_lock:
+            if self.mission is None:
+                return
+            for d in dets:
+                # no range: the box is cut by the bottom of the image and the depth profile has no hit there
+                if d.get('label') in wanted and d.get('range_m') is not None:
+                    self.mission.observe_cone(pose.x, pose.y, pose.yaw, d['label'], float(d['bearing_deg']),
+                                              float(d['range_m']), t)
 
     def _attitude_callback(self, msg: Imu):
         q = msg.orientation
@@ -329,6 +386,49 @@ class ImageCheckpointControllerNode(IndoorMissionNode):
         self._use_satellite_pub.publish(Bool(data=False))
         self._use_image_pub.publish(Bool(data=False))
         self._use_lan_pub.publish(Bool(data=False))
+
+    # -- the explored map, to look at -------------------------------------------
+
+    def _publish_explore_map(self):
+        """The mission's map and its objects in the odometry frame (the mission frame is anchored to
+        it at the start; the grid's origin carries that transform, so no TF is needed)."""
+        with self._lock:
+            anchor_ = self._track_from_odom
+        with self._mission_lock:
+            m = self.mission
+            if m is None or anchor_ is None or not hasattr(m, 'map'):
+                return
+            cmap = m.map
+            prob = 100.0 / (1.0 + np.exp(-cmap.L))
+            data = np.where(cmap.seen, np.clip(prob, 0, 100), -1).astype(np.int8).ravel().tolist()
+            objects = m.objects()
+        odom_from_track = anchor_.inverse()
+        stamp = self.get_clock().now().to_msg()
+        frame = self._param('odom_frame')
+        g = OccupancyGrid()
+        g.header.stamp, g.header.frame_id = stamp, frame
+        g.info.resolution = float(cmap.p['resolution_m'])
+        g.info.width, g.info.height = cmap.w, cmap.h
+        o = odom_from_track.compose(Pose2D(float(cmap.ox), float(cmap.oy), 0.0))
+        g.info.origin.position.x, g.info.origin.position.y = o.x, o.y
+        g.info.origin.orientation.z, g.info.origin.orientation.w = math.sin(o.yaw / 2), math.cos(o.yaw / 2)
+        g.data = data
+        self._map_pub.publish(g)
+        arr = MarkerArray()
+        arr.markers.append(Marker(action=Marker.DELETEALL))
+        for i, (cls, x, y, visited, n) in enumerate(objects):
+            q = odom_from_track.compose(Pose2D(x, y, 0.0))
+            colour = (0.2, 0.8, 0.2) if visited else (1.0, 0.6, 0.0)       # green: shown; orange: pending
+            for k, kind in enumerate((Marker.CYLINDER, Marker.TEXT_VIEW_FACING)):
+                mk = Marker(type=kind, action=Marker.ADD, ns='objects' if k == 0 else 'labels', id=i)
+                mk.header.stamp, mk.header.frame_id = stamp, frame
+                mk.pose.position.x, mk.pose.position.y, mk.pose.position.z = q.x, q.y, 0.25 if k == 0 else 0.8
+                mk.pose.orientation.w = 1.0
+                mk.scale.x, mk.scale.y, mk.scale.z = (0.4, 0.4, 0.5) if k == 0 else (0.0, 0.0, 0.25)
+                mk.color.r, mk.color.g, mk.color.b, mk.color.a = (*colour, 0.9) if k == 0 else (1.0, 1.0, 1.0, 1.0)
+                mk.text = f'{cls}' + (' (shown)' if visited else '') if k == 1 else ''
+                arr.markers.append(mk)
+        self._objects_pub.publish(arr)
 
     # -- resume ---------------------------------------------------------------
 
@@ -428,8 +528,13 @@ class ImageCheckpointControllerNode(IndoorMissionNode):
         try:
             lp_params = {n: self.get_parameter(f'local.{n}').value for n in LOCAL_INDOOR}
             with self._mission_lock:
-                self.mission = LoopPatrolMission(self.goals, self.known, (self.track.start.x, self.track.start.y),
-                                                 'red_orange', lp_params, None, **self._patrol())
+                if self._param('explore'):
+                    explore = {n: self.get_parameter(f'explore.{n}').value for n in EXPLORE_DEFAULTS}
+                    self.mission = ExploreSearchMission(self.goals, (self.track.start.x, self.track.start.y),
+                                                        lp_params, **self._patrol(), **explore)
+                else:
+                    self.mission = LoopPatrolMission(self.goals, self.known, (self.track.start.x, self.track.start.y),
+                                                     'red_orange', lp_params, None, **self._patrol())
             if not (goal_handle.request.resume_from_latest_scanned and self._resume()):
                 if not self._anchor_at(self.track.start):
                     raise RuntimeError(f'no odometry on {self._param("odom_topic")}: is ekf_local running?')
@@ -463,6 +568,9 @@ class ImageCheckpointControllerNode(IndoorMissionNode):
                     pose = self._track_pose
                 if t - self._last_save >= 2.0:
                     self._save_state()
+                if self._param('explore') and t - self._last_map_pub >= 1.0 / float(self._param('explore_map_rate_hz')):
+                    self._last_map_pub = t
+                    self._publish_explore_map()
                 with self._mission_lock:
                     m = self.mission
                     step = m.update(t, pose.x, pose.y, pose.yaw, math.radians(self._turn_rate_dps()))
@@ -483,7 +591,7 @@ class ImageCheckpointControllerNode(IndoorMissionNode):
                         m.confirm(self._now(), accepted)
                     if accepted:
                         result.last_checkpoint_sequence = g.sequence
-                        self.get_logger().info(f'cone {m.index}/{len(self.goals)} shown.' if m.p['any_order'] else
+                        self.get_logger().info(f'cone {m.index}/{m.n_shows} shown.' if m.p['any_order'] else
                                                f'{g.name} confirmed ({m.index}/{len(self.goals)}).')
                     if completed:
                         break

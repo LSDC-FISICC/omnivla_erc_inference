@@ -28,6 +28,8 @@ dead reckoning only); run `ros2 run erc_inference indoor_mission_node` instead.
 
 Arguments: mission:=images|track, model:=none|edge|original, perception:=false|true
 (forced on with mission:=images), depth_backend:=unidepth|da3, cone_height_m:=0.23.
+target:=cones|plants: with plants, object_detector_node (YOLO26) runs instead of the cone
+detector and the mission node is started as the search mission (see `plants` below).
 
 LIVE operation only; it starts the SDK bridge.
 """
@@ -67,8 +69,10 @@ def generate_launch_description():
         DeclareLaunchArgument('cone_height_m', default_value='0.23',
                               description="the cones' real height (m); the detector's range comes from it "
                                           "(9-inch sports cone assumed; nobody could measure the organisers')"),
+        DeclareLaunchArgument('target', default_value='cones',
+                              description="what mission:=images looks for: 'cones' (cone_detector_node -> /erc/cones) "
+                                          "or 'plants' (object_detector_node, YOLO26 -> /erc/objects)"),
     ]
-    images = IfCondition(EqualsSubstitution(LaunchConfiguration('mission'), 'images'))
 
     bridge = [
         Node(package='erc_bridge', executable='erc_data_node',
@@ -122,8 +126,19 @@ def generate_launch_description():
 
     # The cones the goal images show (CPU, ~10 ms/frame): /erc/cones for the mission node.
     cones = Node(package='erc_perception', executable='cone_detector_node', name='cone_detector_node',
-                 output='screen', condition=images,
+                 output='screen',
+                 condition=IfCondition(PythonExpression(["'", LaunchConfiguration('mission'), "' == 'images' and '",
+                                                         LaunchConfiguration('target'), "' == 'cones'"])),
                  parameters=[{'cone_height_m': ParameterValue(LaunchConfiguration('cone_height_m'), value_type=float)}])
+
+    # Potted plants instead (GPU, YOLO26 in the main venv; its boxes on /erc/perception/objects/compressed).
+    # The mission node then needs: -p cones_topic:='' -p objects_topic:=/erc/objects
+    # -p goals_file:=<share>/config/indoor_plants_goals.yaml -p patrol.max_shows:=0, and either
+    # -p explore:=true (no known map: it builds one from /erc/free_space, explore_search.py) or
+    # -p route_file:=<your corridors> (the patrol on a known loop).
+    plants = ExecuteProcess(cmd=['ros2', 'run', 'erc_perception', 'yolo_wrapper'], output='screen',
+                            condition=IfCondition(PythonExpression(["'", LaunchConfiguration('mission'), "' == 'images' and '",
+                                                                    LaunchConfiguration('target'), "' == 'plants'"])))
 
     reminder = LogInfo(msg=(
         'mission_indoor up (mission=', LaunchConfiguration('mission'), ', model=', LaunchConfiguration('model'),
@@ -131,4 +146,4 @@ def generate_launch_description():
         '  and  ros2 action send_goal /start_mission erc_inference_msgs/action/StartMission '
         '"{resume_from_latest_scanned: false}"'))
 
-    return LaunchDescription(args + bridge + inference + [localization, perception, cones, reminder])
+    return LaunchDescription(args + bridge + inference + [localization, perception, cones, plants, reminder])

@@ -1,0 +1,20 @@
+# Search mission: find potted plants on a known corridor loop. Read by
+# image_checkpoint_controller_node (param goals_file) instead of indoor_nyu_goals.yaml.
+#
+# A goal with `class:` has no image: it is one object of that class, as published by
+# erc_perception's object_detector_node (YOLO26; 'potted plant' is a class of the stock COCO
+# weights) on /erc/objects. The mission runs in any order (the node's default): it explores
+# (`-p explore:=true`, no known map) or patrols a known loop (route_file), puts every potted
+# plant it sees on its map, and goes to each one, faces it and holds still patrol.show_s. It ends after as many plants as there are goals here -- run the
+# node with `-p patrol.max_shows:=0`, or it keeps going up to the competition's 7 -- or at
+# mission_timeout_s, or (exploring) when nothing is left to explore, whichever comes first.
+#
+#   ros2 launch erc_inference mission_indoor.launch.py target:=plants debug_images:=true
+#   ros2 run erc_inference image_checkpoint_controller_node --ros-args -p explore:=true \
+#       -p cones_topic:='' -p objects_topic:=/erc/objects -p patrol.max_shows:=0 \
+#       -p goals_file:=$(ros2 pkg prefix erc_inference)/share/erc_inference/config/indoor_plants_goals.yaml
+#   ros2 action send_goal /start_mission erc_inference_msgs/action/StartMission "{resume_from_latest_scanned: false}"
+goals:
+  - {name: Maceta1, class: potted plant}
+  - {name: Maceta2, class: potted plant}
+  - {name: Maceta3, class: potted plant}

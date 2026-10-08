@@ -57,8 +57,13 @@ DEFAULTS = dict(
     show_s=0.0,
     show_face_deg=30.0,         # turn to the cone if it is further off the camera axis than this
     start_scan=False,           # a full turn at the start (the start cone may be beside or behind)
-    same_class_apart_m=3.0,     # any order: a second cone of a class (red and orange are one) must be this far
-                                # from the one already shown -- otherwise it is that cone mapped twice
+    same_class_apart_m=3.0,     # any order: a cone of a class this close to one already shown IS that one
+                                # (mapped twice by drift): not shown again
+    colour_quota=False,         # also cap each colour at its count in the goal images. OFF: a false positive
+                                # (blue graffiti, blue clothes: mission_0929_urban_1235) would then use up
+                                # the real cone's colour
+    max_shows=0,                # any order: keep showing new cones up to this many (0: the number of goals);
+                                # a show can miss -- a duplicate, a false positive -- and an extra costs time only
     direction=1,                # +1: the ring's own order (CCW on NYU), -1: the other way
     patrol_ahead_m=25.0,        # patrol route length ahead of the rover, rebuilt as it goes
     patrol_rebuild_m=10.0,
@@ -131,7 +136,7 @@ DEFAULTS = dict(
 # per mission at 0.25 m/s, which the team accepts; tipping over is what must not happen.
 # the organisers' mechanics (29-sept): points for SEEING each cone from <= 3 m, any order, judged on
 # the video; no SDK checkpoints. The node's defaults.
-PATROL_COMPETITION = {'any_order': True, 'show_s': 5.0, 'start_scan': True, 'arrive_m': 1.8}
+PATROL_COMPETITION = {'any_order': True, 'show_s': 5.0, 'start_scan': True, 'arrive_m': 1.8, 'max_shows': 7}
 
 SAFETY_INDOOR = {'safety.max_linear_vel': 0.25, 'safety.stop_distance_m': 0.7,
                  'safety.obstacle_enabled': False, 'safety.tilt_enabled': True,
@@ -567,11 +572,20 @@ class LoopPatrolMission:
 
     @property
     def goal(self) -> Optional[Goal]:
-        return self.goals[self.index] if self.index < len(self.goals) else None
+        if self.index < len(self.goals):
+            return self.goals[self.index]
+        if not self.done:                 # any order, shows beyond the goal images: any cone
+            return Goal(f'extra{self.index + 1}', 'any', self.index + 1)
+        return None
+
+    @property
+    def n_shows(self):
+        n = int(self.p.get('max_shows', 0) or 0)
+        return max(n, len(self.goals)) if self.p['any_order'] else len(self.goals)
 
     @property
     def done(self):
-        return self.index >= len(self.goals)
+        return self.index >= self.n_shows
 
     # -- inputs -------------------------------------------------------------
 
@@ -862,7 +876,7 @@ class LoopPatrolMission:
                 quota[c.cls] = quota.get(c.cls, 0) - 1
 
             def fresh(c):
-                if quota.get(c.cls, 0) <= 0:
+                if p['colour_quota'] and quota.get(c.cls, 0) <= 0:
                     return False
                 e = c.estimate()
                 return all(v.cls != c.cls or float(np.hypot(*(v.estimate() - e))) > p['same_class_apart_m']
@@ -872,7 +886,7 @@ class LoopPatrolMission:
             if cands:
                 self.target = min(cands, key=lambda c: float(np.hypot(*(c.estimate() - (x, y)))))
                 e = self.target.estimate()
-                self.notes.append(f'{t:.1f} cone {self.index + 1}/{len(self.goals)}: {self.target.cls} cone at '
+                self.notes.append(f'{t:.1f} cone {self.index + 1}/{self.n_shows}: {self.target.cls} cone at '
                                   f'({e[0]:.1f},{e[1]:.1f})')
         elif self.target is None:
             if g.is_start_cone:

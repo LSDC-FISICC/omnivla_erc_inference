@@ -108,7 +108,7 @@ def walls_with_doors(rng, n=3):
 def run(layout='loop', world='chairs', seed=0, drift=(0.01, 0.01, 0.5), k_w=1.1, image_lag_s=0.8,
         localize=True, stop=False, stop_distance_m=0.7, max_linear=0.25, gt45=True, direction=1,
         mission_params=None, lp_params=None, rec_params=None, t_limit=2400.0, leg_limit_s=700.0,
-        goals=None, stuck=True, record=False, competition=False, see_m=3.0):
+        goals=None, stuck=True, record=False, competition=False, see_m=3.0, wl_params=None):
     """competition: the organisers' mechanics (29-sept) -- a cone scores when the rover shows it
     from <= see_m (in the camera's view), any order, no SDK; the mission in PATROL_COMPETITION mode."""
     """goals: override the mission (e.g. [Goal('X', 'never')] to patrol only)."""
@@ -141,7 +141,7 @@ def run(layout='loop', world='chairs', seed=0, drift=(0.01, 0.01, 0.5), k_w=1.1,
     safety.update({'safety.tilt_enabled': False, 'safety.obstacle_enabled': stop,
                    'safety.stop_distance_m': stop_distance_m, 'safety.max_linear_vel': max_linear})
     km = KnownMap.from_yaml(TRACK)
-    wl = WallLocalizer(km)
+    wl = WallLocalizer(km, **(wl_params or {}))
     goals = goals or [Goal(n, c, i + 1, is_start_cone=(n == 'Finish')) for i, (n, c, _) in enumerate(MISSION)]
     mp = dict(direction=direction)
     if competition:
@@ -168,7 +168,7 @@ def run(layout='loop', world='chairs', seed=0, drift=(0.01, 0.01, 0.5), k_w=1.1,
     trace = []
     t, dt = 0.0, 0.02
     loc.update(t, dt, rover)
-    while t < t_limit and not mission.done:
+    while t < t_limit and not mission.done and not (competition and len(scored) == len(cone_xy)):
         loc.update(t, dt, rover)
         rx, ry, rth = loc.estimate()
         ex, ey, eth = wl.apply(rx, ry, rth) if localize else (rx, ry, rth)
