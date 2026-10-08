@@ -108,3 +108,33 @@ Sin monitor en el DGX (acceso remoto):
 
 Los bags grabados antes de este cambio no tienen esos tópicos. Para ellos, `bags/bag_local_map.py`
 reconstruye el mapa y las replanificaciones a PNG.
+
+## Foxglove con pestañas: percepción, A\*, planificador local, replanificador, MPPI
+
+`erc_inference/foxglove/planning_tabs.json` (instalado en `share/erc_inference/foxglove/`). En
+Foxglove: **Layouts → Import from file**. Funciona en vivo (`foxglove_bridge`) y sobre bags.
+
+Para el robot solo con el puente y la percepción (sin controlador de misión, p. ej.
+`mission_indoor.launch.py`: solo existe `odom → base_link`) está `robot_live.json`: cámaras,
+`/erc/free_space` en `base_link`, GPS, comando contra velocidad medida y edades de telemetría.
+
+| pestaña | qué muestra | marco |
+|---|---|---|
+| Resumen | mapa local + rutas + carrot + trayectoria óptima de MPPI, cámara, GPS sobre OSM, log | `rover_leg` |
+| UniDepthV2 | cámara con suelo (verde) y banda de obstáculo (rojo), distancia del modelo, `/erc/free_space` polar | `base_link` |
+| A\* global | costmap OSM + ruta A\* (marco `map`), ruta del tramo (`leg_local`), GPS y meta sobre OSM | `map` / `rover_leg` |
+| Planificador local | `/erc/local_costmap` construido del perfil, `/erc/free_space_leg`, carrot, `/cmd_vel` | `rover_leg` |
+| Replanificador | ruta global (gris) contra la ruta con desvíos (rojo-naranja), log `[local-plan]` / `[recover]` | `rover_leg` |
+| MPPI | costmap de Nav2, trayectorias candidatas, óptima, plan transformado, huella, `/nav2/cmd_vel` vs `/cmd_vel` | `rover_pred` |
+
+Qué hace falta para que cada pestaña tenga datos:
+- **UniDepthV2:** las imágenes salen solo con `debug_images:=true` (apagado por defecto), p. ej.
+  `ros2 launch erc_inference mission_carrot_unidepth.launch.py debug_images:=true`. Son JPEG de
+  512 px (~40 kB) a la tasa del perfil (3 Hz); no en `obstacle_mode:=contact`.
+- **Planificador local / Replanificador:** `checkpoint_controller_node` con `-p local_replan:=true`.
+- **MPPI:** `mission_nav2*.launch.py` (Nav2 publica las trayectorias porque `visualize: true` en
+  `config/nav2_mppi.yaml`).
+- **A\* global:** `erc_static_map_node` + `erc_astar_planner_node` (todos los `mission*`).
+
+El planificador local y el replanificador son la misma clase (`local_planner.LocalReplanner`):
+la primera pestaña mira el mapa que construye, la segunda los cambios que hace a la ruta.

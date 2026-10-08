@@ -1,0 +1,928 @@
+{
+  "configById": {
+    "3D!resumen": {
+      "cameraState": {
+        "perspective": false,
+        "distance": 14,
+        "phi": 0,
+        "thetaOffset": 90,
+        "target": [
+          0,
+          0,
+          0
+        ],
+        "targetOffset": [
+          0,
+          0,
+          0
+        ],
+        "targetOrientation": [
+          0,
+          0,
+          0,
+          1
+        ],
+        "fovy": 45,
+        "near": 0.1,
+        "far": 5000
+      },
+      "followMode": "follow-position",
+      "followTf": "rover_leg",
+      "scene": {
+        "enableStats": false,
+        "transforms": {
+          "showLabel": true,
+          "axisScale": 0.5
+        }
+      },
+      "transforms": {},
+      "topics": {
+        "/erc/local_costmap": {
+          "visible": true,
+          "colorMode": "costmap",
+          "alpha": 0.7,
+          "frameLocked": false
+        },
+        "/erc/global_route": {
+          "visible": true,
+          "lineWidth": 0.12,
+          "gradient": [
+            "#8e8e93",
+            "#c7c7cc"
+          ]
+        },
+        "/erc/local_route": {
+          "visible": true,
+          "lineWidth": 0.08,
+          "gradient": [
+            "#ff9f0a",
+            "#ffd60a"
+          ]
+        },
+        "/erc/carrot": {
+          "visible": true
+        },
+        "/erc/free_space_leg": {
+          "visible": true,
+          "pointSize": 6,
+          "pointShape": "circle",
+          "colorMode": "flat",
+          "flatColor": "#ff3b30",
+          "decayTime": 0
+        },
+        "/optimal_trajectory": {
+          "visible": true,
+          "lineWidth": 0.05,
+          "gradient": [
+            "#30d158",
+            "#30d158"
+          ]
+        }
+      },
+      "publish": {
+        "type": "point"
+      },
+      "imageMode": {},
+      "layers": {
+        "grid": {
+          "layerId": "foxglove.Grid",
+          "visible": true,
+          "frameId": "rover_leg",
+          "size": 30,
+          "divisions": 30,
+          "lineWidth": 1,
+          "color": "#24ff8e30",
+          "position": [
+            0,
+            0,
+            0
+          ],
+          "rotation": [
+            0,
+            0,
+            0
+          ],
+          "order": 1
+        }
+      }
+    },
+    "Image!resumen_cam": {
+      "imageMode": {
+        "imageTopic": "/erc/front_camera"
+      },
+      "cameraState": {},
+      "followMode": "follow-pose",
+      "scene": {},
+      "transforms": {},
+      "topics": {},
+      "layers": {},
+      "publish": {}
+    },
+    "map!resumen_gps": {
+      "center": null,
+      "customTileUrl": "",
+      "disabledTopics": [],
+      "followTopic": "/erc/gps/filtered",
+      "layer": "map",
+      "topicColors": {
+        "/erc/gps/filtered": "#0a84ff",
+        "/goal_gps": "#ff9f0a"
+      },
+      "zoomLevel": 18,
+      "maxNativeZoom": 18
+    },
+    "RosOut!resumen_log": {
+      "searchTerms": [],
+      "minLogLevel": 1,
+      "nameFilter": {}
+    },
+    "Image!ud_overlay": {
+      "imageMode": {
+        "imageTopic": "/erc/perception/overlay/compressed"
+      },
+      "cameraState": {},
+      "followMode": "follow-pose",
+      "scene": {},
+      "transforms": {},
+      "topics": {},
+      "layers": {},
+      "publish": {}
+    },
+    "Image!ud_depth": {
+      "imageMode": {
+        "imageTopic": "/erc/perception/depth/compressed"
+      },
+      "cameraState": {},
+      "followMode": "follow-pose",
+      "scene": {},
+      "transforms": {},
+      "topics": {},
+      "layers": {},
+      "publish": {}
+    },
+    "3D!ud_scan": {
+      "cameraState": {
+        "perspective": false,
+        "distance": 7,
+        "phi": 0,
+        "thetaOffset": 90,
+        "target": [
+          0,
+          0,
+          0
+        ],
+        "targetOffset": [
+          0,
+          0,
+          0
+        ],
+        "targetOrientation": [
+          0,
+          0,
+          0,
+          1
+        ],
+        "fovy": 45,
+        "near": 0.1,
+        "far": 5000
+      },
+      "followMode": "follow-pose",
+      "followTf": "base_link",
+      "scene": {
+        "enableStats": false,
+        "transforms": {
+          "showLabel": true,
+          "axisScale": 0.5
+        }
+      },
+      "transforms": {},
+      "topics": {
+        "/erc/free_space": {
+          "visible": true,
+          "pointSize": 8,
+          "pointShape": "circle",
+          "colorMode": "flat",
+          "flatColor": "#ff3b30",
+          "decayTime": 0
+        }
+      },
+      "publish": {
+        "type": "point"
+      },
+      "imageMode": {},
+      "layers": {
+        "grid": {
+          "layerId": "foxglove.Grid",
+          "visible": true,
+          "frameId": "base_link",
+          "size": 30,
+          "divisions": 30,
+          "lineWidth": 1,
+          "color": "#24ff8e30",
+          "position": [
+            0,
+            0,
+            0
+          ],
+          "rotation": [
+            0,
+            0,
+            0
+          ],
+          "order": 1
+        }
+      }
+    },
+    "Image!ud_cam": {
+      "imageMode": {
+        "imageTopic": "/erc/front_camera"
+      },
+      "cameraState": {},
+      "followMode": "follow-pose",
+      "scene": {},
+      "transforms": {},
+      "topics": {},
+      "layers": {},
+      "publish": {}
+    },
+    "RawMessages!ud_dbg": {
+      "topicPath": "/erc/free_space_debug",
+      "diffEnabled": false,
+      "diffMethod": "custom",
+      "diffTopicPath": "",
+      "showFullMessageForDiff": false,
+      "expansion": "all"
+    },
+    "3D!astar_osm": {
+      "cameraState": {
+        "perspective": false,
+        "distance": 120,
+        "phi": 0,
+        "thetaOffset": 90,
+        "target": [
+          0,
+          0,
+          0
+        ],
+        "targetOffset": [
+          0,
+          0,
+          0
+        ],
+        "targetOrientation": [
+          0,
+          0,
+          0,
+          1
+        ],
+        "fovy": 45,
+        "near": 0.1,
+        "far": 5000
+      },
+      "followMode": "follow-none",
+      "followTf": "map",
+      "scene": {
+        "enableStats": false,
+        "transforms": {
+          "showLabel": true,
+          "axisScale": 0.5
+        }
+      },
+      "transforms": {},
+      "topics": {
+        "/erc_static_map/costmap": {
+          "visible": true,
+          "colorMode": "costmap",
+          "alpha": 0.85,
+          "frameLocked": false
+        },
+        "/erc_static_map/planned_path": {
+          "visible": true,
+          "lineWidth": 0.6,
+          "gradient": [
+            "#bf5af2",
+            "#bf5af2"
+          ]
+        }
+      },
+      "publish": {
+        "type": "point"
+      },
+      "imageMode": {},
+      "layers": {
+        "grid": {
+          "layerId": "foxglove.Grid",
+          "visible": true,
+          "frameId": "map",
+          "size": 30,
+          "divisions": 30,
+          "lineWidth": 1,
+          "color": "#24ff8e30",
+          "position": [
+            0,
+            0,
+            0
+          ],
+          "rotation": [
+            0,
+            0,
+            0
+          ],
+          "order": 1
+        }
+      }
+    },
+    "3D!astar_leg": {
+      "cameraState": {
+        "perspective": false,
+        "distance": 30,
+        "phi": 0,
+        "thetaOffset": 90,
+        "target": [
+          0,
+          0,
+          0
+        ],
+        "targetOffset": [
+          0,
+          0,
+          0
+        ],
+        "targetOrientation": [
+          0,
+          0,
+          0,
+          1
+        ],
+        "fovy": 45,
+        "near": 0.1,
+        "far": 5000
+      },
+      "followMode": "follow-position",
+      "followTf": "rover_leg",
+      "scene": {
+        "enableStats": false,
+        "transforms": {
+          "showLabel": true,
+          "axisScale": 0.5
+        }
+      },
+      "transforms": {},
+      "topics": {
+        "/erc/global_route": {
+          "visible": true,
+          "lineWidth": 0.12,
+          "gradient": [
+            "#8e8e93",
+            "#c7c7cc"
+          ]
+        },
+        "/erc/carrot": {
+          "visible": true
+        }
+      },
+      "publish": {
+        "type": "point"
+      },
+      "imageMode": {},
+      "layers": {
+        "grid": {
+          "layerId": "foxglove.Grid",
+          "visible": true,
+          "frameId": "rover_leg",
+          "size": 30,
+          "divisions": 30,
+          "lineWidth": 1,
+          "color": "#24ff8e30",
+          "position": [
+            0,
+            0,
+            0
+          ],
+          "rotation": [
+            0,
+            0,
+            0
+          ],
+          "order": 1
+        }
+      }
+    },
+    "map!astar_gps": {
+      "center": null,
+      "customTileUrl": "",
+      "disabledTopics": [],
+      "followTopic": "/erc/gps/filtered",
+      "layer": "map",
+      "topicColors": {
+        "/erc/gps/filtered": "#0a84ff",
+        "/goal_gps": "#ff9f0a"
+      },
+      "zoomLevel": 18,
+      "maxNativeZoom": 18
+    },
+    "RosOut!astar_log": {
+      "searchTerms": [
+        "route",
+        "costmap",
+        "Navigating to checkpoint"
+      ],
+      "minLogLevel": 1,
+      "nameFilter": {}
+    },
+    "3D!local_map": {
+      "cameraState": {
+        "perspective": false,
+        "distance": 10,
+        "phi": 0,
+        "thetaOffset": 90,
+        "target": [
+          0,
+          0,
+          0
+        ],
+        "targetOffset": [
+          0,
+          0,
+          0
+        ],
+        "targetOrientation": [
+          0,
+          0,
+          0,
+          1
+        ],
+        "fovy": 45,
+        "near": 0.1,
+        "far": 5000
+      },
+      "followMode": "follow-position",
+      "followTf": "rover_leg",
+      "scene": {
+        "enableStats": false,
+        "transforms": {
+          "showLabel": true,
+          "axisScale": 0.5
+        }
+      },
+      "transforms": {},
+      "topics": {
+        "/erc/local_costmap": {
+          "visible": true,
+          "colorMode": "costmap",
+          "alpha": 0.8,
+          "frameLocked": false
+        },
+        "/erc/free_space_leg": {
+          "visible": true,
+          "pointSize": 6,
+          "pointShape": "circle",
+          "colorMode": "flat",
+          "flatColor": "#ff3b30",
+          "decayTime": 0
+        },
+        "/erc/local_route": {
+          "visible": true,
+          "lineWidth": 0.08,
+          "gradient": [
+            "#ff9f0a",
+            "#ffd60a"
+          ]
+        },
+        "/erc/carrot": {
+          "visible": true
+        }
+      },
+      "publish": {
+        "type": "point"
+      },
+      "imageMode": {},
+      "layers": {
+        "grid": {
+          "layerId": "foxglove.Grid",
+          "visible": true,
+          "frameId": "rover_leg",
+          "size": 30,
+          "divisions": 30,
+          "lineWidth": 1,
+          "color": "#24ff8e30",
+          "position": [
+            0,
+            0,
+            0
+          ],
+          "rotation": [
+            0,
+            0,
+            0
+          ],
+          "order": 1
+        }
+      }
+    },
+    "Image!local_overlay": {
+      "imageMode": {
+        "imageTopic": "/erc/perception/overlay/compressed"
+      },
+      "cameraState": {},
+      "followMode": "follow-pose",
+      "scene": {},
+      "transforms": {},
+      "topics": {},
+      "layers": {},
+      "publish": {}
+    },
+    "RawMessages!local_dbg": {
+      "topicPath": "/omnivla_debug",
+      "diffEnabled": false,
+      "diffMethod": "custom",
+      "diffTopicPath": "",
+      "showFullMessageForDiff": false,
+      "expansion": "all"
+    },
+    "Plot!local_cmd": {
+      "paths": [
+        {
+          "value": "/cmd_vel.linear.x",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "v"
+        },
+        {
+          "value": "/cmd_vel.angular.z",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "w"
+        }
+      ],
+      "showLegend": true,
+      "legendDisplay": "floating",
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "isSynced": true,
+      "xAxisVal": "timestamp",
+      "followingViewWidth": 30
+    },
+    "3D!replan": {
+      "cameraState": {
+        "perspective": false,
+        "distance": 16,
+        "phi": 0,
+        "thetaOffset": 90,
+        "target": [
+          0,
+          0,
+          0
+        ],
+        "targetOffset": [
+          0,
+          0,
+          0
+        ],
+        "targetOrientation": [
+          0,
+          0,
+          0,
+          1
+        ],
+        "fovy": 45,
+        "near": 0.1,
+        "far": 5000
+      },
+      "followMode": "follow-position",
+      "followTf": "rover_leg",
+      "scene": {
+        "enableStats": false,
+        "transforms": {
+          "showLabel": true,
+          "axisScale": 0.5
+        }
+      },
+      "transforms": {},
+      "topics": {
+        "/erc/local_costmap": {
+          "visible": true,
+          "colorMode": "costmap",
+          "alpha": 0.5,
+          "frameLocked": false
+        },
+        "/erc/global_route": {
+          "visible": true,
+          "lineWidth": 0.12,
+          "gradient": [
+            "#8e8e93",
+            "#c7c7cc"
+          ]
+        },
+        "/erc/local_route": {
+          "visible": true,
+          "lineWidth": 0.1,
+          "gradient": [
+            "#ff375f",
+            "#ff9f0a"
+          ]
+        },
+        "/erc/carrot": {
+          "visible": true
+        }
+      },
+      "publish": {
+        "type": "point"
+      },
+      "imageMode": {},
+      "layers": {
+        "grid": {
+          "layerId": "foxglove.Grid",
+          "visible": true,
+          "frameId": "rover_leg",
+          "size": 30,
+          "divisions": 30,
+          "lineWidth": 1,
+          "color": "#24ff8e30",
+          "position": [
+            0,
+            0,
+            0
+          ],
+          "rotation": [
+            0,
+            0,
+            0
+          ],
+          "order": 1
+        }
+      }
+    },
+    "RosOut!replan_log": {
+      "searchTerms": [
+        "[local-plan]",
+        "[recover]",
+        "local map"
+      ],
+      "minLogLevel": 1,
+      "nameFilter": {}
+    },
+    "3D!mppi": {
+      "cameraState": {
+        "perspective": false,
+        "distance": 10,
+        "phi": 0,
+        "thetaOffset": 90,
+        "target": [
+          0,
+          0,
+          0
+        ],
+        "targetOffset": [
+          0,
+          0,
+          0
+        ],
+        "targetOrientation": [
+          0,
+          0,
+          0,
+          1
+        ],
+        "fovy": 45,
+        "near": 0.1,
+        "far": 5000
+      },
+      "followMode": "follow-position",
+      "followTf": "rover_pred",
+      "scene": {
+        "enableStats": false,
+        "transforms": {
+          "showLabel": true,
+          "axisScale": 0.5
+        }
+      },
+      "transforms": {},
+      "topics": {
+        "/local_costmap/costmap": {
+          "visible": true,
+          "colorMode": "costmap",
+          "alpha": 0.7,
+          "frameLocked": false
+        },
+        "/trajectories": {
+          "visible": true
+        },
+        "/optimal_trajectory": {
+          "visible": true,
+          "lineWidth": 0.06,
+          "gradient": [
+            "#30d158",
+            "#30d158"
+          ]
+        },
+        "/transformed_global_plan": {
+          "visible": true,
+          "lineWidth": 0.05,
+          "gradient": [
+            "#0a84ff",
+            "#64d2ff"
+          ]
+        },
+        "/local_costmap/published_footprint": {
+          "visible": true
+        },
+        "/erc/global_route": {
+          "visible": true,
+          "lineWidth": 0.12,
+          "gradient": [
+            "#8e8e93",
+            "#c7c7cc"
+          ]
+        }
+      },
+      "publish": {
+        "type": "point"
+      },
+      "imageMode": {},
+      "layers": {
+        "grid": {
+          "layerId": "foxglove.Grid",
+          "visible": true,
+          "frameId": "rover_pred",
+          "size": 30,
+          "divisions": 30,
+          "lineWidth": 1,
+          "color": "#24ff8e30",
+          "position": [
+            0,
+            0,
+            0
+          ],
+          "rotation": [
+            0,
+            0,
+            0
+          ],
+          "order": 1
+        }
+      }
+    },
+    "Plot!mppi_cmd": {
+      "paths": [
+        {
+          "value": "/nav2/cmd_vel.linear.x",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "MPPI v"
+        },
+        {
+          "value": "/nav2/cmd_vel.angular.z",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "MPPI w"
+        },
+        {
+          "value": "/cmd_vel.linear.x",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "enviado v"
+        },
+        {
+          "value": "/cmd_vel.angular.z",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "enviado w"
+        }
+      ],
+      "showLegend": true,
+      "legendDisplay": "floating",
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "isSynced": true,
+      "xAxisVal": "timestamp",
+      "followingViewWidth": 30
+    },
+    "RawMessages!mppi_dbg": {
+      "topicPath": "/omnivla_debug",
+      "diffEnabled": false,
+      "diffMethod": "custom",
+      "diffTopicPath": "",
+      "showFullMessageForDiff": false,
+      "expansion": "all"
+    },
+    "Tab!main": {
+      "activeTabIdx": 0,
+      "tabs": [
+        {
+          "title": "Resumen",
+          "layout": {
+            "first": "3D!resumen",
+            "second": {
+              "first": "Image!resumen_cam",
+              "second": {
+                "first": "map!resumen_gps",
+                "second": "RosOut!resumen_log",
+                "direction": "row",
+                "splitPercentage": 50
+              },
+              "direction": "column",
+              "splitPercentage": 50
+            },
+            "direction": "row",
+            "splitPercentage": 55
+          }
+        },
+        {
+          "title": "UniDepthV2",
+          "layout": {
+            "first": {
+              "first": "Image!ud_overlay",
+              "second": "Image!ud_depth",
+              "direction": "column",
+              "splitPercentage": 50
+            },
+            "second": {
+              "first": "3D!ud_scan",
+              "second": {
+                "first": "Image!ud_cam",
+                "second": "RawMessages!ud_dbg",
+                "direction": "column",
+                "splitPercentage": 70
+              },
+              "direction": "column",
+              "splitPercentage": 55
+            },
+            "direction": "row",
+            "splitPercentage": 60
+          }
+        },
+        {
+          "title": "A* global",
+          "layout": {
+            "first": {
+              "first": "3D!astar_osm",
+              "second": "3D!astar_leg",
+              "direction": "row",
+              "splitPercentage": 50
+            },
+            "second": {
+              "first": "map!astar_gps",
+              "second": "RosOut!astar_log",
+              "direction": "row",
+              "splitPercentage": 50
+            },
+            "direction": "column",
+            "splitPercentage": 65
+          }
+        },
+        {
+          "title": "Planificador local",
+          "layout": {
+            "first": "3D!local_map",
+            "second": {
+              "first": "Image!local_overlay",
+              "second": {
+                "first": "RawMessages!local_dbg",
+                "second": "Plot!local_cmd",
+                "direction": "column",
+                "splitPercentage": 50
+              },
+              "direction": "column",
+              "splitPercentage": 50
+            },
+            "direction": "row",
+            "splitPercentage": 60
+          }
+        },
+        {
+          "title": "Replanificador",
+          "layout": {
+            "first": "3D!replan",
+            "second": "RosOut!replan_log",
+            "direction": "row",
+            "splitPercentage": 62
+          }
+        },
+        {
+          "title": "MPPI",
+          "layout": {
+            "first": "3D!mppi",
+            "second": {
+              "first": "Plot!mppi_cmd",
+              "second": "RawMessages!mppi_dbg",
+              "direction": "column",
+              "splitPercentage": 60
+            },
+            "direction": "row",
+            "splitPercentage": 62
+          }
+        }
+      ]
+    }
+  },
+  "globalVariables": {},
+  "userNodes": {},
+  "playbackConfig": {
+    "speed": 1
+  },
+  "drawerConfig": {
+    "tracks": []
+  },
+  "layout": "Tab!main"
+}
