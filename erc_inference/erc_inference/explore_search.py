@@ -5,14 +5,14 @@ For "drive around indoors and find the potted plants" (object_detector_node, YOL
 loop_patrol.LoopPatrolMission patrols corridors it was given, this one has only what the rover
 sees: the same log-odds grid local_planner.LocalCostmap builds from /erc/free_space, kept for
 the whole mission in the mission frame (origin at the start pose), and the objects' positions
-as markers on it (loop_patrol.ConeMap: detections clustered by class). No ROS:
+as markers on it (object_tracker.ObjectTracker: one track per object). No ROS:
 image_checkpoint_controller_node (param explore) and test/explore_search_sim.py run this code,
 through the same interface as LoopPatrolMission.
 
   EXPLORE  go to a frontier: free, seen ground next to ground the camera has not looked at,
            the rover can get to, chosen ahead of it when there is one near, by A* on the map. Reached, or no longer a frontier -> the next. None left near the
            rover -> look around once; none anywhere -> the area is explored.
-  GOTO     an object is on the map (min_confirm detections): A* to a standoff point short of
+  GOTO     an object is on the map (a confirmed track): A* to a standoff point short of
            it, the nearest unvisited first; the route is rebuilt as the estimate moves.
   SHOW     within arrive_m: face it, hold still show_s. ARRIVED -> the caller calls confirm().
   SCAN     turns in place: at the start, and when there is no frontier in reach.
@@ -21,9 +21,10 @@ through the same interface as LoopPatrolMission.
 
 What it does not have, and what follows from that:
   * No drift correction. The map and the pose drift together, so what is near the rover is
-    consistent with what it sees, but a place mapped minutes ago is displaced when the rover
-    comes back to it (walls drawn twice, an object mapped twice: same_class_apart_m covers
-    the second). Nothing here closes loops.
+    consistent with what it sees, but a place mapped long ago is displaced when the rover
+    comes back to it. So the map forgets: a cell is dropped map_forget_m (25 m) of driving
+    after it was last seen, and so are the objects not shown yet. Nothing here closes loops;
+    an object shown before the rover drove a long loop can be shown again.
   * The profile reaches 3 m in +-60 deg and only +-map_fov_deg enters the map: rooms wider
     than ~5 m are explored along their walls, slowly.
   * Phantom obstacles of the depth model become walls here; hit evidence decays only when a
@@ -37,7 +38,8 @@ from scipy import ndimage
 
 from erc_inference import local_planner as lp
 from erc_inference.image_goal_mission import Goal, _cumlen, _wrap, point_at, project_forward
-from erc_inference.loop_patrol import ARRIVED, DONE, GOTO, SCAN, SHOW, ConeCluster, ConeMap, Step
+from erc_inference.loop_patrol import ARRIVED, DONE, GOTO, SCAN, SHOW, Step
+from erc_inference.object_tracker import ObjectTracker, Track
 from erc_inference.loop_patrol import DEFAULTS as PATROL_DEFAULTS
 
 EXPLORE = 'explore'
@@ -58,11 +60,11 @@ DEFAULTS = dict(
     unreachable_s=60.0,         # an object with no path to any of them is left alone this long
     stop_when_explored=True,    # no frontier anywhere and no object pending: the mission ends
     route_clear_m=4.0,          # route length ahead checked against the map
-    object_gate_m=1.5,          # detections this close to the object being approached join it (it follows
-                                # the live view). loop_patrol's target_gate_m is 4 m, for cones of different
-                                # colours far apart; here every object is of one class, and at 4 m the plant
-                                # beside the target was taken for it and dragged its marker (ROS e2e, 9-oct:
-                                # one plant shown twice)
+    map_forget_m=25.0,          # the map holds what was seen in the last this-many metres DRIVEN (0: all of
+                                # it). The pose is wheels + gyro, nothing absolute: it drifts, and what was
+                                # mapped long ago comes back displaced, a second wall beside the first.
+                                # Rather than blanking the map every 25 m -- which would also blank what is
+                                # right ahead -- each cell is dropped 25 m of driving after it was last seen.
     stuck_turning_deg=40.0,     # with the carrot this far off the heading the rover is turning in place
                                 # (the carrot controller does from 45 deg), and not moving is expected: a
                                 # frontier behind it takes > 12 s to face at that turn rate with the command
@@ -84,7 +86,10 @@ class ExploreSearchMission:
         lp_kw['margin_m'] = 0.0
         self.replanner = lp.LocalReplanner(np.array([self.start - h, self.start + h]), **lp_kw)
         self.map = self.replanner.map
-        self.cones = ConeMap(self.p)        # the objects; the name is loop_patrol's
+        self.cones = ObjectTracker()        # the objects, one track each; the attribute name is loop_patrol's
+        self.odometer = 0.0                 # metres driven, for forgetting
+        self._odo_xy = None
+        self._forgot_at = 0.0
         self.index = 0
         self._arrive0 = self.p['arrive_m']
         self.notes: List[str] = []
@@ -94,7 +99,7 @@ class ExploreSearchMission:
         self._route_kind = None
         self._route_t = -math.inf
         self._route_to = None
-        self.target: Optional[ConeCluster] = None
+        self.target: Optional[Track] = None
         self.frontier = None
         self._frontier_t = 0.0
         self._tried = []                 # (t, x, y) frontiers reached or given up
@@ -143,20 +148,25 @@ class ExploreSearchMission:
             return 0.0
         return abs(math.degrees(_wrap(h[-1][1] - h[0][1]))) / (h[-1][0] - h[0][0])
 
-    def observe_cone(self, x, y, yaw, cls, bearing_deg, range_m, t=None):
-        if range_m > self.p['max_detection_m']:
-            return None
+    def observe_objects(self, x, y, yaw, detections, t=None):
+        """One camera frame's detections, [(class, bearing_deg, range_m), ...], seen from (x, y, yaw):
+        all at once, so that two objects in one frame are never taken for one (object_tracker)."""
         if t is not None:
             self._yaws = [(tt, a) for tt, a in self._yaws if t - tt <= 1.0] + [(t, yaw)]
         if self.turn_rate_dps() > self.p['cone_max_turn_dps']:
-            return None
-        a = yaw + math.radians(bearing_deg)
-        return self.cones.add(cls, (x + range_m * math.cos(a), y + range_m * math.sin(a)), t,
-                              prefer=self.target, prefer_gate=self.p['object_gate_m'])
+            return []
+        dets = [d for d in detections if d[2] <= self.p['max_detection_m']]
+        return self.cones.observe(x, y, yaw, dets, 0.0 if t is None else t, self.odometer)
+
+    def observe_cone(self, x, y, yaw, cls, bearing_deg, range_m, t=None):
+        """One detection alone (loop_patrol's interface); a frame with several goes to observe_objects."""
+        got = self.observe_objects(x, y, yaw, [(cls, bearing_deg, range_m)], t)
+        return got[0] if got else None
 
     def observe_scan(self, t, x, y, yaw, bearings_deg, ranges, hit):
         b, r, h = np.asarray(bearings_deg, float), np.asarray(ranges, float), np.asarray(hit, bool)
         self._last_profile = (b, r, h)
+        self.map.odometer = self.odometer
         self.replanner.observe(t, x, y, yaw, b, r, h)
 
     def confirm(self, t, accepted: bool):
@@ -191,6 +201,7 @@ class ExploreSearchMission:
             ok = m._inside(rows, cols)
             m.L[rows[ok], cols[ok]] = m.p['max_logodds']
             m.seen[rows[ok], cols[ok]] = True
+            m.travel[rows[ok], cols[ok]] = self.odometer
             m._dist = None
         if self.frontier is not None:
             self._tried.append((t, *self.frontier))
@@ -203,16 +214,16 @@ class ExploreSearchMission:
     def export_state(self):
         return {'index': self.index,
                 'cones': [{'cls': c.cls, 'name': c.name, 'visited': c.visited,
-                           'points': [list(map(float, pt)) for pt in c.points[-self.p['fuse_n']:]]}
-                          for c in self.cones.clusters if c.points]}
+                           'points': [[float(v) for v in c.estimate()]]}
+                          for c in self.cones.clusters if c.confirmed]}
 
     def import_state(self, state, first_goal_index=None):
         """The objects and the count survive a restart of the node; the map is built again."""
         self.index = min(int(state.get('index', 0)), self.n_shows)
-        self.cones.clusters = [
-            ConeCluster(c['cls'], [np.asarray(q, float) for q in c['points']], name=c.get('name', ''),
-                        visited=bool(c.get('visited', False)), times=[-math.inf] * len(c['points']))
-            for c in state.get('cones', [])]
+        self.cones = ObjectTracker()
+        for c in state.get('cones', []):
+            self.cones.add_known(c['cls'], np.median(np.array(c['points'], float), axis=0), c.get('name', ''),
+                                 bool(c.get('visited', False)))
         self.target = None
         self.state = EXPLORE if not self.done else DONE
         self._route_kind = None
@@ -222,8 +233,31 @@ class ExploreSearchMission:
 
     def objects(self):
         """[(class, x, y, visited, detections)] of every confirmed object on the map."""
-        return [(c.cls, float(c.estimate()[0]), float(c.estimate()[1]), bool(c.visited and c.name != 'rejected'),
-                 len(c.points)) for c in self.cones.clusters if len(c.points) >= self.p['min_confirm']]
+        return [(f'{c.cls} #{c.id}', float(c.estimate()[0]), float(c.estimate()[1]),
+                 bool(c.visited and c.name != 'rejected'), len(c.points)) for c in self.cones.clusters if c.confirmed]
+
+    def _travel(self, x, y):
+        """Metres driven; every metre, forget what was last seen map_forget_m ago and keep the grid
+        around the rover."""
+        if self._odo_xy is not None:
+            d = math.hypot(x - self._odo_xy[0], y - self._odo_xy[1])
+            if d < 1.0:                      # a jump is a new anchor, not driving
+                self.odometer += d
+        self._odo_xy = (x, y)
+        if self.odometer - self._forgot_at < 1.0:
+            return
+        self._forgot_at = self.odometer
+        m = self.map
+        half = 0.5 * m.w * m.p['resolution_m']
+        if max(abs(x - (m.ox + half)), abs(y - (m.oy + half))) > 0.5 * half:
+            m.recenter(x, y)
+        forget = float(self.p['map_forget_m'])
+        if forget > 0.0:
+            m.forget(self.odometer - forget)
+            keep = self.target
+            self.cones.forget(self.odometer - forget)
+            if keep is not None and keep not in self.cones.clusters:
+                self.cones.clusters.append(keep)     # the one it is going to stays
 
     # -- routes ----------------------------------------------------------------
 
@@ -393,6 +427,10 @@ class ExploreSearchMission:
         if self.done:
             return Step(None, (0.0, 0.0), False, DONE, 'explored' if self.explored else 'mission complete')
         self._yaws = [(tt, a) for tt, a in self._yaws if t - tt <= 1.0] + [(t, yaw)]
+        self._travel(x, y)
+        if self.target is not None and self.target not in self.cones.clusters:
+            self.target = None               # merged into another track, or forgotten
+            self._route_kind = None
         if self.target is None:
             shown = [c for c in self.cones.clusters if c.visited and c.name.startswith('cone')]
 
@@ -400,8 +438,8 @@ class ExploreSearchMission:
                 e = c.estimate()
                 return all(v.cls != c.cls or float(np.hypot(*(v.estimate() - e))) > p['same_class_apart_m']
                            for v in shown)
-            cands = [c for c in self.cones.clusters if not c.visited and len(c.points) >= p['min_confirm']
-                     and fresh(c) and t >= self._skip.get(id(c), -math.inf)]
+            cands = [c for c in self.cones.clusters if not c.visited and c.confirmed
+                     and fresh(c) and t >= self._skip.get(c.id, -math.inf)]
             if cands:
                 self.target = min(cands, key=lambda c: float(np.hypot(*(c.estimate() - (x, y)))))
                 e = self.target.estimate()
@@ -440,7 +478,7 @@ class ExploreSearchMission:
             if self._route_kind != GOTO or np.hypot(*(est - self._route_to)) > p['reroute_moved_m'] \
                     or t - self._route_t > p['reroute_every_s'] or self._route_blocked(t):
                 if not self._route_to_object(t, x, y, est):
-                    self._skip[id(self.target)] = t + p['unreachable_s']
+                    self._skip[self.target.id] = t + p['unreachable_s']
                     self.notes.append(f'{t:.1f} no path to the {self.target.cls} at ({est[0]:.1f},{est[1]:.1f}); '
                                       f'exploring on')
                     self.target = None

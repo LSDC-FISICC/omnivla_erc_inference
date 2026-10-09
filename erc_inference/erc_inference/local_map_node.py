@@ -5,7 +5,7 @@ The exploring mission (explore_search, in image_checkpoint_controller_node) buil
 from /erc/free_space and puts the objects of /erc/objects on it -- but only once the mission
 has been started, and then the rover moves. This node builds the same map, with the same
 class and the same indoor parameters (local_planner.LocalCostmap, loop_patrol.LOCAL_INDOOR,
-loop_patrol.ConeMap), from the same two topics and /erc/odometry/local, and never commands
+object_tracker.ObjectTracker), from the same two topics and /erc/odometry/local, and never commands
 anything: push the rover by hand or drive it from the SDK panel and watch what it would see.
 
     /erc/local_map          nav_msgs/OccupancyGrid, odometry frame, the seen part only
@@ -36,7 +36,8 @@ from visualization_msgs.msg import MarkerArray
 
 from erc_inference import local_planner as lp
 from erc_inference.loop_patrol import DEFAULTS as PATROL_DEFAULTS
-from erc_inference.loop_patrol import LOCAL_INDOOR, ConeMap
+from erc_inference.loop_patrol import LOCAL_INDOOR
+from erc_inference.object_tracker import ObjectTracker
 from erc_inference.map_viz import grid_message, object_markers
 
 
@@ -53,7 +54,9 @@ class LocalMapNode(Node):
         self.declare_parameter('object_classes', ['potted plant'])
         self.declare_parameter('map_topic', '/erc/local_map')
         self.declare_parameter('mission_objects_topic', '/erc/explore/objects')
-        self.declare_parameter('map_half_m', 30.0)           # a square this far each way from the first pose
+        self.declare_parameter('map_half_m', 30.0)           # the grid: a square this far each way, kept around the rover
+        self.declare_parameter('map_forget_m', 25.0)         # a cell is dropped this many metres DRIVEN after it was
+                                                             # last seen (0: never): the pose drifts, old map lies
         self.declare_parameter('publish_rate_hz', 1.0)
         for name, default in LOCAL_INDOOR.items():
             self.declare_parameter(f'local.{name}', default)
@@ -85,8 +88,9 @@ class LocalMapNode(Node):
         kw = {n: self.get_parameter(f'local.{n}').value for n in LOCAL_INDOOR}
         kw['margin_m'] = 0.0
         self._replanner = lp.LocalReplanner(np.array([[x - h, y - h], [x + h, y + h]]), **kw)
-        self._objects = ConeMap(dict(PATROL_DEFAULTS))
+        self._objects = ObjectTracker()
         self._trail = []
+        self._odometer, self._odo_xy, self._forgot_at = 0.0, (x, y), 0.0
         self._frame = None
 
     def _on_reset(self, _req, res):
@@ -105,7 +109,28 @@ class LocalMapNode(Node):
         while self._hist and t - self._hist[0][0] > 5.0:
             self._hist.popleft()
         if not self._trail or math.hypot(x - self._trail[-1][0], y - self._trail[-1][1]) > 0.1:
-            self._trail.append((x, y, yaw))
+            self._trail.append((x, y, yaw, self._odometer))
+        self._travel(x, y)
+
+    def _travel(self, x, y):
+        """Metres driven; every metre: the grid stays around the rover and what was last seen
+        map_forget_m of driving ago is dropped (map, objects and path alike)."""
+        d = math.hypot(x - self._odo_xy[0], y - self._odo_xy[1])
+        if d < 1.0:
+            self._odometer += d
+        self._odo_xy = (x, y)
+        if self._odometer - self._forgot_at < 1.0:
+            return
+        self._forgot_at = self._odometer
+        m = self._replanner.map
+        half = 0.5 * m.w * m.p['resolution_m']
+        if max(abs(x - (m.ox + half)), abs(y - (m.oy + half))) > 0.5 * half:
+            m.recenter(x, y)
+        forget = float(self.get_parameter('map_forget_m').value)
+        if forget > 0.0:
+            m.forget(self._odometer - forget)
+            self._objects.forget(self._odometer - forget)
+            self._trail = [p for p in self._trail if p[3] >= self._odometer - forget]
 
     def _pose_at(self, stamp):
         """The pose at a perception stamp (nearest odometry sample within 0.5 s), else the latest."""
@@ -132,6 +157,7 @@ class LocalMapNode(Node):
         hit = np.isfinite(r) & (r < msg.range_max - 0.05)
         r = np.where(np.isfinite(r), r, msg.range_max)
         # the planner's own gate: scans are skipped while the heading turns faster than it can trust
+        self._replanner.map.odometer = self._odometer
         self._replanner.observe(pose[0], pose[1], pose[2], pose[3], b, r, hit)
 
     def _on_objects(self, msg: String):
@@ -145,14 +171,10 @@ class LocalMapNode(Node):
         if self._turn_rate_dps() > PATROL_DEFAULTS['cone_max_turn_dps']:
             return                        # the image is older than the heading: a turning rover misplaces it
         wanted = set(self.get_parameter('object_classes').value)
-        for d in doc.get('detections', []):
-            if d.get('label') not in wanted or d.get('range_m') is None:
-                continue
-            rng = float(d['range_m'])
-            if rng > PATROL_DEFAULTS['max_detection_m']:
-                continue
-            a = pose[3] + math.radians(float(d['bearing_deg']))
-            self._objects.add(d['label'], (pose[1] + rng * math.cos(a), pose[2] + rng * math.sin(a)), self._now())
+        frame = [(d['label'], float(d['bearing_deg']), float(d['range_m'])) for d in doc.get('detections', [])
+                 if d.get('label') in wanted and d.get('range_m') is not None
+                 and float(d['range_m']) <= PATROL_DEFAULTS['max_detection_m']]
+        self._objects.observe(pose[1], pose[2], pose[3], frame, self._now(), self._odometer)   # the frame at once
 
     def _on_mission_markers(self, _msg):
         self._mission_markers_t = self._now()
@@ -166,14 +188,14 @@ class LocalMapNode(Node):
             self._map_pub.publish(grid)
         mission = self._now() - self._mission_markers_t < 3.0
         objs = [] if mission else [
-            (c.cls, float(c.estimate()[0]), float(c.estimate()[1]), False, len(c.points))
-            for c in self._objects.clusters if len(c.points) >= PATROL_DEFAULTS['min_confirm']]
+            (f'{c.cls} #{c.id}', float(c.estimate()[0]), float(c.estimate()[1]), False, len(c.points))
+            for c in self._objects.clusters if c.confirmed]
         if not mission or not self._held_back:
             self._obj_pub.publish(object_markers(objs, stamp, self._frame))     # empty once, then silent
         self._held_back = mission
         path = Path()
         path.header.stamp, path.header.frame_id = stamp, self._frame
-        for x, y, yaw in self._trail[-2000:]:
+        for x, y, yaw, _odo in self._trail[-2000:]:
             ps = PoseStamped()
             ps.header = path.header
             ps.pose.position.x, ps.pose.position.y = float(x), float(y)

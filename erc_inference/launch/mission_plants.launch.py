@@ -36,6 +36,7 @@ from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
@@ -56,6 +57,7 @@ def generate_launch_description():
         output='log', condition=IfCondition(LaunchConfiguration('foxglove')))
     # The map the rover would build, to look at before anything drives: view only, it commands nothing.
     local_map = Node(package='erc_inference', executable='local_map_node', name='local_map_node', output='screen',
+                     parameters=[{'map_forget_m': ParameterValue(LaunchConfiguration('map_forget_m'), value_type=float)}],
                      condition=IfCondition(LaunchConfiguration('local_map')))
     reminder = LogInfo(msg=(
         'mission_plants up. Then, in another terminal:  ros2 launch erc_inference plants_controller.launch.py'
@@ -70,6 +72,8 @@ def generate_launch_description():
                               description='minimum confidence of a YOLO26 detection (raise it if it sees plants that are not)'),
         DeclareLaunchArgument('local_map', default_value='true',
                               description='also run local_map_node: /erc/local_map, the map with nobody driving'),
+        DeclareLaunchArgument('map_forget_m', default_value='25.0',
+                              description='local_map_node: keep what was seen in the last this-many metres driven (0: all)'),
         DeclareLaunchArgument('foxglove', default_value='false',
                               description='also start foxglove_bridge (127.0.0.1 only)'),
         DeclareLaunchArgument('foxglove_port', default_value='8766'),

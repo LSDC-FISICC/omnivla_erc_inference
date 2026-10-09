@@ -16,6 +16,7 @@ Arguments:
   show_s       how long it holds still in front of each plant (default 5)
   arrive_m     how close it gets before showing it (default 1.8)
   stop_when_explored  true (default): also end when nothing is left to explore
+  forget_m     the map keeps what was seen in the last this-many metres driven (default 25; 0: all)
 More of the node's parameters: `ros2 run erc_inference image_checkpoint_controller_node
 --ros-args -p ...` with the ones set below.
 """
@@ -48,6 +49,7 @@ def generate_launch_description():
             'patrol.show_s': arg('show_s', float),
             'patrol.arrive_m': arg('arrive_m', float),
             'explore.stop_when_explored': arg('stop_when_explored', bool),
+            'explore.map_forget_m': arg('forget_m', float),
             'mission_timeout_s': arg('timeout_s', float),
             # its own file: a state saved by the cone mission must never be resumed here
             'state_file': os.path.expanduser('~/.ros/erc_plants_mission_state.json'),
@@ -57,6 +59,8 @@ def generate_launch_description():
         DeclareLaunchArgument('timeout_s', default_value='1800.0', description='mission time limit (s)'),
         DeclareLaunchArgument('show_s', default_value='5.0', description='hold still this long at each plant (s)'),
         DeclareLaunchArgument('arrive_m', default_value='1.8', description='show a plant from this distance (m)'),
+        DeclareLaunchArgument('forget_m', default_value='25.0',
+                              description='the map keeps what was seen in the last this-many metres driven (0: all)'),
         DeclareLaunchArgument('stop_when_explored', default_value='true',
                               description='end the mission when no frontier is left'),
         controller,

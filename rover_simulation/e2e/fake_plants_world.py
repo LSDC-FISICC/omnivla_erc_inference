@@ -8,7 +8,7 @@ explore:=true) and carrot_controller_node run against:
   - the floor of test/explore_search_sim.py, which the mission knows nothing about: two 2 m
     corridors in an L, a 5 x 4 m room, four potted plants (discs: obstacles too);
   - /erc/free_space from test/obstacles.profile and /erc/objects as object_detector_node
-    publishes it (<= 6 m, +-50 deg, p 0.8, line of sight, 1.5 deg / 8 % noise), both from
+    publishes it (<= 8 m, +-50 deg, p 0.8, line of sight, 1.5 deg noise, range 8 % short and 8 % noisy), both from
     where the rover was IMAGE_LAG_S ago.
 It also checks what the node publishes to look at: /erc/explore/map and /erc/explore/objects.
 
@@ -179,11 +179,11 @@ class World(Node):
             d = p - o
             r = float(np.hypot(*d))
             brg = math.degrees(math.remainder(math.atan2(d[1], d[0]) - lth, 2 * math.pi))
-            if abs(brg) > 50.0 or not 0.4 < r < 6.0 or self.rng.random() > 0.8:
+            if abs(brg) > 50.0 or not 0.4 < r < 8.0 or self.rng.random() > 0.8:
                 continue
             if min((w.ray_hit(o, d / r, r) for w in self.walls), default=math.inf) < r - 0.05:
                 continue
-            rng_m = r * (1 + self.rng.normal(0, 0.08))
+            rng_m = r * (0.92 + self.rng.normal(0, 0.08))     # the depth model's range: short and noisy
             dets.append({'label': 'potted plant', 'conf': 0.8, 'bearing_deg': brg + self.rng.normal(0, 1.5),
                          'range_m': rng_m, 'range_base_m': rng_m, 'range_scan_m': None, 'clipped': False})
         self.obj_pub.publish(String(data=json.dumps({'stamp': self._now(), 'detections': dets})))

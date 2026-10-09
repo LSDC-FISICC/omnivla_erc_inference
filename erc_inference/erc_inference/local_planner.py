@@ -95,6 +95,12 @@ class LocalCostmap:
         self.L = np.zeros((self.h, self.w), np.float32)
         self.seen = np.zeros((self.h, self.w), bool)
         self._dist = None      # distance to the nearest occupied cell, m (cached)
+        # For a map kept while the rover travels far (explore_search, local_map_node): how far the
+        # rover had travelled when each cell was last looked at. The owner keeps `odometer` (m) up
+        # to date; forget() then drops what was seen too long ago, and recenter() moves the grid
+        # along with the rover. Nothing else here reads them.
+        self.travel = np.full((self.h, self.w), -np.inf, np.float32)
+        self.odometer = 0.0
 
     # -- geometry ----------------------------------------------------------
     def cell(self, x, y):
@@ -135,6 +141,7 @@ class LocalCostmap:
         idx = np.unique(rows[ok] * self.w + cols[ok])
         self.L.flat[idx] += p['free_logodds']
         self.seen.flat[idx] = True
+        self.travel.flat[idx] = self.odometer
         # hit evidence
         hx = x + np.cos(ang[hit]) * rng[hit]
         hy = y + np.sin(ang[hit]) * rng[hit]
@@ -143,7 +150,40 @@ class LocalCostmap:
         idx = np.unique(rows[ok] * self.w + cols[ok])
         self.L.flat[idx] += p['hit_logodds']
         self.seen.flat[idx] = True
+        self.travel.flat[idx] = self.odometer
         np.clip(self.L, p['min_logodds'], p['max_logodds'], out=self.L)
+        self._dist = None
+
+    def forget(self, before):
+        """Cells last looked at before the rover had travelled `before` metres go back to unseen.
+        -> how many. The pose the map is drawn with drifts (wheels + gyro, nothing absolute), so
+        what was mapped 30 m of driving ago is no longer where the map says; kept, it is drawn a
+        second time, displaced, when the rover comes back."""
+        old = self.seen & (self.travel < before)
+        n = int(old.sum())
+        if n:
+            self.L[old] = 0.0
+            self.seen[old] = False
+            self._dist = None
+        return n
+
+    def recenter(self, x, y):
+        """Shift the grid by whole cells so that (x, y) is at its centre; what falls off is lost."""
+        res = self.p['resolution_m']
+        dc = int(round((x - (self.ox + 0.5 * self.w * res)) / res))
+        dr = int(round((y - (self.oy + 0.5 * self.h * res)) / res))
+        if dc == 0 and dr == 0:
+            return
+        r0, r1 = max(0, -dr), min(self.h, self.h - dr)          # rows of the new grid that keep data
+        c0, c1 = max(0, -dc), min(self.w, self.w - dc)
+        for name, fill in (('L', 0.0), ('seen', False), ('travel', -np.inf)):
+            old = getattr(self, name)
+            new = np.full_like(old, fill)
+            if r1 > r0 and c1 > c0:
+                new[r0:r1, c0:c1] = old[r0 + dr:r1 + dr, c0 + dc:c1 + dc]
+            setattr(self, name, new)
+        self.ox += dc * res
+        self.oy += dr * res
         self._dist = None
 
     def occupied(self):

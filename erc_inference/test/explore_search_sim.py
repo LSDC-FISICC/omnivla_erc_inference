@@ -5,7 +5,8 @@ A small floor the mission knows nothing about: an L of two 2 m corridors and a 5
 off the first one, potted plants (discs: they are obstacles too) standing in it. The rover
 gets what it would get on the real one: obstacles.profile() as /erc/free_space (its measured
 periphery, misses and noise), plant detections with bearing and range noise and a line of
-sight, a pose that drifts (wheel and gyro scale errors), and its commands arrive late. A
+sight (range a fraction short and 8% noisy, as the depth model's; now and then a detection that
+is nothing), a pose that drifts (wheel and gyro scale errors), and its commands arrive late. A
 plain carrot follower drives (v 0.25 m/s, turn in place beyond 45 deg): not MotionController
 and not controller_sim's plant, so this checks the mission's logic and map, not the tuning.
 
@@ -68,13 +69,18 @@ def run(seed, n_goals=3, t_max=1800.0, delay_s=1.0, wheel_scale=0.97, gyro_scale
         if k % 3 == 0:               # perception and the mission at ~3 Hz
             b, free, caps = obs.profile(x, y, th, things, rng)
             m.observe_scan(t, ex, ey, eth, b, np.minimum(free, obs.MAX_RANGE_M), free < caps - 0.05)
+            frame = []
             for px, py in PLANTS:
                 r = math.hypot(px - x, py - y)
                 brg = math.degrees((math.atan2(py - y, px - x) - th + math.pi) % (2 * math.pi) - math.pi)
                 d = np.array([px - x, py - y]) / max(r, 1e-6)
                 blocked = min((s.ray_hit(np.array([x, y]), d, r) for s in walls), default=math.inf) < r - 0.05
-                if 0.4 < r < 6.0 and abs(brg) < 50 and not blocked and rng.random() < 0.8:
-                    m.observe_cone(ex, ey, eth, 'potted plant', brg + rng.normal(0, 1.5), r * (1 + rng.normal(0, 0.08)), t)
+                if 0.4 < r < 8.0 and abs(brg) < 50 and not blocked and rng.random() < 0.8:
+                    # the depth model's range: a fraction short (4.4 m for ~4.9 m on the rover) and noisy
+                    frame.append(('potted plant', brg + rng.normal(0, 1.5), r * (0.92 + rng.normal(0, 0.08))))
+            if rng.random() < 0.02:          # a detection that is not a plant, once in a while
+                frame.append(('potted plant', rng.uniform(-45, 45), rng.uniform(1.5, 7.0)))
+            m.observe_objects(ex, ey, eth, frame, t)
             step = m.update(t, ex, ey, eth, abs(w))
             if step.arrived:
                 e = m.target.estimate()

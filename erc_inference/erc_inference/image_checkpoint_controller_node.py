@@ -321,14 +321,17 @@ class ImageCheckpointControllerNode(IndoorMissionNode):
             return
         wanted = set(self._param('object_classes'))
         t = self._now()
+        # no range: the object is not on the floor, or there was no fresh distance image for it
+        frame = [(d['label'], float(d['bearing_deg']), float(d['range_m'])) for d in dets
+                 if d.get('label') in wanted and d.get('range_m') is not None]
         with self._mission_lock:
             if self.mission is None:
                 return
-            for d in dets:
-                # no range: the box is cut by the bottom of the image and the depth profile has no hit there
-                if d.get('label') in wanted and d.get('range_m') is not None:
-                    self.mission.observe_cone(pose.x, pose.y, pose.yaw, d['label'], float(d['bearing_deg']),
-                                              float(d['range_m']), t)
+            if hasattr(self.mission, 'observe_objects'):
+                self.mission.observe_objects(pose.x, pose.y, pose.yaw, frame, t)   # the frame at once: tracking
+            else:
+                for label, bearing, rng in frame:
+                    self.mission.observe_cone(pose.x, pose.y, pose.yaw, label, bearing, rng, t)
 
     def _attitude_callback(self, msg: Imu):
         q = msg.orientation
