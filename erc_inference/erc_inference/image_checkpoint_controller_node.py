@@ -614,7 +614,12 @@ class ImageCheckpointControllerNode(IndoorMissionNode):
             goal_handle.succeed()
             result.success = True
             result.mission_completed = True
-            result.message = f'All {len(self.goals)} goals reached in {self._now() - t_start:.0f} s.'
+            if getattr(m, 'explored', False):
+                result.message = (f'Nothing left to explore after {self._now() - t_start:.0f} s: '
+                                  f'{m.index}/{m.n_shows} objects shown.')
+            else:
+                result.message = f'All {m.n_shows} goals reached in {self._now() - t_start:.0f} s.'
+            self.get_logger().info(f'Mission ended: {result.message}')
             return result
         except Exception as exc:
             self.get_logger().error(f'Mission failed: {exc}')

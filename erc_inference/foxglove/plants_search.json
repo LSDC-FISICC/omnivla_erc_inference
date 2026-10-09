@@ -1,0 +1,167 @@
+{
+  "configById": {
+    "3D!plants_map": {
+      "cameraState": {
+        "perspective": false,
+        "distance": 18,
+        "phi": 0,
+        "thetaOffset": 90,
+        "target": [
+          0,
+          0,
+          0
+        ],
+        "targetOffset": [
+          0,
+          0,
+          0
+        ],
+        "targetOrientation": [
+          0,
+          0,
+          0,
+          1
+        ],
+        "fovy": 45,
+        "near": 0.1,
+        "far": 5000
+      },
+      "followMode": "follow-position",
+      "followTf": "base_link",
+      "scene": {
+        "enableStats": false,
+        "transforms": {
+          "showLabel": true,
+          "axisScale": 0.5
+        }
+      },
+      "transforms": {},
+      "topics": {
+        "/erc/explore/map": {
+          "visible": true,
+          "colorMode": "costmap",
+          "alpha": 0.8,
+          "frameLocked": false
+        },
+        "/erc/explore/objects": {
+          "visible": true
+        },
+        "/erc/free_space": {
+          "visible": true,
+          "pointSize": 8,
+          "pointShape": "circle",
+          "colorMode": "flat",
+          "flatColor": "#ff3b30",
+          "decayTime": 0
+        }
+      },
+      "publish": {
+        "type": "point"
+      },
+      "imageMode": {},
+      "layers": {
+        "grid": {
+          "layerId": "foxglove.Grid",
+          "visible": true,
+          "frameId": "odom",
+          "size": 30,
+          "divisions": 30,
+          "lineWidth": 1,
+          "color": "#24ff8e30",
+          "position": [
+            0,
+            0,
+            0
+          ],
+          "rotation": [
+            0,
+            0,
+            0
+          ],
+          "order": 1
+        }
+      }
+    },
+    "Image!plants_yolo": {
+      "imageMode": {
+        "imageTopic": "/erc/perception/objects/compressed"
+      },
+      "cameraState": {},
+      "followMode": "follow-pose",
+      "scene": {},
+      "transforms": {},
+      "topics": {},
+      "layers": {},
+      "publish": {}
+    },
+    "Image!plants_overlay": {
+      "imageMode": {
+        "imageTopic": "/erc/perception/overlay/compressed"
+      },
+      "cameraState": {},
+      "followMode": "follow-pose",
+      "scene": {},
+      "transforms": {},
+      "topics": {},
+      "layers": {},
+      "publish": {}
+    },
+    "Plot!plants_cmd": {
+      "paths": [
+        {
+          "value": "/cmd_vel.linear.x",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "v"
+        },
+        {
+          "value": "/cmd_vel.angular.z",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "w"
+        }
+      ],
+      "showLegend": true,
+      "legendDisplay": "floating",
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "isSynced": true,
+      "xAxisVal": "timestamp",
+      "followingViewWidth": 30
+    },
+    "RosOut!plants_log": {
+      "searchTerms": [],
+      "minLogLevel": 1,
+      "nameFilter": {}
+    }
+  },
+  "globalVariables": {},
+  "userNodes": {},
+  "playbackConfig": {
+    "speed": 1
+  },
+  "drawerConfig": {
+    "tracks": []
+  },
+  "layout": {
+    "first": "3D!plants_map",
+    "second": {
+      "first": {
+        "first": "Image!plants_yolo",
+        "second": "Image!plants_overlay",
+        "direction": "column",
+        "splitPercentage": 50
+      },
+      "second": {
+        "first": "Plot!plants_cmd",
+        "second": "RosOut!plants_log",
+        "direction": "column",
+        "splitPercentage": 40
+      },
+      "direction": "row",
+      "splitPercentage": 50
+    },
+    "direction": "row",
+    "splitPercentage": 48
+  }
+}

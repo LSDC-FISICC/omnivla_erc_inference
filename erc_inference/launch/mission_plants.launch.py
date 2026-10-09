@@ -1,0 +1,64 @@
+"""Indoor search mission: explore with no known map and find the potted plants. Terminal 2.
+
+Everything the mission needs except the node that drives -- mission_indoor.launch.py with
+target:=plants:
+
+    erc_bridge        camera, telemetry, control, status (the SDK must be running)
+    erc_localization  localization_local: wheels + gyro -> /erc/odometry/local (no GPS)
+    erc_perception    free_space_node (UniDepthV2) -> /erc/free_space, the map's input;
+                      object_detector_node (YOLO26, 'potted plant') -> /erc/objects
+    erc_inference     carrot_controller_node at 0.25 m/s, turning in place from 45 deg
+
+Then, in its own terminal -- it is the only writer of /cmd_vel, so Ctrl-C there stops the rover:
+
+    ros2 launch erc_inference plants_controller.launch.py
+    ros2 action send_goal --feedback /start_mission erc_inference_msgs/action/StartMission \\
+        "{resume_from_latest_scanned: false}"
+
+Arguments: debug_images:=true|false (default true: the frame with the ground and the obstacle
+band, and the model's distance, as JPEGs; the YOLO26 boxes are always published),
+foxglove:=true|false (default false: also start foxglove_bridge on 127.0.0.1:foxglove_port,
+8766 -- forward the port and open ws://localhost:8766 as "Foxglove WebSocket"; layout
+share/erc_inference/foxglove/plants_search.json), yolo_conf:=0.35 (the detector's minimum
+confidence), depth_backend:=unidepth|da3.
+
+LIVE operation only; it starts the SDK bridge.
+"""
+import os
+
+from ament_index_python.packages import get_package_share_directory
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription, LogInfo
+from launch.conditions import IfCondition
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import LaunchConfiguration
+
+
+def generate_launch_description():
+    share = get_package_share_directory('erc_inference')
+    stack = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(os.path.join(share, 'launch', 'mission_indoor.launch.py')),
+        launch_arguments={'mission': 'images', 'model': 'none', 'target': 'plants',
+                          'depth_backend': LaunchConfiguration('depth_backend'),
+                          'yolo_conf': LaunchConfiguration('yolo_conf'),
+                          'debug_images': LaunchConfiguration('debug_images')}.items())
+    foxglove = ExecuteProcess(
+        cmd=['ros2', 'launch', 'foxglove_bridge', 'foxglove_bridge_launch.xml',
+             ['port:=', LaunchConfiguration('foxglove_port')], 'address:=127.0.0.1'],
+        output='log', condition=IfCondition(LaunchConfiguration('foxglove')))
+    reminder = LogInfo(msg=(
+        'mission_plants up. Then, in another terminal:  ros2 launch erc_inference plants_controller.launch.py'
+        '  and  ros2 action send_goal --feedback /start_mission erc_inference_msgs/action/StartMission '
+        '"{resume_from_latest_scanned: false}"'))
+    return LaunchDescription([
+        DeclareLaunchArgument('debug_images', default_value='true',
+                              description='free_space_node also publishes /erc/perception/{overlay,depth}/compressed'),
+        DeclareLaunchArgument('depth_backend', default_value='unidepth',
+                              description="free_space_node depth model: 'unidepth' (UniDepthV2) or 'da3'"),
+        DeclareLaunchArgument('yolo_conf', default_value='0.35',
+                              description='minimum confidence of a YOLO26 detection (raise it if it sees plants that are not)'),
+        DeclareLaunchArgument('foxglove', default_value='false',
+                              description='also start foxglove_bridge (127.0.0.1 only)'),
+        DeclareLaunchArgument('foxglove_port', default_value='8766'),
+        stack, foxglove, reminder,
+    ])

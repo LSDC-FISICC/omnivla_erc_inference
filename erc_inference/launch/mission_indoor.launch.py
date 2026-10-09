@@ -69,6 +69,8 @@ def generate_launch_description():
         DeclareLaunchArgument('cone_height_m', default_value='0.23',
                               description="the cones' real height (m); the detector's range comes from it "
                                           "(9-inch sports cone assumed; nobody could measure the organisers')"),
+        DeclareLaunchArgument('yolo_conf', default_value='0.35',
+                              description='target:=plants: minimum confidence of a YOLO26 detection'),
         DeclareLaunchArgument('target', default_value='cones',
                               description="what mission:=images looks for: 'cones' (cone_detector_node -> /erc/cones) "
                                           "or 'plants' (object_detector_node, YOLO26 -> /erc/objects)"),
@@ -136,7 +138,8 @@ def generate_launch_description():
     # -p goals_file:=<share>/config/indoor_plants_goals.yaml -p patrol.max_shows:=0, and either
     # -p explore:=true (no known map: it builds one from /erc/free_space, explore_search.py) or
     # -p route_file:=<your corridors> (the patrol on a known loop).
-    plants = ExecuteProcess(cmd=['ros2', 'run', 'erc_perception', 'yolo_wrapper'], output='screen',
+    plants = ExecuteProcess(cmd=['ros2', 'run', 'erc_perception', 'yolo_wrapper', '--ros-args',
+                                 '-p', ['conf:=', LaunchConfiguration('yolo_conf')]], output='screen',
                             condition=IfCondition(PythonExpression(["'", LaunchConfiguration('mission'), "' == 'images' and '",
                                                                     LaunchConfiguration('target'), "' == 'plants'"])))
 
