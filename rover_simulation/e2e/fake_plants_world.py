@@ -23,7 +23,7 @@ import sys
 
 import numpy as np
 import rclpy
-from geometry_msgs.msg import PoseStamped, Twist
+from geometry_msgs.msg import PoseStamped, Twist, Vector3
 from nav_msgs.msg import OccupancyGrid, Odometry
 from rcl_interfaces.msg import Log
 from rclpy.node import Node
@@ -193,6 +193,12 @@ def main():
     dur, seed, n_goals = float(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
     rclpy.init()
     n = World(seed, n_goals)
+    drive = len(sys.argv) > 4 and sys.argv[4] == 'drive'     # no mission: this drives, for local_map_node
+    if drive:
+        pub = n.create_publisher(Twist, '/cmd_vel', 10)
+        n.create_subscription(OccupancyGrid, '/erc/local_map', n._map, 1)
+        n.create_subscription(MarkerArray, '/erc/local_map/objects', n._markers, 1)
+        n.create_timer(0.1, lambda: pub.publish(Twist(linear=Vector3(x=0.25)) if n.x < 10.5 else Twist()))
     while rclpy.ok() and n.t() < dur and not STATE['done']:
         rclpy.spin_once(n, timeout_sec=0.01)
     t_end = n.t()
@@ -207,15 +213,21 @@ def main():
     if g is None:
         print('map: NOTHING on /erc/explore/map', flush=True)
     else:
-        d = np.asarray(g.data, np.int16)
+        d = np.asarray(g.data, np.int16).reshape(g.info.height, g.info.width)
+        # occupied cells back in the mission frame: they must lie on the walls and the plants
+        rows, cols = np.nonzero(d > 80)
+        yaw = 2 * math.atan2(g.info.origin.orientation.z, g.info.origin.orientation.w)
+        cx, cy = (cols + 0.5) * g.info.resolution, (rows + 0.5) * g.info.resolution
+        xo = g.info.origin.position.x + math.cos(yaw) * cx - math.sin(yaw) * cy
+        yo = g.info.origin.position.y + math.sin(yaw) * cx + math.cos(yaw) * cy
         ox, oy, oth = ODOM_OFFSET
         c, s = math.cos(oth), math.sin(oth)
-        want = (ox + c * -30.0 - s * -30.0, oy + s * -30.0 + c * -30.0, oth)     # the map's corner, in odom
-        got = (g.info.origin.position.x, g.info.origin.position.y,
-               2 * math.atan2(g.info.origin.orientation.z, g.info.origin.orientation.w))
-        print(f'map: {n.maps} msgs, frame {g.header.frame_id}, {g.info.width}x{g.info.height} @ {g.info.resolution:.2f} m, '
-              f'seen {int((d >= 0).sum())} cells, occupied {int((d > 80).sum())}; origin {tuple(round(v, 2) for v in got)} '
-              f'expected {tuple(round(v, 2) for v in want)}', flush=True)
+        xm, ym = c * (xo - ox) + s * (yo - oy), -s * (xo - ox) + c * (yo - oy)
+        dist = np.array([obs.clearance((a, b), n.world_all) for a, b in zip(xm, ym)]) if len(xm) else np.zeros(0)
+        on = float((dist < 0.45).mean()) if len(dist) else float('nan')
+        print(f'map: {n.maps} msgs, frame {g.header.frame_id}, {g.info.width}x{g.info.height} cells @ '
+              f'{g.info.resolution:.2f} m ({len(g.data) / 1000:.1f} kB), seen {int((d >= 0).sum())}, occupied {len(rows)}: '
+              f'{100 * on:.0f}% within 0.45 m of a real wall or plant', flush=True)
     mk = n.markers_last
     if mk is None:
         print('objects: NOTHING on /erc/explore/objects', flush=True)

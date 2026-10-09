@@ -37,8 +37,25 @@
       },
       "transforms": {},
       "topics": {
-        "/erc/explore/map": {
+        "/erc/local_map": {
           "visible": true,
+          "colorMode": "costmap",
+          "alpha": 0.8,
+          "frameLocked": false
+        },
+        "/erc/local_map/objects": {
+          "visible": true
+        },
+        "/erc/local_map/path": {
+          "visible": true,
+          "lineWidth": 0.04,
+          "gradient": [
+            "#0a84ff",
+            "#0a84ff"
+          ]
+        },
+        "/erc/explore/map": {
+          "visible": false,
           "colorMode": "costmap",
           "alpha": 0.8,
           "frameLocked": false

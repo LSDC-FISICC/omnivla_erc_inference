@@ -44,6 +44,7 @@ setup(
             'nav2_route_follower_node = erc_inference.nav2_route_follower_node:main',
             'indoor_mission_node = erc_inference.indoor_mission_node:main',
             'image_checkpoint_controller_node = erc_inference.image_checkpoint_controller_node:main',
+            'local_map_node = erc_inference.local_map_node:main',
             'image_goal_offroad_node = erc_inference.image_goal_offroad_node:main',
             'flag_checkpoint_node = erc_inference.flag_checkpoint_node:main',
         ],

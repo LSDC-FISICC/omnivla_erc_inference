@@ -102,6 +102,11 @@ Sin monitor en el DGX (acceso remoto):
   `ros2 launch foxglove_bridge foxglove_bridge_launch.xml port:=8766`; en la laptop
   `ssh -L 8766:localhost:8766 <dgx>` y en Foxglove abrir `ws://localhost:8766`. Puerto 8766
   porque `e2e/fake_world.py` usa el 8765.
+  **No mirar las cámaras crudas** (`/erc/front_camera`: 1.77 MB por cuadro, 7 MB/s): por el
+  túnel Foxglove se atrasa ~20 s. Usar `/erc/front_camera/compressed` (el JPEG tal como lo
+  entrega el SDK), o lanzar el puente sin ellas:
+  `"topic_whitelist:=['^(?!/erc/(front|rear)_camera$).*']"` (lo que hace
+  `mission_plants.launch.py foxglove:=true`).
 - **RViz en la laptop:** copiar el bag (o el extracto) y `rviz/local_planning.rviz`; solo usa
   mensajes estándar, no hace falta este código.
 - **Sin nada:** `bags/bag_leg_view.py <bag> out.png` dibuja lo mismo a PNG (último tramo).

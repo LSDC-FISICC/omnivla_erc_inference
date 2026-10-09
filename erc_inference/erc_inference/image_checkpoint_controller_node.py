@@ -62,7 +62,7 @@ from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from sensor_msgs.msg import Imu, LaserScan
 from std_msgs.msg import Bool, String
-from visualization_msgs.msg import Marker, MarkerArray
+from visualization_msgs.msg import MarkerArray
 
 from erc_inference_msgs.action import StartMission
 
@@ -74,6 +74,7 @@ from erc_inference.indoor_track import Pose2D, anchor
 from erc_inference.loop_patrol import DEFAULTS as PATROL_DEFAULTS
 from erc_inference.loop_patrol import (LOCAL_INDOOR, PATROL_COMPETITION, SAFETY_INDOOR, KnownMap, LoopPatrolMission,
                                       WallLocalizer)
+from erc_inference.map_viz import grid_message, object_markers
 from erc_inference.safety_envelope import DEFAULTS as SAFETY_DEFAULTS
 from erc_inference.safety_envelope import SafetyEnvelope, parameter_errors as safety_errors
 
@@ -398,37 +399,15 @@ class ImageCheckpointControllerNode(IndoorMissionNode):
             m = self.mission
             if m is None or anchor_ is None or not hasattr(m, 'map'):
                 return
-            cmap = m.map
-            prob = 100.0 / (1.0 + np.exp(-cmap.L))
-            data = np.where(cmap.seen, np.clip(prob, 0, 100), -1).astype(np.int8).ravel().tolist()
-            objects = m.objects()
-        odom_from_track = anchor_.inverse()
-        stamp = self.get_clock().now().to_msg()
-        frame = self._param('odom_frame')
-        g = OccupancyGrid()
-        g.header.stamp, g.header.frame_id = stamp, frame
-        g.info.resolution = float(cmap.p['resolution_m'])
-        g.info.width, g.info.height = cmap.w, cmap.h
-        o = odom_from_track.compose(Pose2D(float(cmap.ox), float(cmap.oy), 0.0))
-        g.info.origin.position.x, g.info.origin.position.y = o.x, o.y
-        g.info.origin.orientation.z, g.info.origin.orientation.w = math.sin(o.yaw / 2), math.cos(o.yaw / 2)
-        g.data = data
-        self._map_pub.publish(g)
-        arr = MarkerArray()
-        arr.markers.append(Marker(action=Marker.DELETEALL))
-        for i, (cls, x, y, visited, n) in enumerate(objects):
-            q = odom_from_track.compose(Pose2D(x, y, 0.0))
-            colour = (0.2, 0.8, 0.2) if visited else (1.0, 0.6, 0.0)       # green: shown; orange: pending
-            for k, kind in enumerate((Marker.CYLINDER, Marker.TEXT_VIEW_FACING)):
-                mk = Marker(type=kind, action=Marker.ADD, ns='objects' if k == 0 else 'labels', id=i)
-                mk.header.stamp, mk.header.frame_id = stamp, frame
-                mk.pose.position.x, mk.pose.position.y, mk.pose.position.z = q.x, q.y, 0.25 if k == 0 else 0.8
-                mk.pose.orientation.w = 1.0
-                mk.scale.x, mk.scale.y, mk.scale.z = (0.4, 0.4, 0.5) if k == 0 else (0.0, 0.0, 0.25)
-                mk.color.r, mk.color.g, mk.color.b, mk.color.a = (*colour, 0.9) if k == 0 else (1.0, 1.0, 1.0, 1.0)
-                mk.text = f'{cls}' + (' (shown)' if visited else '') if k == 1 else ''
-                arr.markers.append(mk)
-        self._objects_pub.publish(arr)
+            o = anchor_.inverse()
+            origin = (o.x, o.y, o.yaw)
+            stamp = self.get_clock().now().to_msg()
+            frame = self._param('odom_frame')
+            grid = grid_message(m.map, stamp, frame, origin)
+            markers = object_markers(m.objects(), stamp, frame, origin)
+        if grid is not None:
+            self._map_pub.publish(grid)
+        self._objects_pub.publish(markers)
 
     # -- resume ---------------------------------------------------------------
 

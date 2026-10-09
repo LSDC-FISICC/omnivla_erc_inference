@@ -8,6 +8,8 @@ target:=plants:
     erc_perception    free_space_node (UniDepthV2) -> /erc/free_space, the map's input;
                       object_detector_node (YOLO26, 'potted plant') -> /erc/objects
     erc_inference     carrot_controller_node at 0.25 m/s, turning in place from 45 deg
+                      local_map_node: /erc/local_map (+ /objects, /path), the map and the plants
+                      on it as the rover would build them, to look at before anything drives
 
 Then, in its own terminal -- it is the only writer of /cmd_vel, so Ctrl-C there stops the rover:
 
@@ -15,11 +17,12 @@ Then, in its own terminal -- it is the only writer of /cmd_vel, so Ctrl-C there 
     ros2 action send_goal --feedback /start_mission erc_inference_msgs/action/StartMission \\
         "{resume_from_latest_scanned: false}"
 
-Arguments: debug_images:=true|false (default true: the frame with the ground and the obstacle
+Arguments: local_map:=true|false (default true), debug_images:=true|false (default true: the frame with the ground and the obstacle
 band, and the model's distance, as JPEGs; the YOLO26 boxes are always published),
 foxglove:=true|false (default false: also start foxglove_bridge on 127.0.0.1:foxglove_port,
 8766 -- forward the port and open ws://localhost:8766 as "Foxglove WebSocket"; layout
-share/erc_inference/foxglove/plants_search.json), yolo_conf:=0.35 (the detector's minimum
+share/erc_inference/foxglove/plants_search.json; the raw camera images are not offered, look at
+/erc/front_camera/compressed), yolo_conf:=0.35 (the detector's minimum
 confidence), depth_backend:=unidepth|da3.
 
 LIVE operation only; it starts the SDK bridge.
@@ -32,6 +35,7 @@ from launch.actions import DeclareLaunchArgument, ExecuteProcess, IncludeLaunchD
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import Node
 
 
 def generate_launch_description():
@@ -44,8 +48,15 @@ def generate_launch_description():
                           'debug_images': LaunchConfiguration('debug_images')}.items())
     foxglove = ExecuteProcess(
         cmd=['ros2', 'launch', 'foxglove_bridge', 'foxglove_bridge_launch.xml',
-             ['port:=', LaunchConfiguration('foxglove_port')], 'address:=127.0.0.1'],
+             ['port:=', LaunchConfiguration('foxglove_port')], 'address:=127.0.0.1',
+             # every topic but the two raw camera images: 1.77 MB a frame, 7 MB/s, and through an SSH
+             # tunnel Foxglove ran ~20 s behind showing one (2026-10-09). Their JPEGs are
+             # /erc/{front,rear}_camera/compressed; the YOLO26 boxes, /erc/perception/objects/compressed.
+             "topic_whitelist:=['^(?!/erc/(front|rear)_camera$).*']"],
         output='log', condition=IfCondition(LaunchConfiguration('foxglove')))
+    # The map the rover would build, to look at before anything drives: view only, it commands nothing.
+    local_map = Node(package='erc_inference', executable='local_map_node', name='local_map_node', output='screen',
+                     condition=IfCondition(LaunchConfiguration('local_map')))
     reminder = LogInfo(msg=(
         'mission_plants up. Then, in another terminal:  ros2 launch erc_inference plants_controller.launch.py'
         '  and  ros2 action send_goal --feedback /start_mission erc_inference_msgs/action/StartMission '
@@ -57,8 +68,10 @@ def generate_launch_description():
                               description="free_space_node depth model: 'unidepth' (UniDepthV2) or 'da3'"),
         DeclareLaunchArgument('yolo_conf', default_value='0.35',
                               description='minimum confidence of a YOLO26 detection (raise it if it sees plants that are not)'),
+        DeclareLaunchArgument('local_map', default_value='true',
+                              description='also run local_map_node: /erc/local_map, the map with nobody driving'),
         DeclareLaunchArgument('foxglove', default_value='false',
                               description='also start foxglove_bridge (127.0.0.1 only)'),
         DeclareLaunchArgument('foxglove_port', default_value='8766'),
-        stack, foxglove, reminder,
+        stack, local_map, foxglove, reminder,
     ])

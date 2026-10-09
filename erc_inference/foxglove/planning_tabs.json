@@ -108,7 +108,7 @@
     },
     "Image!resumen_cam": {
       "imageMode": {
-        "imageTopic": "/erc/front_camera"
+        "imageTopic": "/erc/front_camera/compressed"
       },
       "cameraState": {},
       "followMode": "follow-pose",
@@ -235,7 +235,7 @@
     },
     "Image!ud_cam": {
       "imageMode": {
-        "imageTopic": "/erc/front_camera"
+        "imageTopic": "/erc/front_camera/compressed"
       },
       "cameraState": {},
       "followMode": "follow-pose",

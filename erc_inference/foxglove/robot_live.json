@@ -75,7 +75,7 @@
     },
     "Image!live_front": {
       "imageMode": {
-        "imageTopic": "/erc/front_camera"
+        "imageTopic": "/erc/front_camera/compressed"
       },
       "cameraState": {},
       "followMode": "follow-pose",
@@ -87,7 +87,7 @@
     },
     "Image!live_rear": {
       "imageMode": {
-        "imageTopic": "/erc/rear_camera"
+        "imageTopic": "/erc/rear_camera/compressed"
       },
       "cameraState": {},
       "followMode": "follow-pose",
