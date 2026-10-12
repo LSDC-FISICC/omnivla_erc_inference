@@ -70,6 +70,28 @@
           "colorMode": "flat",
           "flatColor": "#ff3b30",
           "decayTime": 0
+        },
+        "/erc/local_route": {
+          "visible": true,
+          "lineWidth": 0.05,
+          "gradient": [
+            "#ff9f0a",
+            "#ff9f0a"
+          ]
+        },
+        "/optimal_trajectory": {
+          "visible": true,
+          "lineWidth": 0.04,
+          "gradient": [
+            "#30d158",
+            "#30d158"
+          ]
+        },
+        "/local_costmap/costmap": {
+          "visible": false,
+          "colorMode": "costmap",
+          "alpha": 0.5,
+          "frameLocked": false
         }
       },
       "publish": {

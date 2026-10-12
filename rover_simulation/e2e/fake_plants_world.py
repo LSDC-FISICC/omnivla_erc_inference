@@ -111,13 +111,20 @@ class World(Node):
         if m.name != 'image_checkpoint_controller_node':
             return
         if any(k in m.msg for k in ('object ', 'shown', 'Mission', 'goal ', 'no path', 'explore', 'frontier',
-                                    'stuck', 'Anchored', 'ready')):
+                                    'stuck', 'Anchored', 'ready', 'counted', 'open ahead', 'no way on')):
             print(f'  {self.t():6.1f}s  {m.msg[:150]}', flush=True)
         got = re.search(r'object \d+/\d+: .* at \((-?[\d.]+),(-?[\d.]+)\)', m.msg)
         if got:                      # where the mission thinks the plant it is going to stands
             self.going_to = (float(got.group(1)), float(got.group(2)))
         if 'shown.' in m.msg:        # "cone n/N shown.": which plant that was, and how far it really is
             which = int(np.hypot(*(self.plants - self.going_to).T).argmin())
+            d = float(np.hypot(*(self.plants[which] - (self.x, self.y))))
+            STATE['shown'].append((round(self.t()), which, round(d, 2)))
+            STATE['done'] = len(STATE['shown']) >= self.n_goals
+        got = re.search(r'counted: #\d+ at \((-?[\d.]+),(-?[\d.]+)\)', m.msg)
+        if got:                      # driving past and counting: which plant the counted track is
+            e = (float(got.group(1)), float(got.group(2)))
+            which = int(np.hypot(*(self.plants - e).T).argmin())
             d = float(np.hypot(*(self.plants[which] - (self.x, self.y))))
             STATE['shown'].append((round(self.t()), which, round(d, 2)))
             STATE['done'] = len(STATE['shown']) >= self.n_goals

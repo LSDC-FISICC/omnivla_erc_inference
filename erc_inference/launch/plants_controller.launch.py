@@ -10,12 +10,22 @@ mission_plants.launch.py; it is the only writer of /cmd_vel, so Ctrl-C here stop
 No known map: the rover's pose when the goal is sent is the map's origin (0, 0, facing +x).
 The map and the plants on it are published on /erc/explore/map and /erc/explore/objects.
 
+What it does (since 12-oct): drives on wherever the profile shows an open way ahead that leads to
+ground not seen yet, and counts each potted plant as it comes within count_m of it. It does not
+turn in place to search, does not go to the plants and does not stop at them. With no open way
+ahead the map decides (frontiers, A*); with nowhere to go it stands still, and 20 s of that ends
+the mission. approach:=true is the mission as it was before: a look around at the start, then go
+to each plant, face it and hold still show_s.
+
 Arguments:
-  plants       how many potted plants to show before the mission ends (default 3)
+  plants       how many potted plants to count before the mission ends (default 3)
   timeout_s    the mission's time limit (default 1800)
+  count_m      a plant counts once the rover is within this of it, driving by (default 2.0)
+  apart_m      a plant this close to one already counted is the same plant (default 1.5)
+  approach     false (default). true: go to each plant and show it, with these three:
   show_s       how long it holds still in front of each plant (default 5)
   arrive_m     a plant counts once the rover is within this of it (default 1.0)
-  apart_m      a plant this close to one already shown is the same plant (default 1.5)
+  standoff_m   the route to a plant ends this far short of it (default 0.9)
   stop_when_explored  true (default): also end when nothing is left to explore
   forget_m     the map keeps what was seen in the last this-many metres driven (default 25; 0: all)
 More of the node's parameters: `ros2 run erc_inference image_checkpoint_controller_node
@@ -26,7 +36,7 @@ import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
@@ -36,6 +46,9 @@ def generate_launch_description():
 
     def arg(name, kind):
         return ParameterValue(LaunchConfiguration(name), value_type=kind)
+
+    approach = PythonExpression(["'", LaunchConfiguration('approach'), "' == 'true'"])
+    drive_by = PythonExpression(["'", LaunchConfiguration('approach'), "' != 'true'"])
 
     controller = Node(
         package='erc_inference', executable='image_checkpoint_controller_node',
@@ -51,6 +64,19 @@ def generate_launch_description():
             'patrol.arrive_m': arg('arrive_m', float),
             'patrol.standoff_m': arg('standoff_m', float),
             'patrol.same_class_apart_m': arg('apart_m', float),
+            # driving past and counting, or (approach) going to each plant: explore_search.py
+            'explore.count_on_sight': ParameterValue(drive_by, value_type=bool),
+            'explore.forward_first': ParameterValue(drive_by, value_type=bool),
+            'explore.look_around': ParameterValue(approach, value_type=bool),
+            'patrol.start_scan': ParameterValue(approach, value_type=bool),
+            'explore.count_m': arg('count_m', float),
+            # A tilt needs the accelerometer to agree: on 12-oct the attitude filter read 15-17 deg
+            # three times while turning in place on a flat floor (the accelerometer: 0.8 deg), and
+            # each time the mission backed off and marked an obstacle ahead that was not there.
+            'safety.tilt_accel_confirm_deg': 6.0,
+            # what MPPI needs if it is the one driving (mission_plants.launch.py controller:=mppi);
+            # with the carrot nobody listens
+            'nav2_frames': True,
             'explore.stop_when_explored': arg('stop_when_explored', bool),
             'explore.map_forget_m': arg('forget_m', float),
             'mission_timeout_s': arg('timeout_s', float),
@@ -58,8 +84,12 @@ def generate_launch_description():
             'state_file': os.path.expanduser('~/.ros/erc_plants_mission_state.json'),
         }])
     return LaunchDescription([
-        DeclareLaunchArgument('plants', default_value='3', description='potted plants to show before it ends'),
+        DeclareLaunchArgument('plants', default_value='3', description='potted plants to count before it ends'),
         DeclareLaunchArgument('timeout_s', default_value='1800.0', description='mission time limit (s)'),
+        DeclareLaunchArgument('approach', default_value='false',
+                              description='false: drive past and count; true: go to each plant, face it, hold still'),
+        DeclareLaunchArgument('count_m', default_value='2.0',
+                              description='driving past: a plant counts once the rover is within this of it (m)'),
         DeclareLaunchArgument('show_s', default_value='5.0', description='hold still this long at each plant (s)'),
         DeclareLaunchArgument('arrive_m', default_value='1.0',
                               description='a plant counts once the rover is within this of it (m)'),

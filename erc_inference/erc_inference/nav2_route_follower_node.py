@@ -78,8 +78,15 @@ LATCHED_QOS = QoSProfile(depth=1, history=HistoryPolicy.KEEP_LAST,
                          durability=DurabilityPolicy.TRANSIENT_LOCAL)
 
 
+def rest_rate(w_cmd, deadband, slope):
+    """The yaw rate a rover with a dead zone does IN PLACE for a commanded one: nothing below
+    `deadband`, then `slope` times the excess (config/rover_dynamics.yaml: 0.10 and 1.7 on the team's
+    own unit -- asked 0.15 / 0.30 / 0.45 rad/s it does 0.08 / 0.34 / 0.60)."""
+    return math.copysign(slope * max(0.0, abs(w_cmd) - deadband), w_cmd)
+
+
 def snap_command(v, w, v_floor=0.25, v_stop=0.02, w_floor=0.15, w_stop=0.01,
-                 k_w_moving=1.0, k_w_in_place=1.0, w_max=None):
+                 k_w_moving=1.0, k_w_in_place=1.0, w_max=None, rest_deadband=0.0, rest_slope=1.0):
     """MPPI's (v, w) -> what this rover can execute.
 
     The rover has two usable speed states: stopped, or at least v_floor. So v below
@@ -98,6 +105,12 @@ def snap_command(v, w, v_floor=0.25, v_stop=0.02, w_floor=0.15, w_stop=0.01,
     Mission17sept_wuhan 4.1). The command is MPPI's rate divided by that gain, then
     clipped to w_max. Without it MPPI's 0.04 rad/s detour became 0.015 rad/s of
     real turn and the rover drove straight into the hedge (e2e, hedge, local_replan).
+
+    rest_deadband > 0: in place the rover is not a gain but a dead zone and a slope
+    (rest_rate); the command is its inverse, deadband + |w| / slope, and k_w_in_place
+    and w_floor are not used. One gain cannot stand for it: learned online on the
+    team's unit it read 0.57, 0.46, 0.32 and 1.04 within two minutes, as the rates
+    MPPI happened to ask changed (ROS e2e, 12-oct).
     """
     v = float(v)
     w = float(w)
@@ -109,6 +122,11 @@ def snap_command(v, w, v_floor=0.25, v_stop=0.02, w_floor=0.15, w_stop=0.01,
         # arc near a wall became a 2.5x wider one at 0.25 m/s
         w = w * v_floor / v
         v = v_floor
+    if v == 0.0 and rest_deadband > 0.0:
+        w = 0.0 if abs(w) < w_stop else math.copysign(rest_deadband + abs(w) / rest_slope, w)
+        if w_max is not None:
+            w = max(-w_max, min(w_max, w))
+        return v, w
     w = w / (k_w_moving if v > 0.0 else k_w_in_place)
     if w_max is not None:
         w = max(-w_max, min(w_max, w))
@@ -121,7 +139,7 @@ def snap_command(v, w, v_floor=0.25, v_stop=0.02, w_floor=0.15, w_stop=0.01,
 
 
 def predict_pose(x, y, yaw, commands, now, delay_s, k_v=1.11, k_w_moving=0.36,
-                 k_w_in_place=1.18, v_breakaway=0.15):
+                 k_w_in_place=1.18, v_breakaway=0.15, rest_deadband=0.0, rest_slope=1.0):
     """Roll (x, y, yaw) forward through the commands of the last delay_s.
 
     commands: [(t, v, w), ...] as sent to /cmd_vel, oldest first; each holds
@@ -138,7 +156,10 @@ def predict_pose(x, y, yaw, commands, now, delay_s, k_v=1.11, k_w_moving=0.36,
     for (ta, v, w), (tb, _v, _w) in zip(seg[:-1], seg[1:]):
         dt = max(0.0, tb - ta)
         vr = k_v * v if abs(v) >= v_breakaway else 0.0
-        wr = (k_w_moving if vr != 0.0 else k_w_in_place) * w
+        if vr == 0.0 and rest_deadband > 0.0:
+            wr = rest_rate(w, rest_deadband, rest_slope)
+        else:
+            wr = (k_w_moving if vr != 0.0 else k_w_in_place) * w
         n = max(1, int(dt / 0.05))
         h = dt / n
         for _ in range(n):
@@ -248,6 +269,11 @@ class Nav2RouteFollower(Node):
         self.declare_parameter('k_w_moving', 1.0)
         self.declare_parameter('k_w_in_place', 1.0)
         self.declare_parameter('w_max', 0.3)     # controller.yaml max_angular_vel
+        # In place, a dead zone and a slope instead of k_w_in_place (see rest_rate, snap_command);
+        # 0 = the gain, as on the competition rovers. v_breakaway: below it the rover does not move.
+        self.declare_parameter('w_rest_deadband', 0.0)
+        self.declare_parameter('w_rest_slope', 1.0)
+        self.declare_parameter('v_breakaway', 0.15)
         # Smith predictor (see module docstring, 5); 0 publishes rover_pred = rover_leg
         self.declare_parameter('predict_delay_s', 1.3)
         self.declare_parameter('k_v', 1.11)
@@ -381,7 +407,7 @@ class Nav2RouteFollower(Node):
             vin, win, source = 0.0, self._turning * g('turn_rate'), 'turn-in-place'
         v, w = snap_command(vin, win, g('v_floor'), g('v_stop'), g('w_floor'),
                             k_w_moving=self._k_w['moving'], k_w_in_place=self._k_w['in_place'],
-                            w_max=g('w_max'))
+                            w_max=g('w_max'), rest_deadband=g('w_rest_deadband'), rest_slope=g('w_rest_slope'))
         if not self._enabled:
             v, w = 0.0, 0.0
         out = Twist()
@@ -428,7 +454,8 @@ class Nav2RouteFollower(Node):
         d = float(g('predict_delay_s'))
         if d > 0.0 and not placeholder:
             x, y, yaw = predict_pose(x, y, yaw, self._sent, self._now(), d, float(g('k_v')),
-                                     self._k_w['moving'], self._k_w['in_place'])
+                                     self._k_w['moving'], self._k_w['in_place'], float(g('v_breakaway')),
+                                     float(g('w_rest_deadband')), float(g('w_rest_slope')))
         if not placeholder:
             self._pred = (x, y, yaw)
         out = TransformStamped()
@@ -444,9 +471,12 @@ class Nav2RouteFollower(Node):
         od.pose.pose.orientation = out.transform.rotation
         if self._sent:
             _t, vc, wc = self._sent[-1]
-            vr = float(g('k_v')) * vc if abs(vc) >= 0.15 else 0.0
+            vr = float(g('k_v')) * vc if abs(vc) >= float(g('v_breakaway')) else 0.0
             od.twist.twist.linear.x = float(vr)
-            od.twist.twist.angular.z = float((self._k_w['moving'] if vr else self._k_w['in_place']) * wc)
+            if not vr and float(g('w_rest_deadband')) > 0.0:
+                od.twist.twist.angular.z = float(rest_rate(wc, float(g('w_rest_deadband')), float(g('w_rest_slope'))))
+            else:
+                od.twist.twist.angular.z = float((self._k_w['moving'] if vr else self._k_w['in_place']) * wc)
         self._odom_pub.publish(od)
 
     # -- learned yaw gain and turn-in-place ---------------------------------
@@ -465,6 +495,8 @@ class Nav2RouteFollower(Node):
                          float(g('k_w_window_s')), float(g('v_floor')) * 0.8)
         lo, hi = [float(b) for b in g('k_w_bounds')]
         for state, (ratio, n) in k.items():
+            if state == 'in_place' and float(g('w_rest_deadband')) > 0.0:
+                continue                # not a gain on this unit (rest_rate): nothing to learn here
             if n >= int(g('k_w_min_samples')) and np.isfinite(ratio):
                 new = min(hi, max(lo, ratio))
                 if abs(new - self._k_w[state]) > 0.1:

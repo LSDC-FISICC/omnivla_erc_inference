@@ -7,7 +7,9 @@ target:=plants:
     erc_localization  localization_local: wheels + gyro -> /erc/odometry/local (no GPS)
     erc_perception    free_space_node (UniDepthV2) -> /erc/free_space, the map's input;
                       object_detector_node (YOLO26, 'potted plant') -> /erc/objects
-    erc_inference     carrot_controller_node at 0.25 m/s, turning in place from 45 deg
+    erc_inference     carrot_controller_node at 0.25 m/s, turning in place from 30 deg -- or, with
+                      controller:=mppi, Nav2's MPPI on the mission's route (controller_server,
+                      its local costmap from the profile, nav2_route_follower_node)
                       local_map_node: /erc/local_map (+ /objects, /path), the map and the plants
                       on it as the rover would build them, to look at before anything drives
 
@@ -17,7 +19,7 @@ Then, in its own terminal -- it is the only writer of /cmd_vel, so Ctrl-C there 
     ros2 action send_goal --feedback /start_mission erc_inference_msgs/action/StartMission \\
         "{resume_from_latest_scanned: false}"
 
-Arguments: record:=true (a rosbag of the run, rosbags/mission_<time>_macetas),
+Arguments: controller:=carrot|mppi (default carrot), record:=true (a rosbag of the run, rosbags/mission_<time>_macetas),
 local_map:=true|false (default true), debug_images:=true|false (default true: the frame with the ground and the obstacle
 band, and the model's distance, as JPEGs; the YOLO26 boxes are always published),
 foxglove:=true|false (default false: also start foxglove_bridge on 127.0.0.1:foxglove_port,
@@ -36,7 +38,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription, LogInfo
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
@@ -45,7 +47,9 @@ def generate_launch_description():
     share = get_package_share_directory('erc_inference')
     stack = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(os.path.join(share, 'launch', 'mission_indoor.launch.py')),
-        launch_arguments={'mission': 'images', 'model': 'none', 'target': 'plants',
+        launch_arguments={'mission': 'images', 'target': 'plants',
+                          'model': PythonExpression(["'mppi' if '", LaunchConfiguration('controller'),
+                                                     "' == 'mppi' else 'none'"]),
                           'depth_backend': LaunchConfiguration('depth_backend'),
                           'yolo_conf': LaunchConfiguration('yolo_conf'),
                           # Turning in place from 30 deg, not 45: on this rover turning WHILE driving is the
@@ -80,6 +84,9 @@ def generate_launch_description():
         '  and  ros2 action send_goal --feedback /start_mission erc_inference_msgs/action/StartMission '
         '"{resume_from_latest_scanned: false}"'))
     return LaunchDescription([
+        DeclareLaunchArgument('controller', default_value='carrot',
+                              description="what follows the mission's route: 'carrot' (carrot_controller_node) or "
+                                          "'mppi' (Nav2 MPPI; in simulation only so far)"),
         DeclareLaunchArgument('debug_images', default_value='true',
                               description='free_space_node also publishes /erc/perception/{overlay,depth}/compressed'),
         DeclareLaunchArgument('depth_backend', default_value='unidepth',

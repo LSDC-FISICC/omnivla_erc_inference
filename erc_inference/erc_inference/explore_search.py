@@ -19,6 +19,21 @@ through the same interface as LoopPatrolMission.
   DONE     as many objects shown as there are goals (or patrol.max_shows), or nothing left to
            explore (stop_when_explored).
 
+Driving past and counting (forward_first + count_on_sight, look_around off; what mission_plants
+runs since 12-oct): the rover never turns to search and never goes to an object.
+  * forward_first: while the profile shows an open way ahead that leads to ground not seen yet,
+    the route is a straight line into the middle of that opening, rebuilt every second from
+    the profile alone. The map is not asked: on the first real run two people walking up the
+    corridor were written into it as a wall across the corridor, the route to a plant 5 m
+    ahead went round the back (+149 deg), and the rover spent the run turning within 1.7 m of
+    its start (rosbags/mission_1012_1429_macetas). Only with no such opening do the frontiers
+    and A* above decide.
+  * count_on_sight: an object counts when the rover comes within count_m of its track, as it
+    drives by. Never one within same_class_apart_m of one already counted.
+  * look_around off: with nowhere to go the rover stands still; after half of explored_after_s
+    the map is started again (the rover may be boxed in by its own drifted map), and
+    explored_after_s of standing ends the mission.
+
 What it does not have, and what follows from that:
   * No drift correction. The map and the pose drift together, so what is near the rover is
     consistent with what it sees, but a place mapped long ago is displaced when the rover
@@ -53,6 +68,7 @@ DEFAULTS = dict(
     frontier_reach_m=0.8,       # this close to the frontier it is reached
     frontier_timeout_s=90.0,    # a frontier not reached in this long is dropped
     frontier_candidates=8,      # frontiers tried with A*, best first, near and then far
+    frontier_free_logodds=-0.79,    # ground counts as free for frontiers at this evidence: two free profiles
     frontier_spacing_m=1.5,     # one tried (reached or failed) is not picked again this close...
     frontier_memory_s=180.0,    # ...for this long
     goto_angles_deg=(0.0, 35.0, -35.0, 70.0, -70.0, 110.0, -110.0, 180.0),   # standoff points tried
@@ -72,7 +88,33 @@ DEFAULTS = dict(
                                 # frontier behind it takes > 12 s to face at that turn rate with the command
                                 # delay, and read as "stuck" with nothing ahead (ROS e2e, 9-oct). Only for
     stuck_turn_grace_s=30.0,    # this long: a turn that never ends is being stuck too
+    # driving past and counting (see the module docstring)
+    count_on_sight=False,       # an object counts when the rover is within count_m of it; no GOTO, no SHOW
+    count_m=2.0,
+    count_min_sightings=8,      # ...and seen this many times: a track of 3-5 sightings is a piece of another,
+                                # split off while the rover turned -- one plant was counted twice, 1.9 m apart,
+                                # as #4 (25 sightings) and #5 (3) (ROS e2e with MPPI, 12-oct)
+    forward_first=False,        # an open way ahead, leading to unseen ground, is taken before any frontier
+    forward_fov_deg=40.0,       # looked for within this bearing (the map's limit too: the periphery is not trusted)
+    forward_open_m=2.0,         # a bin is open when the profile reports nothing nearer
+    forward_min_width_m=0.9,    # an opening is this wide at forward_open_m, or it is not one
+    forward_clear_m=0.0,        # > 0: ...and nothing the whole profile reports within this of the straight line
+                                # into it. OFF: tried at 0.35 because the rover rubbed a pot beside the opening
+                                # (ROS e2e) -- it rubbed it all the same, and in explore_search_sim --count the
+                                # seeds 1, 3 and 6 went from 5, 2, 9 touches to 19, 12, 9 and took twice as long
+                                # (the map decides more often, and its routes turn more). 0.2 changed nothing.
+    forward_reach_m=2.5,        # the straight route ends this far ahead, and 0.5 m short of what is seen there
+    forward_every_s=1.0,        # rebuilt this often
+    forward_grace_s=2.0,        # ...and kept this much longer when a profile shows no opening
+    forward_max_turn_dps=20.0,  # not while the heading moves faster: the profile is ~0.4 s old
+    forward_unseen_within_m=6.0,    # "leads to unseen ground": an unseen cell this near along it, before a wall
+    forward_hold_s=15.0,        # after being stuck or tilted the map decides for this long (it holds the mark)
+    forward_profile_age_s=1.5,
+    look_around=True,           # False: no turning in place to look for a way on
+    explored_after_s=20.0,      # look_around off: nowhere to go for this long = explored (people move away)
 )
+
+FORWARD = 'forward'             # a route kind, not a state: the state is EXPLORE
 
 
 class ExploreSearchMission:
@@ -115,6 +157,12 @@ class ExploreSearchMission:
         self._trail = []
         self._turning_since = None
         self._last_profile = None
+        self._profile_t = -math.inf
+        self._fwd_dir = None             # (t, world angle) of the last forward route
+        self._fwd_hold_until = -math.inf
+        self._nothing_since = None       # since when there has been nowhere to go (look_around off)
+        self._pick_t = -math.inf
+        self._map_reset = False
         self._last_check = -math.inf
         self._backoff_until = None
         self._stuck_at = []              # (t, x, y) of recent stuck events
@@ -169,6 +217,7 @@ class ExploreSearchMission:
     def observe_scan(self, t, x, y, yaw, bearings_deg, ranges, hit):
         b, r, h = np.asarray(bearings_deg, float), np.asarray(ranges, float), np.asarray(hit, bool)
         self._last_profile = (b, r, h)
+        self._profile_t = t
         self.map.odometer = self.odometer
         self.replanner.observe(t, x, y, yaw, b, r, h)
 
@@ -218,6 +267,7 @@ class ExploreSearchMission:
         self._stuck_at = [e for e in self._stuck_at if t - e[0] <= p['stuck_memory_s']]
         here = sum(math.hypot(e[1] - x, e[2] - y) <= p['stuck_same_m'] for e in self._stuck_at)
         self._stuck_at.append((t, x, y))
+        self._fwd_hold_until = t + p['forward_hold_s']
         mark = why.startswith('tilt') or here >= 1 or (ahead is not None and ahead < p['stuck_mark_to_m'] + 0.1)
         if mark:
             m = self.map
@@ -350,7 +400,11 @@ class ExploreSearchMission:
         by A*, a handful of those hid every real one and the mission ended "explored" with a room
         never entered (explore_search_sim seed 4, 9-oct)."""
         m = self.map
-        passable = m.seen & (m.L < 0.0) & (m.distance() > m.p['inflate_m'])
+        # free on two profiles at least: a ray that slips past a wall leaves its cells free ONCE, and
+        # while that wall has been hit only once it is not yet a wall in the map. The frontier behind
+        # it was then "reachable": 2.9 m, through the south wall of the first corridor, and with the
+        # rover committed to it (_committed) it drove at the wall (ROS e2e with MPPI, 12-oct).
+        passable = m.seen & (m.L <= self.p['frontier_free_logodds']) & (m.distance() > m.p['inflate_m'])
         labels, n = ndimage.label(passable, structure=np.ones((3, 3), bool))
         if n == 0:
             return np.zeros(0), np.zeros(0)
@@ -419,6 +473,143 @@ class ExploreSearchMission:
         r, c = int(r), int(c)
         return 'reached' if self.map.seen[max(r - 1, 0):r + 2, max(c - 1, 0):c + 2].all() else None
 
+    # -- driving past and counting -------------------------------------------------
+
+    def _opening(self, yaw):
+        """The open way ahead in the last profile: (bearing_deg of its middle, free range there),
+        or None. An opening is a run of bins within forward_fov_deg that all report nothing nearer
+        than forward_open_m, at least forward_min_width_m wide at that distance; of several, the
+        one nearest the direction the rover was already taking (straight ahead at first)."""
+        p = self.p
+        b_all, r_all, h_all = self._last_profile
+        k = np.abs(b_all) <= p['forward_fov_deg']
+        if k.sum() < 2:
+            return None
+        order = np.argsort(b_all[k])
+        b, r = b_all[k][order], r_all[k][order]
+        step = float(np.median(np.diff(b)))
+        need = math.degrees(2.0 * math.atan(0.5 * p['forward_min_width_m'] / p['forward_open_m']))
+        want = 0.0 if self._fwd_dir is None else math.degrees(_wrap(self._fwd_dir[1] - yaw))
+
+        def clear(aim, reach):
+            # nothing the WHOLE profile reports within forward_clear_m of the straight line (a pot
+            # just outside the opening, 0.8 m away at 14 deg, is 0.2 m from it). See forward_clear_m.
+            d = np.radians(b_all - aim)
+            along, across = r_all * np.cos(d), np.abs(r_all * np.sin(d))
+            return not (h_all & (along > 0.0) & (along < reach + 0.3) & (across < p['forward_clear_m'])).any()
+
+        best = None
+        i, n = 0, len(b)
+        while i < n:
+            if r[i] < p['forward_open_m']:
+                i += 1
+                continue
+            j = i
+            while j + 1 < n and r[j + 1] >= p['forward_open_m']:
+                j += 1
+            if b[j] - b[i] + step >= need:
+                mid = 0.5 * (b[i] + b[j])
+                reach = max(1.0, min(p['forward_reach_m'], float(r[i:j + 1].min()) - 0.5))
+                # the middle of the opening, or the nearest direction to it that is clear and still
+                # has half the needed width to each edge
+                lo, hi = b[i] - 0.5 * step + 0.5 * need, b[j] + 0.5 * step - 0.5 * need
+                cands = sorted([mid] + [float(c) for c in b[i:j + 1] if lo <= c <= hi], key=lambda c: abs(c - mid))
+                aim = next((c for c in cands if clear(c, reach)), None)
+                if aim is not None and (best is None or abs(aim - want) < abs(best[0] - want)):
+                    best = (float(aim), float(r[i:j + 1].min()))
+            i = j + 1
+        return best
+
+    def _leads_to_unseen(self, x, y, ang, clear_to):
+        """True when, going from (x, y) along ang, ground the camera has not looked at comes before
+        a wall of the map. What the profile shows free right now (clear_to) is not asked of the map:
+        a person who walked through is still in it for a couple of seconds."""
+        m = self.map
+        d = np.arange(0.4, self.p['forward_unseen_within_m'] + 1e-9, 0.5 * m.p['resolution_m'])
+        rows, cols = m.cell(x + d * math.cos(ang), y + d * math.sin(ang))
+        ok = m._inside(rows, cols)
+        if not ok.any():
+            return False
+        d, rows, cols = d[ok], rows[ok], cols[ok]
+        unseen = ~m.seen[rows, cols]
+        wall = (m.L[rows, cols] >= m.p['occupied_logodds']) & (d > clear_to)
+        if not unseen.any():
+            return False
+        first = int(np.argmax(unseen))
+        return not wall[:first].any()
+
+    def _committed(self, x, y):
+        """True while the rover is on its way to a frontier the map chose and that frontier is still
+        one. The way ahead does not take over then: with both deciding, each for a second or two --
+        an opening that leads to a pocket of unseen ground, a frontier 12 m back at -95 deg, the
+        opening again -- the rover turned one way and the other against a wall (explore_search_sim
+        --count seed 2: 1100 touches in 25 minutes)."""
+        f = self.frontier
+        if f is None or self._route_kind != EXPLORE:
+            return False
+        if math.hypot(f[0] - x, f[1] - y) <= self.p['frontier_reach_m'] or float(self.cum[-1]) - self.s_proj < 0.3:
+            return False
+        r, c = (int(v) for v in self.map.cell(f[0], f[1]))
+        return not self.map.seen[max(r - 1, 0):r + 2, max(c - 1, 0):c + 2].all()
+
+    def _forward(self, t, x, y, yaw):
+        """Keep, or rebuild, the straight route into the open way ahead. -> True while there is one."""
+        p = self.p
+        if t < self._fwd_hold_until or self._last_profile is None:
+            return False
+        if self._route_kind == FORWARD and t - self._route_t < p['forward_every_s']:
+            return True
+        # One profile without the opening does not end it: the route in force was drawn over ground
+        # seen free, and forward_grace_s of it is half a metre.
+        keep = (self._route_kind == FORWARD and t - self._route_t < p['forward_every_s'] + p['forward_grace_s']
+                and float(self.cum[-1]) - self.s_proj > 0.8)
+        if t - self._profile_t > p['forward_profile_age_s']:
+            return False
+        if self.turn_rate_dps() > p['forward_max_turn_dps']:
+            return self._route_kind == FORWARD      # mid-turn: the route it has, until the profile can be used
+        got = self._opening(yaw)
+        if got is None:
+            return keep
+        ang = yaw + math.radians(got[0])
+        if self._fwd_dir is not None and t - self._fwd_dir[0] < 3.0:
+            turn = _wrap(ang - self._fwd_dir[1])
+            if abs(turn) < math.radians(40.0):          # half-way each second: one odd profile does not swing it
+                ang = self._fwd_dir[1] + 0.5 * turn
+        if not self._leads_to_unseen(x, y, ang, got[1]):
+            return keep
+        reach = max(1.0, min(p['forward_reach_m'], got[1] - 0.5))
+        if self._route_kind != FORWARD:
+            self.notes.append(f'{t:.1f} open ahead ({got[0]:+.0f} deg, {got[1]:.1f} m): driving on')
+        self._fwd_dir = (t, ang)
+        self.frontier = None
+        self._set_route([(x, y), (x + reach * math.cos(ang), y + reach * math.sin(ang))], FORWARD, t)
+        return True
+
+    def _count(self, t, x, y):
+        """count_on_sight: every confirmed object the rover is now within count_m of counts, once."""
+        p = self.p
+        for c in list(self.cones.clusters):
+            if c.visited or not c.confirmed or self.index >= self.n_shows or len(c.points) < p['count_min_sightings']:
+                continue
+            e = c.live(t, p['live_s'])
+            e = c.estimate() if e is None else e
+            d = math.hypot(e[0] - x, e[1] - y)
+            if d > p['count_m']:
+                continue
+            dup = next((v for v in self.cones.clusters if v is not c and v.visited and v.name.startswith('cone')
+                        and v.cls == c.cls
+                        and float(np.hypot(*(v.estimate() - c.estimate()))) <= p['same_class_apart_m']), None)
+            c.visited = True
+            if dup is not None:
+                c.name = 'duplicate'
+                self.notes.append(f'{t:.1f} the {c.cls} #{c.id} at ({e[0]:.1f},{e[1]:.1f}) is #{dup.id}, '
+                                  f'already counted: not again')
+                continue
+            self.index += 1
+            c.name = f'cone{self.index}'
+            self.notes.append(f'{t:.1f} {c.cls} {self.index}/{self.n_shows} counted: #{c.id} at ({e[0]:.1f},{e[1]:.1f}), '
+                              f'{d:.1f} m away, {len(c.points)} sightings')
+
     # -- scans -------------------------------------------------------------------
 
     def _scan_step(self, t, yaw, rate):
@@ -470,7 +661,17 @@ class ExploreSearchMission:
         if self.target is not None and self.target not in self.cones.clusters:
             self.target = None               # merged into another track, or forgotten
             self._route_kind = None
-        if self.target is None:
+            if self.state in (SHOW, ARRIVED):
+                # ...while it was being shown: nothing was shown. Left as it was, the hold ran out,
+                # the caller confirmed "it" and one more object was counted with no object there
+                # (explore_search_sim seed 2 crashed on it; the node would have counted it)
+                self.state = EXPLORE
+        if p['count_on_sight']:
+            self._count(t, x, y)
+            if self.done:
+                self.notes.append(f'{t:.1f} {self.index}/{self.n_shows} objects counted')
+                return Step(None, (0.0, 0.0), False, DONE, 'mission complete')
+        elif self.target is None:
             shown = [c for c in self.cones.clusters if c.visited and c.name.startswith('cone')]
 
             def fresh(c):
@@ -498,6 +699,8 @@ class ExploreSearchMission:
                 self.target.visited, self.target.name = True, 'duplicate'
                 self.target = None
                 self._route_kind = None
+        if self.target is None and self.state in (SHOW, ARRIVED):
+            self.state = EXPLORE             # what was being shown turned out to be one already shown
         if self.target is not None:
             # Far away the position is every sighting fused; the last few seconds alone (a handful of
             # ranges, each good to ~12%) move it by a metre and the route with it. Close up, what is
@@ -557,8 +760,13 @@ class ExploreSearchMission:
                     self.state = EXPLORE
                     self._route_kind = None
                     return Step(None, (0.0, 0.0), False, EXPLORE, 'no path to the object')
+        elif p['forward_first'] and not self._committed(x, y) and self._forward(t, x, y, yaw):
+            self.state = EXPLORE
+            self._nothing_since = None
         else:
             self.state = EXPLORE
+            if self._route_kind == FORWARD:      # the way ahead closed: the map decides
+                self._route_kind = None
             if self._route_kind == EXPLORE and self._route_blocked(t):
                 path = self.map.plan((x, y), self.frontier)       # another way to the same frontier
                 if path is not None and len(path) >= 2:
@@ -574,7 +782,44 @@ class ExploreSearchMission:
                 # the rover stood "looking around" for minutes with frontiers 3 m ahead (sim, 9-oct)
                 if how == 'failed' and self.frontier is not None:
                     self._tried.append((t, *self.frontier))
-                if not self._pick_frontier(t, x, y, yaw):
+                if self._nothing_since is not None and t - self._pick_t < 1.0:
+                    return Step(None, (0.0, 0.0), False, EXPLORE, 'no way on')     # A* once a second, not every tick
+                self._pick_t = t
+                if self._pick_frontier(t, x, y, yaw):
+                    self._nothing_since = None
+                    self.notes.append(f'{t:.1f} frontier at ({self.frontier[0]:.1f},{self.frontier[1]:.1f}): '
+                                      f'{float(self.cum[-1]):.1f} m, starts {self._first_leg_deg(x, y, yaw):+.0f} deg '
+                                      f'from the heading')
+                elif not p['look_around']:
+                    # Nowhere to go from what has been seen, and no turning to look for more: stand
+                    # still. Whoever stands in the way may move; half-way through, the frontiers
+                    # given up are tried again; explored_after_s of this is "explored".
+                    if self._nothing_since is None:
+                        self._nothing_since = t
+                        self._map_reset = False
+                        self.notes.append(f'{t:.1f} no way on from here: waiting')
+                    waited = t - self._nothing_since
+                    if not self._map_reset and waited > 0.5 * p['explored_after_s']:
+                        # Half-way through: the map is started again. With frontiers on it and a path to
+                        # none of them, the rover is standing inside a wall of its own map -- one drawn
+                        # on the way out, the pose having drifted since (explore_search_sim --count
+                        # seed 0: 41 frontiers, no path to any, mission ended with half the floor unseen).
+                        # What it has counted stays counted.
+                        self._map_reset = True
+                        self._tried = []
+                        m = self.map
+                        m.L[:] = 0.0
+                        m.seen[:] = False
+                        m.travel[:] = -np.inf
+                        m._dist = None
+                        self._fwd_hold_until = -math.inf
+                        self.notes.append(f'{t:.1f} still no way on: the map is started again')
+                    if waited >= p['explored_after_s'] and self.replanner.scans > 0 and p['stop_when_explored']:
+                        self.explored = True
+                        self.notes.append(f'{t:.1f} nothing left to explore: {self.index}/{self.n_shows} objects')
+                        return Step(None, (0.0, 0.0), False, DONE, 'explored')
+                    return Step(None, (0.0, 0.0), False, EXPLORE, 'no way on')
+                else:
                     here = np.array([x, y])
                     if self._scanned_at is None or np.hypot(*(here - self._scanned_at)) > 1.0:
                         # nothing in reach from what this heading showed: look around once

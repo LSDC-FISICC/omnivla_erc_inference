@@ -56,12 +56,13 @@ import yaml
 
 import rclpy
 from ament_index_python.packages import get_package_share_directory
-from geometry_msgs.msg import Twist
-from nav_msgs.msg import OccupancyGrid, Odometry
+from geometry_msgs.msg import PoseStamped, TransformStamped, Twist
+from nav_msgs.msg import OccupancyGrid, Odometry, Path
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from sensor_msgs.msg import Imu, LaserScan
 from std_msgs.msg import Bool, String
+from tf2_ros import TransformBroadcaster
 from visualization_msgs.msg import MarkerArray
 
 from erc_inference_msgs.action import StartMission
@@ -69,7 +70,7 @@ from erc_inference_msgs.action import StartMission
 from erc_inference.explore_search import DEFAULTS as EXPLORE_DEFAULTS
 from erc_inference.explore_search import ExploreSearchMission
 from erc_inference.image_goal_mission import Goal
-from erc_inference.indoor_mission_node import IndoorMissionNode, yaw_from_quaternion
+from erc_inference.indoor_mission_node import LATCHED_QOS, IndoorMissionNode, yaw_from_quaternion
 from erc_inference.indoor_track import Pose2D, anchor
 from erc_inference.loop_patrol import DEFAULTS as PATROL_DEFAULTS
 from erc_inference.loop_patrol import (LOCAL_INDOOR, PATROL_COMPETITION, SAFETY_INDOOR, KnownMap, LoopPatrolMission,
@@ -132,6 +133,14 @@ class ImageCheckpointControllerNode(IndoorMissionNode):
         self.declare_parameter('explore_objects_topic', '/erc/explore/objects')
         self.declare_parameter('explore_map_rate_hz', 1.0)
         self.declare_parameter('odom_frame', 'odom')
+        # What Nav2's MPPI needs to drive this mission instead of the carrot (nav2_route_follower_node
+        # + config/nav2_mppi.yaml, mission_indoor.launch.py model:=mppi), under the names the outdoor
+        # stack already uses: TF leg_local -> rover_leg (the mission frame and the rover in it), the
+        # profile stamped in rover_leg, and the route the carrot is taken from as a Path. With the
+        # carrot driving nobody listens. Also TF odom -> leg_local, to look at both together.
+        self.declare_parameter('nav2_frames', False)
+        self.declare_parameter('nav2_route_topic', '/erc/local_route')
+        self.declare_parameter('nav2_scan_topic', '/erc/free_space_leg')
         for name, default in EXPLORE_DEFAULTS.items():
             self.declare_parameter(f'explore.{name}', list(default) if isinstance(default, tuple) else default)
         self.declare_parameter('free_space_topic', '/erc/free_space')
@@ -186,6 +195,11 @@ class ImageCheckpointControllerNode(IndoorMissionNode):
         self._map_pub = self.create_publisher(OccupancyGrid, self._param('explore_map_topic'), 1)
         self._objects_pub = self.create_publisher(MarkerArray, self._param('explore_objects_topic'), 1)
         self._last_map_pub = -1e9
+        self._nav2 = bool(self._param('nav2_frames'))
+        self._tf = TransformBroadcaster(self)
+        self._nav2_route_pub = self.create_publisher(Path, self._param('nav2_route_topic'), LATCHED_QOS)
+        self._nav2_scan_pub = self.create_publisher(LaserScan, self._param('nav2_scan_topic'), 10)
+        self._nav2_route = None
         if self._param('cones_topic'):
             self.create_subscription(String, self._param('cones_topic'), self._cones_callback, 10,
                                      callback_group=self._sensor_group)
@@ -234,6 +248,23 @@ class ImageCheckpointControllerNode(IndoorMissionNode):
                 self._pose_hist.popleft()
             self._odom_condition.notify_all()
         self._publish_pose(pose, msg.header.stamp)
+        if self._nav2:
+            tr = TransformStamped()
+            tr.header.stamp, tr.header.frame_id, tr.child_frame_id = msg.header.stamp, 'leg_local', 'rover_leg'
+            tr.transform.translation.x, tr.transform.translation.y = float(pose.x), float(pose.y)
+            tr.transform.rotation.z, tr.transform.rotation.w = math.sin(pose.yaw / 2), math.cos(pose.yaw / 2)
+            # ...and where the mission frame is in the odometry frame, so that the route, MPPI's
+            # costmap and its trajectory can be looked at on the same picture as the map (odom)
+            with self._lock:
+                o = self._track_from_odom.inverse() if self._track_from_odom is not None else None
+            if o is None:
+                self._tf.sendTransform(tr)
+                return
+            to = TransformStamped()
+            to.header.stamp, to.header.frame_id, to.child_frame_id = msg.header.stamp, self._param('odom_frame'), 'leg_local'
+            to.transform.translation.x, to.transform.translation.y = float(o.x), float(o.y)
+            to.transform.rotation.z, to.transform.rotation.w = math.sin(o.yaw / 2), math.cos(o.yaw / 2)
+            self._tf.sendTransform([to, tr])
 
     def _ros_s(self):
         return self.get_clock().now().nanoseconds * 1e-9
@@ -264,6 +295,12 @@ class ImageCheckpointControllerNode(IndoorMissionNode):
     # -- perception ---------------------------------------------------------
 
     def _scan_callback(self, msg: LaserScan):
+        if self._nav2:
+            leg = LaserScan()
+            leg.header.stamp, leg.header.frame_id = msg.header.stamp, 'rover_leg'
+            leg.angle_min, leg.angle_max, leg.angle_increment = msg.angle_min, msg.angle_max, msg.angle_increment
+            leg.range_min, leg.range_max, leg.ranges = msg.range_min, msg.range_max, msg.ranges
+            self._nav2_scan_pub.publish(leg)
         r = np.asarray(msg.ranges, float)
         b = np.degrees(msg.angle_min + np.arange(len(r)) * msg.angle_increment)
         hit = np.isfinite(r) & (r < msg.range_max - 0.05)
@@ -336,6 +373,8 @@ class ImageCheckpointControllerNode(IndoorMissionNode):
     def _attitude_callback(self, msg: Imu):
         q = msg.orientation
         self.envelope.observe_attitude(self._now(), q.x, q.y, q.z, q.w)
+        a = msg.linear_acceleration                 # the filter passes the accelerometer through
+        self.envelope.observe_accel(self._now(), a.x, a.y, a.z)
 
     # -- output: override, then the safety envelope, then the shaper -------
 
@@ -390,6 +429,24 @@ class ImageCheckpointControllerNode(IndoorMissionNode):
         self._use_satellite_pub.publish(Bool(data=False))
         self._use_image_pub.publish(Bool(data=False))
         self._use_lan_pub.publish(Bool(data=False))
+
+    def _publish_nav2_route(self, route):
+        """The route the carrot is taken from, for MPPI: once per route, not per tick."""
+        if not self._nav2 or route is None or len(route) < 2:
+            return
+        key = (len(route), tuple(np.round(np.asarray(route, float)[[0, -1]].ravel(), 3)))
+        if key == self._nav2_route:
+            return
+        self._nav2_route = key
+        path = Path()
+        path.header.stamp, path.header.frame_id = self.get_clock().now().to_msg(), 'leg_local'
+        for x, y in np.asarray(route, float)[:, :2]:
+            ps = PoseStamped()
+            ps.header = path.header
+            ps.pose.position.x, ps.pose.position.y = float(x), float(y)
+            ps.pose.orientation.w = 1.0
+            path.poses.append(ps)
+        self._nav2_route_pub.publish(path)
 
     # -- the explored map, to look at -------------------------------------------
 
@@ -594,6 +651,7 @@ class ImageCheckpointControllerNode(IndoorMissionNode):
                     self._override = step.command
                 if step.carrot is not None:
                     self._publish_carrot(*step.carrot)
+                    self._publish_nav2_route(step.route)
                 target = m.target.estimate() if m.target is not None else None
                 dist = math.hypot(target[0] - pose.x, target[1] - pose.y) if target is not None else -1.0
                 self._feedback(goal_handle, g.sequence, dist, f'{step.state} {g.name}')

@@ -26,7 +26,14 @@ The rover must stand next to the orange Start cone, facing east along the south 
 mission:=track -- the older indoor_mission_node (checkpoint coordinates from the track file,
 dead reckoning only); run `ros2 run erc_inference indoor_mission_node` instead.
 
-Arguments: mission:=images|track, model:=none|edge|original, perception:=false|true
+model:=mppi -- Nav2's MPPI drives instead of the carrot (controller_server + its local costmap
+from the profile, and nav2_route_follower_node, as in mission_nav2.launch.py), with this unit's
+measured dynamics (config/rover_dynamics.yaml) in the follower's predictor. The mission node must
+then run with -p nav2_frames:=true (plants_controller.launch.py does): it publishes the route, the
+TF leg_local -> rover_leg and the profile in rover_leg that MPPI works in. In simulation only so
+far (rover_simulation/e2e/run_e2e_plants.sh with CONTROLLER=mppi).
+
+Arguments: mission:=images|track, model:=none|mppi|edge|original, perception:=false|true
 (forced on with mission:=images), depth_backend:=unidepth|da3, cone_height_m:=0.23.
 target:=cones|plants: with plants, object_detector_node (YOLO26) runs instead of the cone
 detector and the mission node is started as the search mission (see `plants` below).
@@ -36,6 +43,7 @@ LIVE operation only; it starts the SDK bridge.
 
 import os
 
+import yaml
 from ament_index_python.packages import get_package_prefix, get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription,
@@ -45,6 +53,8 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import EqualsSubstitution, LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
+
+from erc_inference.nav2_indoor import indoor_params_file
 
 # Must match indoor_mission_node's fix_topic / heading_topic defaults.
 INDOOR_FIX_TOPIC = '/erc/indoor/fix'
@@ -60,8 +70,8 @@ def generate_launch_description():
                               description="'images': image_checkpoint_controller_node (the NYU mission: cone "
                                           "images, known corridors); 'track': indoor_mission_node (track file)"),
         DeclareLaunchArgument('model', default_value='none',
-                              description="'none': carrot_controller_node (no model); 'edge' (OmniVLA-edge) or "
-                                          "'original' (OmniVLA 7B)"),
+                              description="'none': carrot_controller_node (no model); 'mppi': Nav2 MPPI on the "
+                                          "mission's route; 'edge' (OmniVLA-edge) or 'original' (OmniVLA 7B)"),
         DeclareLaunchArgument('perception', default_value='false',
                               description='run erc_perception free_space_node; forced on with mission:=images'),
         DeclareLaunchArgument('depth_backend', default_value='unidepth',
@@ -119,6 +129,37 @@ def generate_launch_description():
                        condition=IfCondition(EqualsSubstitution(LaunchConfiguration('model'), 'original'))),
     ]
 
+    # Nav2's MPPI instead of the carrot. The follower's predictor and command snapping take the
+    # unit's measured dynamics: the delay as one lag (dead time + the mean of the two time
+    # constants: what a steady command takes to show), the speed gain, and the turn gains at the
+    # speed it will be asked (moving: k_w0 + k_w1 * 0.25; in place: the dead zone and the slope,
+    # which no single gain stands for). k_w_auto then follows the moving gain, within [0.2, 2.0].
+    share = get_package_share_directory('erc_inference')
+    nav2_yaml = indoor_params_file(os.path.join(share, 'config', 'nav2_mppi.yaml'))     # see nav2_indoor.py
+    with open(os.path.join(share, 'config', 'rover_dynamics.yaml')) as fh:
+        dyn = yaml.safe_load(fh)
+    is_mppi = IfCondition(EqualsSubstitution(LaunchConfiguration('model'), 'mppi'))
+    mppi = [
+        Node(package='nav2_controller', executable='controller_server', name='controller_server',
+             output='screen', parameters=[nav2_yaml],
+             remappings=[('cmd_vel', '/nav2/cmd_vel')], condition=is_mppi),
+        Node(package='nav2_lifecycle_manager', executable='lifecycle_manager',
+             name='lifecycle_manager_mppi', output='screen', parameters=[nav2_yaml], condition=is_mppi),
+        Node(package='erc_inference', executable='nav2_route_follower_node', name='nav2_route_follower_node',
+             output='screen', condition=is_mppi,
+             parameters=[{
+                 'predict_delay_s': round(dyn['dead_time_s'] + 0.5 * (dyn['tau_v_s'] + dyn['tau_w_s']), 2),
+                 'k_v': float(dyn['k_v']),
+                 'k_w_moving': round(dyn['k_w0'] + dyn['k_w1'] * 0.25, 2),
+                 'w_rest_deadband': float(dyn['w_rest_deadband']),
+                 'w_rest_slope': float(dyn['w_rest_slope']),
+                 'v_breakaway': max(0.05, float(dyn['v_floor'])),
+                 # the mission node's envelope stops anything slower (min_moving_linear_vel). The turn in
+                 # place is the follower's own 50 / 20 deg, on the PREDICTED heading: with the carrot's
+                 # 30 / 10 it swung +-30 deg about the route and turned in place 43 % of the time (e2e)
+                 'v_floor': 0.25}]),
+    ]
+
     # No GPS wait inside, so no TimerAction as in the outdoor launches.
     localization = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -156,4 +197,4 @@ def generate_launch_description():
         '  and  ros2 action send_goal /start_mission erc_inference_msgs/action/StartMission '
         '"{resume_from_latest_scanned: false}"'))
 
-    return LaunchDescription(args + bridge + inference + [localization, perception, cones, plants, reminder])
+    return LaunchDescription(args + bridge + inference + mppi + [localization, perception, cones, plants, reminder])

@@ -51,12 +51,15 @@ if os.environ.get('PLANTS_XY'):          # "x,y;x,y;..." -- another arrangement,
     PLANTS = np.array([[float(v) for v in q.split(',')] for q in os.environ['PLANTS_XY'].split(';')])
 
 
-def run(seed, n_goals=3, t_max=1800.0, delay_s=1.0, wheel_scale=0.97, gyro_scale=1.03, record=False):
+def run(seed, n_goals=3, t_max=1800.0, delay_s=1.0, wheel_scale=0.97, gyro_scale=1.03, record=False, count=False):
     rng = np.random.default_rng(seed)
     walls = world()
     things = walls + [obs.Disc(tuple(p), PLANT_R) for p in PLANTS]
     kw = dict(PATROL_COMPETITION)
     kw['max_shows'] = 0
+    if count:                        # driving past and counting, as plants_controller.launch.py runs it
+        kw.update(start_scan=False, count_on_sight=True, forward_first=True, look_around=False,
+                  same_class_apart_m=1.5)
     m = ExploreSearchMission([Goal(f'Maceta{i + 1}', 'potted plant', i + 1) for i in range(n_goals)],
                              (0.0, 0.0), dict(LOCAL_INDOOR), **kw)
     x = y = th = 0.0                 # truth
@@ -84,10 +87,16 @@ def run(seed, n_goals=3, t_max=1800.0, delay_s=1.0, wheel_scale=0.97, gyro_scale
                 frame.append(('potted plant', rng.uniform(-45, 45), rng.uniform(1.5, 7.0)))
             m.observe_objects(ex, ey, eth, frame, t)
             step = m.update(t, ex, ey, eth, abs(w))
+            for c in m.cones.clusters:       # counted while driving past: which true plant, how far the rover is
+                if count and c.name.startswith('cone') and c.id not in {s[3] for s in shown}:
+                    which = int(np.hypot(*(PLANTS - c.estimate()).T).argmin())
+                    shown.append((round(t), round(float(np.hypot(*(PLANTS[which] - (x, y)))), 2), which, c.id,
+                                  round(float(np.hypot(*(PLANTS[which] - c.estimate()))), 2)))
             if step.arrived:
                 e = m.target.estimate()
                 which = int(np.hypot(*(PLANTS - e).T).argmin())          # the true plant this marker is
-                shown.append((round(t), round(float(np.hypot(*(PLANTS[which] - (x, y)))), 2), which))
+                shown.append((round(t), round(float(np.hypot(*(PLANTS[which] - (x, y)))), 2), which, m.target.id,
+                              round(float(np.hypot(*(PLANTS[which] - e))), 2)))
                 m.confirm(t, True)
                 cmd = (0.0, 0.0)
             elif step.command is not None:
@@ -113,7 +122,8 @@ def run(seed, n_goals=3, t_max=1800.0, delay_s=1.0, wheel_scale=0.97, gyro_scale
         if record and k % 10 == 0:
             trail.append((x, y, ex, ey))
     out = dict(seed=seed, done=m.done, explored=m.explored, shown=len(shown), t=round(t), hits=hits, stucks=m.stucks,
-               distinct=len({s[2] for s in shown}), show_dist=[s[1] for s in shown], objects=len(m.objects()),
+               distinct=len({s[2] for s in shown}), show_dist=[s[1] for s in shown],
+               mark_err=[s[4] for s in shown], objects=len(m.objects()),
                pose_err=round(math.hypot(ex - x, ey - y), 2))
     return (out, m, np.array(trail)) if record else out
 
@@ -149,14 +159,15 @@ def main():
     ap.add_argument('--goals', type=int, default=3)
     ap.add_argument('--delay', type=float, default=1.0)
     ap.add_argument('--plot', default='')
+    ap.add_argument('--count', action='store_true', help='drive past and count (no scans, no approach)')
     a = ap.parse_args()
     for seed in range(a.seeds):
         if a.plot and seed == 0:
-            out, m, trail = run(seed, a.goals, delay_s=a.delay, record=True)
+            out, m, trail = run(seed, a.goals, delay_s=a.delay, record=True, count=a.count)
             plot(m, trail, a.plot)
             print('\n'.join(m.notes[:60]))
         else:
-            out = run(seed, a.goals, delay_s=a.delay)
+            out = run(seed, a.goals, delay_s=a.delay, count=a.count)
         print(out)
 
 

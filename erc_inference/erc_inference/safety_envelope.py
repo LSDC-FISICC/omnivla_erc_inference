@@ -57,6 +57,16 @@ DEFAULTS = {
     'safety.max_tilt_deg': 15.0,
     'safety.tilt_resume_deg': 8.0,
     'safety.tilt_resume_s': 1.0,
+    # > 0: the attitude filter's tilt counts only while the accelerometer (the direction of its
+    # median over tilt_accel_window_s, against the same at arm()) shows at least this much, or
+    # while the filter reads twice max_tilt_deg; the accelerometer alone above max_tilt_deg is a
+    # tilt as well. The window must hold two telemetry bursts (5 samples every ~0.43 s): with 0.5 s
+    # one bump while reversing read 18 deg. On the team's own unit the filter
+    # read 15-17 deg three times while turning in place on a flat floor, the accelerometer 0.8 deg
+    # (mission_1012_1429_macetas). This rover accelerates at ~0.4 m/s2 at most: 2.4 deg of apparent
+    # tilt. 0: the filter alone, as in the competition.
+    'safety.tilt_accel_confirm_deg': 0.0,
+    'safety.tilt_accel_window_s': 1.0,
     'safety.attitude_timeout_s': 1.5,
     'safety.stop_if_attitude_stale': True,
     'safety.obstacle_enabled': False,
@@ -132,6 +142,10 @@ class SafetyEnvelope:
         self._tilted = False
         self._level_since: Optional[float] = None
         self.tilt_deg = 0.0
+        self.filter_tilt_deg = 0.0
+        self.accel_tilt_deg: Optional[float] = None
+        self._accel = []                # (t, ax, ay, az), the last few seconds
+        self._ref_accel: Optional[Tuple[float, float, float]] = None
         self._scan = None               # (t, bearings_deg, ranges, range_max)
         self._scan_seen = None          # t of the last profile counted
         self._blocked_n = 0
@@ -143,6 +157,7 @@ class SafetyEnvelope:
     def arm(self):
         """Take the current attitude as level. Call with the rover standing on the floor."""
         self._ref_up = self._att.up if self._att is not None else None
+        self._ref_accel = self._accel_now(self._accel[-1][0], 1.0) if self._accel else None
         self._tilted = False
         self._level_since = None
 
@@ -150,6 +165,20 @@ class SafetyEnvelope:
         self._att = _Attitude(up_in_body(qx, qy, qz, qw), t)
         if self._ref_up is None:
             self._ref_up = self._att.up
+
+    def observe_accel(self, t, ax, ay, az):
+        """The accelerometer (specific force, body frame): the second opinion on a tilt."""
+        if ax * ax + ay * ay + az * az < 1.0:       # an Imu message with no acceleration in it
+            return
+        self._accel = [a for a in self._accel if t - a[0] <= 5.0] + [(t, ax, ay, az)]
+        if self._ref_accel is None:
+            self._ref_accel = (ax, ay, az)
+
+    def _accel_now(self, now, window_s):
+        a = [v[1:] for v in self._accel if now - v[0] <= window_s]
+        if not a:
+            return None
+        return tuple(float(v) for v in np.median(np.array(a), axis=0))
 
     def observe_free_space(self, t, bearings_deg: Sequence[float], ranges: Sequence[float], range_max: float):
         self._scan = (t, list(bearings_deg), list(ranges), float(range_max))
@@ -163,7 +192,19 @@ class SafetyEnvelope:
             if p['safety.stop_if_attitude_stale']:
                 return True, 'attitude stale'
             return False, 'attitude stale, ignored'
-        self.tilt_deg = angle_between_deg(self._att.up, self._ref_up)
+        self.tilt_deg = self.filter_tilt_deg = angle_between_deg(self._att.up, self._ref_up)
+        confirm = p.get('safety.tilt_accel_confirm_deg', 0.0)
+        acc = self._accel_now(now, p.get('safety.tilt_accel_window_s', 1.0)) if confirm > 0.0 else None
+        self.accel_tilt_deg = None
+        if acc is not None and self._ref_accel is not None:
+            self.accel_tilt_deg = angle_between_deg(acc, self._ref_accel)
+            # the accelerometer agrees there is a tilt, or the filter reads twice the limit (the
+            # median takes ~1 s to follow, and a rover going over does not wait): the larger of the
+            # two. Otherwise the accelerometer's own.
+            if self.accel_tilt_deg >= confirm or self.filter_tilt_deg >= 2.0 * p['safety.max_tilt_deg']:
+                self.tilt_deg = max(self.filter_tilt_deg, self.accel_tilt_deg)
+            else:
+                self.tilt_deg = self.accel_tilt_deg
         if not self._tilted and self.tilt_deg > p['safety.max_tilt_deg']:
             self._tilted, self._level_since = True, None
         elif self._tilted:
