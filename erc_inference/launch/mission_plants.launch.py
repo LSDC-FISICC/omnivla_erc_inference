@@ -17,7 +17,8 @@ Then, in its own terminal -- it is the only writer of /cmd_vel, so Ctrl-C there 
     ros2 action send_goal --feedback /start_mission erc_inference_msgs/action/StartMission \\
         "{resume_from_latest_scanned: false}"
 
-Arguments: local_map:=true|false (default true), debug_images:=true|false (default true: the frame with the ground and the obstacle
+Arguments: record:=true (a rosbag of the run, rosbags/mission_<time>_macetas),
+local_map:=true|false (default true), debug_images:=true|false (default true: the frame with the ground and the obstacle
 band, and the model's distance, as JPEGs; the YOLO26 boxes are always published),
 foxglove:=true|false (default false: also start foxglove_bridge on 127.0.0.1:foxglove_port,
 8766 -- forward the port and open ws://localhost:8766 as "Foxglove WebSocket"; layout
@@ -28,6 +29,7 @@ confidence), depth_backend:=unidepth|da3.
 LIVE operation only; it starts the SDK bridge.
 """
 import os
+import time
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -66,6 +68,13 @@ def generate_launch_description():
     local_map = Node(package='erc_inference', executable='local_map_node', name='local_map_node', output='screen',
                      parameters=[{'map_forget_m': ParameterValue(LaunchConfiguration('map_forget_m'), value_type=float)}],
                      condition=IfCondition(LaunchConfiguration('local_map')))
+    # Everything but the raw camera images and the distance image (GBs a minute), in rosbags/.
+    # Started and closed by this launch, so Ctrl-C here closes the bag properly.
+    bag = ExecuteProcess(
+        cmd=['ros2', 'bag', 'record', '--all-topics',
+             '--exclude-regex', '/erc/(front|rear)_camera$|/erc/perception/distance$',
+             '-o', [LaunchConfiguration('bag_dir'), '/mission_', LaunchConfiguration('bag_name')]],
+        output='log', condition=IfCondition(LaunchConfiguration('record')))
     reminder = LogInfo(msg=(
         'mission_plants up. Then, in another terminal:  ros2 launch erc_inference plants_controller.launch.py'
         '  and  ros2 action send_goal --feedback /start_mission erc_inference_msgs/action/StartMission '
@@ -75,7 +84,7 @@ def generate_launch_description():
                               description='free_space_node also publishes /erc/perception/{overlay,depth}/compressed'),
         DeclareLaunchArgument('depth_backend', default_value='unidepth',
                               description="free_space_node depth model: 'unidepth' (UniDepthV2) or 'da3'"),
-        DeclareLaunchArgument('yolo_conf', default_value='0.35',
+        DeclareLaunchArgument('yolo_conf', default_value='0.5',
                               description='minimum confidence of a YOLO26 detection (raise it if it sees plants that are not)'),
         DeclareLaunchArgument('local_map', default_value='true',
                               description='also run local_map_node: /erc/local_map, the map with nobody driving'),
@@ -85,8 +94,12 @@ def generate_launch_description():
                               description='the carrot turns in place once the route is this far off the heading'),
         DeclareLaunchArgument('turn_exit_deg', default_value='10.0',
                               description='... and drives on again once it is within this'),
+        DeclareLaunchArgument('record', default_value='false',
+                              description='record a rosbag of the whole run (all but the raw images) in bag_dir'),
+        DeclareLaunchArgument('bag_dir', default_value=os.path.expanduser('~/lsdc/erc-omni-vla/rosbags')),
+        DeclareLaunchArgument('bag_name', default_value=time.strftime('%m%d_%H%M') + '_macetas'),
         DeclareLaunchArgument('foxglove', default_value='false',
                               description='also start foxglove_bridge (127.0.0.1 only)'),
         DeclareLaunchArgument('foxglove_port', default_value='8766'),
-        stack, local_map, foxglove, reminder,
+        stack, local_map, foxglove, bag, reminder,
     ])

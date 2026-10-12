@@ -60,6 +60,8 @@ DEFAULTS = dict(
     unreachable_s=60.0,         # an object with no path to any of them is left alone this long
     stop_when_explored=True,    # no frontier anywhere and no object pending: the mission ends
     route_clear_m=4.0,          # route length ahead checked against the map
+    live_within_m=2.5,          # the approach follows the last live_s of sightings only this close
+    arrive_lead_m=0.3,          # the stop is commanded this far before arrive_m (see update)
     map_forget_m=25.0,          # the map holds what was seen in the last this-many metres DRIVEN (0: all of
                                 # it). The pose is wheels + gyro, nothing absolute: it drifts, and what was
                                 # mapped long ago comes back displaced, a second wall beside the first.
@@ -306,6 +308,11 @@ class ExploreSearchMission:
     def _carrot(self):
         return point_at(self.pts, self.cum, self.s_proj + self.p['carrot_distance_m'])
 
+    def _first_leg_deg(self, x, y, yaw):
+        """Where the route heads at the carrot, in degrees left of the rover's heading."""
+        c = point_at(self.pts, self.cum, self.s_proj + self.p['carrot_distance_m'])
+        return math.degrees(_wrap(math.atan2(c[1] - y, c[0] - x) - yaw))
+
     def _route_blocked(self, t):
         """True when the route ahead crosses what the map now holds as an obstacle."""
         p = self.replanner.p
@@ -480,14 +487,34 @@ class ExploreSearchMission:
                 self._route_kind = None
         est = None
         if self.target is not None:
-            est = self.target.live(t, p['live_s'])
-            if est is None:
-                est = self.target.estimate(p['fuse_n'])
+            # the same object as one already shown, now that it is seen from closer: not shown twice
+            e = self.target.estimate()
+            dup = next((v for v in self.cones.clusters if v is not self.target and v.visited
+                        and v.name.startswith('cone') and v.cls == self.target.cls
+                        and float(np.hypot(*(v.estimate() - e))) <= p['same_class_apart_m']), None)
+            if dup is not None:
+                self.notes.append(f'{t:.1f} the {self.target.cls} #{self.target.id} at ({e[0]:.1f},{e[1]:.1f}) is #{dup.id}, '
+                                  f'already shown: not again')
+                self.target.visited, self.target.name = True, 'duplicate'
+                self.target = None
+                self._route_kind = None
+        if self.target is not None:
+            # Far away the position is every sighting fused; the last few seconds alone (a handful of
+            # ranges, each good to ~12%) move it by a metre and the route with it. Close up, what is
+            # in view now is the better guide.
+            est = self.target.estimate()
+            if math.hypot(est[0] - x, est[1] - y) <= p['live_within_m']:
+                live = self.target.live(t, p['live_s'])
+                if live is not None:
+                    est = live
         if self.state == ARRIVED:
             return Step(None, (0.0, 0.0), True, ARRIVED)
         if self.state == SHOW:
             return self._show(t, x, y, yaw, est, rate)
-        if est is not None and math.hypot(est[0] - x, est[1] - y) <= p['arrive_m']:
+        # arrive_lead_m sooner: the stop takes effect ~1 s later, 0.25-0.6 m further on. With the stop
+        # commanded AT arrive_m 1.0 the rover came to rest 0.3-0.8 m from the plant, against the pot
+        # more than once (ROS e2e, 12-oct).
+        if est is not None and math.hypot(est[0] - x, est[1] - y) <= p['arrive_m'] + p['arrive_lead_m']:
             self.state = SHOW
             self._show_phase, self._show_t0 = 'face', t
             self.notes.append(f'{t:.1f} at the {self.target.cls}: {math.hypot(est[0] - x, est[1] - y):.1f} m; showing it')
@@ -507,9 +534,22 @@ class ExploreSearchMission:
             self._route_kind = None
         if est is not None:
             self.state = GOTO
-            if self._route_kind != GOTO or np.hypot(*(est - self._route_to)) > p['reroute_moved_m'] \
-                    or t - self._route_t > p['reroute_every_s'] or self._route_blocked(t):
-                if not self._route_to_object(t, x, y, est):
+            why = ('new' if self._route_kind != GOTO else
+                   f'object moved {float(np.hypot(*(est - self._route_to))):.1f} m'
+                   if np.hypot(*(est - self._route_to)) > p['reroute_moved_m'] else
+                   'blocked' if self._route_blocked(t) else
+                   'timer' if t - self._route_t > p['reroute_every_s'] else '')
+            if why:
+                before = self._first_leg_deg(x, y, yaw) if self._route_kind == GOTO else None
+                ok = self._route_to_object(t, x, y, est)
+                if ok:
+                    after = self._first_leg_deg(x, y, yaw)
+                    turned = None if before is None else abs((after - before + 180.0) % 360.0 - 180.0)
+                    if why != 'timer' or (turned is not None and turned > 30.0):
+                        self.notes.append(f'{t:.1f} route to #{self.target.id} ({why}): {float(self.cum[-1]):.1f} m, '
+                                          f'starts {after:+.0f} deg from the heading'
+                                          + (f' (was {before:+.0f})' if before is not None else ''))
+                if not ok:
                     self._skip[self.target.id] = t + p['unreachable_s']
                     self.notes.append(f'{t:.1f} no path to the {self.target.cls} at ({est[0]:.1f},{est[1]:.1f}); '
                                       f'exploring on')

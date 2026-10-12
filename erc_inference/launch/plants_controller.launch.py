@@ -14,7 +14,8 @@ Arguments:
   plants       how many potted plants to show before the mission ends (default 3)
   timeout_s    the mission's time limit (default 1800)
   show_s       how long it holds still in front of each plant (default 5)
-  arrive_m     how close it gets before showing it (default 1.8)
+  arrive_m     a plant counts once the rover is within this of it (default 1.0)
+  apart_m      a plant this close to one already shown is the same plant (default 1.5)
   stop_when_explored  true (default): also end when nothing is left to explore
   forget_m     the map keeps what was seen in the last this-many metres driven (default 25; 0: all)
 More of the node's parameters: `ros2 run erc_inference image_checkpoint_controller_node
@@ -48,6 +49,8 @@ def generate_launch_description():
             'patrol.max_shows': arg('plants', int),
             'patrol.show_s': arg('show_s', float),
             'patrol.arrive_m': arg('arrive_m', float),
+            'patrol.standoff_m': arg('standoff_m', float),
+            'patrol.same_class_apart_m': arg('apart_m', float),
             'explore.stop_when_explored': arg('stop_when_explored', bool),
             'explore.map_forget_m': arg('forget_m', float),
             'mission_timeout_s': arg('timeout_s', float),
@@ -58,7 +61,12 @@ def generate_launch_description():
         DeclareLaunchArgument('plants', default_value='3', description='potted plants to show before it ends'),
         DeclareLaunchArgument('timeout_s', default_value='1800.0', description='mission time limit (s)'),
         DeclareLaunchArgument('show_s', default_value='5.0', description='hold still this long at each plant (s)'),
-        DeclareLaunchArgument('arrive_m', default_value='1.8', description='show a plant from this distance (m)'),
+        DeclareLaunchArgument('arrive_m', default_value='1.0',
+                              description='a plant counts once the rover is within this of it (m)'),
+        DeclareLaunchArgument('standoff_m', default_value='0.9',
+                              description='the route to a plant ends this far short of it (m); below arrive_m'),
+        DeclareLaunchArgument('apart_m', default_value='1.5',
+                              description='a plant this close to one already shown is that same plant: not shown again'),
         DeclareLaunchArgument('forget_m', default_value='25.0',
                               description='the map keeps what was seen in the last this-many metres driven (0: all)'),
         DeclareLaunchArgument('stop_when_explored', default_value='true',

@@ -47,6 +47,8 @@ def world():
 
 
 PLANTS = np.array([[9.0, 0.6], [6.8, 4.2], [13.4, 7.0], [3.6, 4.4]])
+if os.environ.get('PLANTS_XY'):          # "x,y;x,y;..." -- another arrangement, e.g. one in view from the start
+    PLANTS = np.array([[float(v) for v in q.split(',')] for q in os.environ['PLANTS_XY'].split(';')])
 
 
 def run(seed, n_goals=3, t_max=1800.0, delay_s=1.0, wheel_scale=0.97, gyro_scale=1.03, record=False):
