@@ -115,6 +115,7 @@ class ExploreSearchMission:
         self._last_profile = None
         self._last_check = -math.inf
         self._backoff_until = None
+        self._stuck_at = []              # (t, x, y) of recent stuck events
         self.stucks = 0
         self.explored = False
         self._show_phase, self._show_t0 = None, 0.0
@@ -173,12 +174,30 @@ class ExploreSearchMission:
         if self.target is not None:
             self.target.visited = True
             self.target.name = f'cone{self.index + 1}' if accepted else 'rejected'
+            self._mark(self.target.estimate())
         self.notes.append(f'{t:.1f} {self.goal.name} ' + ('confirmed' if accepted else 'rejected'))
         if accepted:
             self.index += 1
         self.target = None
         self.state = EXPLORE if not self.done else DONE
         self._route_kind = None
+
+    def _mark(self, xy, radius=0.3):
+        """The object just shown is an obstacle where its track says: the rover stands 1-2 m from it
+        about to drive on, and from that close the profile's rays often pass beside a pot (ROS e2e,
+        12-oct: it rubbed the plant it had just shown, four times)."""
+        m = self.map
+        r = m.p['resolution_m']
+        k = int(math.ceil(radius / r))
+        r0, c0 = (int(v) for v in m.cell(xy[0], xy[1]))
+        for dr in range(-k, k + 1):
+            for dc in range(-k, k + 1):
+                rr, cc = r0 + dr, c0 + dc
+                if 0 <= rr < m.h and 0 <= cc < m.w and math.hypot(dr, dc) * r <= radius:
+                    m.L[rr, cc] = m.p['max_logodds']
+                    m.seen[rr, cc] = True
+                    m.travel[rr, cc] = self.odometer
+        m._dist = None
 
     def block_ahead(self, t, x, y, yaw, why):
         """Something ahead stopped the rover (stuck, or tilting onto it): back off, mark it, reroute."""
@@ -190,7 +209,14 @@ class ExploreSearchMission:
             b, r, h = self._last_profile
             k = (np.abs(b) <= 20.0) & h
             ahead = float(r[k].min()) if k.any() else None
-        mark = why.startswith('tilt') or (ahead is not None and ahead < p['stuck_mark_to_m'] + 0.1)
+        # Stuck again in the same place: what holds the rover is beside it, where the profile does not
+        # look (a door jamb), so "nothing seen ahead" and the same route again, for ever (ROS e2e with
+        # the turn gain measured at low speed, 12-oct: 17 times in 4 minutes). The second time, mark
+        # ahead regardless; the third, give up on where it was going and go somewhere else.
+        self._stuck_at = [e for e in self._stuck_at if t - e[0] <= p['stuck_memory_s']]
+        here = sum(math.hypot(e[1] - x, e[2] - y) <= p['stuck_same_m'] for e in self._stuck_at)
+        self._stuck_at.append((t, x, y))
+        mark = why.startswith('tilt') or here >= 1 or (ahead is not None and ahead < p['stuck_mark_to_m'] + 0.1)
         if mark:
             m = self.map
             ds = np.arange(p['stuck_mark_from_m'], p['stuck_mark_to_m'] + 1e-9, m.p['resolution_m'] * 0.5)
@@ -206,10 +232,16 @@ class ExploreSearchMission:
         if self.frontier is not None:
             self._tried.append((t, *self.frontier))
             self.frontier = None
+        gave_up = ''
+        if here >= p['stuck_flip_after'] - 1 and self.target is not None and self.state != SHOW:
+            self._skip[self.target.id] = t + 2.0 * p['unreachable_s']
+            gave_up = f'; stuck here {here + 1} times: leaving the {self.target.cls} for later'
+            self.target = None
+            self.state = EXPLORE
         self._route_kind = None
         self._trail = []
         self.notes.append(f'{t:.1f} {why}: backing off, ' + ('obstacle marked ahead' if mark else 'nothing seen ahead')
-                          + ', rerouting')
+                          + ', rerouting' + gave_up)
 
     def export_state(self):
         return {'index': self.index,

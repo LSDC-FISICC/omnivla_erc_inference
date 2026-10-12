@@ -437,7 +437,7 @@ class ImageCheckpointControllerNode(IndoorMissionNode):
                    'odom': [odom.x, odom.y, odom.yaw]}
         path = self._param('state_file')
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = path + '.tmp'
+        tmp = f'{path}.{os.getpid()}.tmp'       # its own: two nodes saving to one path must not share it
         with open(tmp, 'w') as f:
             json.dump(doc, f)
         os.replace(tmp, path)                   # never a half-written file
@@ -549,7 +549,12 @@ class ImageCheckpointControllerNode(IndoorMissionNode):
                 with self._lock:
                     pose = self._track_pose
                 if t - self._last_save >= 2.0:
-                    self._save_state()
+                    try:
+                        self._save_state()
+                    except OSError as exc:      # the memory for a resume; not worth the mission
+                        self._last_save = t     # (four simulations sharing one file aborted two, 12-oct)
+                        self.get_logger().warn(f'could not save the mission state: {exc}',
+                                               throttle_duration_sec=30)
                 if self._param('explore') and t - self._last_map_pub >= 1.0 / float(self._param('explore_map_rate_hz')):
                     self._last_map_pub = t
                     self._publish_explore_map()

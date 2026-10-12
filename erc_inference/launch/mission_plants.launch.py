@@ -46,6 +46,13 @@ def generate_launch_description():
         launch_arguments={'mission': 'images', 'model': 'none', 'target': 'plants',
                           'depth_backend': LaunchConfiguration('depth_backend'),
                           'yolo_conf': LaunchConfiguration('yolo_conf'),
+                          # Turning in place from 30 deg, not 45: on this rover turning WHILE driving is the
+                          # part that does not repeat (it did 0.9x of the command in one excitation run and
+                          # 0.4x in the next, config/rover_dynamics.yaml), turning in place is steady. In the
+                          # ROS e2e with its measured dynamics: 45/15 -> 4 and 10 touches, and a door jamb it
+                          # never got past when the gain was the low one; 30/10 -> 0 and 5, and through.
+                          'turn_enter_deg': LaunchConfiguration('turn_enter_deg'),
+                          'turn_exit_deg': LaunchConfiguration('turn_exit_deg'),
                           'debug_images': LaunchConfiguration('debug_images')}.items())
     foxglove = ExecuteProcess(
         cmd=['ros2', 'launch', 'foxglove_bridge', 'foxglove_bridge_launch.xml',
@@ -74,6 +81,10 @@ def generate_launch_description():
                               description='also run local_map_node: /erc/local_map, the map with nobody driving'),
         DeclareLaunchArgument('map_forget_m', default_value='25.0',
                               description='local_map_node: keep what was seen in the last this-many metres driven (0: all)'),
+        DeclareLaunchArgument('turn_enter_deg', default_value='30.0',
+                              description='the carrot turns in place once the route is this far off the heading'),
+        DeclareLaunchArgument('turn_exit_deg', default_value='10.0',
+                              description='... and drives on again once it is within this'),
         DeclareLaunchArgument('foxglove', default_value='false',
                               description='also start foxglove_bridge (127.0.0.1 only)'),
         DeclareLaunchArgument('foxglove_port', default_value='8766'),

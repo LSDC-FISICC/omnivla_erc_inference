@@ -1,0 +1,32 @@
+# Commanded -> real dynamics of THIS unit: the team's own Mini+ (helm-luke-knit).
+# Identified 2026-10-12 from two open-loop excitation runs (Earth-rover-ros2-bridge/tools/
+# run_excitation.sh: blocks 1-3; rosbags/excitation_1012_1318 and _1322; tools/identify_dynamics.py
+# fitted on both, 28 free-run windows; fitting one and predicting the other: NRMSE v 0.05-0.06,
+# w 0.063-0.064). Read by rover_simulation/e2e/fake_plants_world.py; MPPI is to read it next.
+#
+#     v' = (k_v * v_cmd(t - dead_time_s) - v) / tau_v_s
+#     w' = (k_w * w_cmd(t - dead_time_s) - w) / tau_w_s
+#
+# The competition rovers, for comparison (what controller.yaml and the other fake worlds assume):
+# dead time 1.3 s, tau 0.47 / 0.35 s, k_v 1.11 with nothing moving below ~0.15-0.25, turn gain
+# 1.1 moving and 1.18 in place.
+dead_time_s: 0.65          # 0.65 in both runs. NOT the 1.3 s of the controllers: those take the delay as
+                           # one pure lag, and for a steady command that is dead_time + tau = 1.27-1.39 s
+                           # here -- so delay_compensation_s 1.3 stays as it is.
+tau_v_s: 0.74              # 0.69 and 0.80
+tau_w_s: 0.62              # 0.73 and 0.50
+k_v: 1.07                  # 1.08 and 1.07. Asked 0.10 / 0.15 / 0.20 / 0.30 it does 0.10 / 0.15 / 0.21 / 0.32 m/s
+                           # by its wheels (radius 46.75 mm, the competition rovers', not checked on this one).
+v_floor: 0.0               # it moves at 0.10, the lowest tried; the competition rovers did not below ~0.2
+#
+# TURNING IS NOT ONE GAIN.
+# In place it is a dead zone and then a steep slope, the same in both runs: asked 0.15 / 0.30 / 0.45 it
+# does 0.07-0.09 / 0.33-0.36 / 0.60-0.64 rad/s = w_rest_slope * (|w_cmd| - w_rest_deadband). (Once, -0.30
+# gave -0.23.)
+w_rest_deadband: 0.10
+w_rest_slope: 1.7
+# Moving, k_w = k_w0 + k_w1 * v. At 0.30 m/s both runs agree (it does ~1.4x what is asked). At 0.15 m/s
+# they do NOT: 0.9x in one run and 0.4-0.45x in the other, ten minutes apart on the same floor, cause
+# unknown -- which is why k_w1 came out +0.72 in one fit and -0.02 in the other. The joint fit:
+k_w0: 1.03
+k_w1: 0.40

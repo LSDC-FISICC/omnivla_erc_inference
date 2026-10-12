@@ -3,9 +3,10 @@
 # started by launch/plants_controller.launch.py (explore:=true, /erc/objects), and
 # carrot_controller_node from this source tree, against fake_plants_world.py (plant, a floor the
 # mission does not know, plants, lagged free space and detections). Carrot parameters as
-# mission_indoor.launch.py sets them.
+# mission_plants.launch.py sets them.
 #   ./run_e2e_plants.sh <seconds> <seed> [plants to show] [tag]
-# env: PLANT_KW_MOVING WHEEL_SCALE GYRO_SCALE GYRO_BIAS_DEG_MIN IMAGE_LAG_S ROS_DOMAIN_ID_E2E
+# env: PLANT (unit|competition) KW_MOVING_SCALE WHEEL_SCALE GYRO_SCALE GYRO_BIAS_DEG_MIN IMAGE_LAG_S
+#      ROS_DOMAIN_ID_E2E EXTRA_CARROT_ARGS (more -p name:=value for carrot_controller_node)
 #      EXTRA_LAUNCH_ARGS (more name:=value for plants_controller.launch.py)
 HERE=$(cd "$(dirname "$0")" && pwd)
 SRC=$(cd "$HERE/../../erc_inference" && pwd)
@@ -18,7 +19,7 @@ python3 "$HERE/fake_plants_world.py" "$D" "$SEED" "$N" > "$OUT.world.log" 2>&1 &
 sleep 2
 python3 -m erc_inference.carrot_controller_node --ros-args --params-file "$SRC/config/controller.yaml" \
   -p gps_topic:=/erc/indoor/fix -p compass_topic:=/erc/indoor/heading_deg \
-  -p max_linear_vel:=0.25 -p goal_turn.enter_deg:=45.0 -p goal_turn.exit_deg:=15.0 > "$OUT.carrot.log" 2>&1 & CN=$!
+  -p max_linear_vel:=0.25 -p goal_turn.enter_deg:=30.0 -p goal_turn.exit_deg:=10.0 ${EXTRA_CARROT_ARGS:-} > "$OUT.carrot.log" 2>&1 & CN=$!
 # In its own session with SIGINT at its default, as in a terminal: a background job of a script
 # has SIGINT ignored, python keeps it ignored, and the launch then outlives this script with the
 # node still serving /start_mission (the next run got two missions driving at once, 9-oct).

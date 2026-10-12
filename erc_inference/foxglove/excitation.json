@@ -1,0 +1,254 @@
+{
+  "configById": {
+    "Plot!exc_lin": {
+      "paths": [
+        {
+          "value": "/cmd_vel.linear.x",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "comando v"
+        },
+        {
+          "value": "/erc/wheel_twist.twist.twist.linear.x",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "ruedas v (m/s)"
+        },
+        {
+          "value": "/erc/odometry/local.twist.twist.linear.x",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "EKF v"
+        }
+      ],
+      "showLegend": true,
+      "legendDisplay": "floating",
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "isSynced": true,
+      "xAxisVal": "timestamp",
+      "followingViewWidth": 40
+    },
+    "Plot!exc_ang": {
+      "paths": [
+        {
+          "value": "/cmd_vel.angular.z",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "comando w"
+        },
+        {
+          "value": "/erc/imu.angular_velocity.z",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "giroscopio w (rad/s)"
+        },
+        {
+          "value": "/erc/odometry/local.twist.twist.angular.z",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "EKF w"
+        }
+      ],
+      "showLegend": true,
+      "legendDisplay": "floating",
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "isSynced": true,
+      "xAxisVal": "timestamp",
+      "followingViewWidth": 40
+    },
+    "Plot!exc_lat": {
+      "paths": [
+        {
+          "value": "/erc/data_latency.data",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "telemetria (s)"
+        },
+        {
+          "value": "/erc/cmd_delay.data",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "retardo cmd (s)"
+        },
+        {
+          "value": "/erc/gyro_bias.vector.z",
+          "enabled": true,
+          "timestampMethod": "receiveTime",
+          "label": "sesgo giro z (rad/s)"
+        }
+      ],
+      "showLegend": true,
+      "legendDisplay": "floating",
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "isSynced": true,
+      "xAxisVal": "timestamp",
+      "followingViewWidth": 40
+    },
+    "3D!exc_map": {
+      "cameraState": {
+        "perspective": false,
+        "distance": 18,
+        "phi": 0,
+        "thetaOffset": 90,
+        "target": [
+          0,
+          0,
+          0
+        ],
+        "targetOffset": [
+          0,
+          0,
+          0
+        ],
+        "targetOrientation": [
+          0,
+          0,
+          0,
+          1
+        ],
+        "fovy": 45,
+        "near": 0.1,
+        "far": 5000
+      },
+      "followMode": "follow-position",
+      "followTf": "base_link",
+      "scene": {
+        "enableStats": false,
+        "transforms": {
+          "showLabel": true,
+          "axisScale": 0.5
+        }
+      },
+      "transforms": {},
+      "topics": {
+        "/erc/local_map": {
+          "visible": true,
+          "colorMode": "costmap",
+          "alpha": 0.8,
+          "frameLocked": false
+        },
+        "/erc/local_map/objects": {
+          "visible": true
+        },
+        "/erc/local_map/path": {
+          "visible": true,
+          "lineWidth": 0.04,
+          "gradient": [
+            "#0a84ff",
+            "#0a84ff"
+          ]
+        },
+        "/erc/explore/map": {
+          "visible": false,
+          "colorMode": "costmap",
+          "alpha": 0.8,
+          "frameLocked": false
+        },
+        "/erc/explore/objects": {
+          "visible": true
+        },
+        "/erc/free_space": {
+          "visible": true,
+          "pointSize": 8,
+          "pointShape": "circle",
+          "colorMode": "flat",
+          "flatColor": "#ff3b30",
+          "decayTime": 0
+        }
+      },
+      "publish": {
+        "type": "point"
+      },
+      "imageMode": {},
+      "layers": {
+        "grid": {
+          "layerId": "foxglove.Grid",
+          "visible": true,
+          "frameId": "odom",
+          "size": 30,
+          "divisions": 30,
+          "lineWidth": 1,
+          "color": "#24ff8e30",
+          "position": [
+            0,
+            0,
+            0
+          ],
+          "rotation": [
+            0,
+            0,
+            0
+          ],
+          "order": 1
+        }
+      }
+    },
+    "Image!exc_cam": {
+      "imageMode": {
+        "imageTopic": "/erc/front_camera/compressed"
+      },
+      "cameraState": {},
+      "followMode": "follow-pose",
+      "scene": {},
+      "transforms": {},
+      "topics": {},
+      "layers": {},
+      "publish": {}
+    },
+    "RawMessages!exc_seg": {
+      "topicPath": "/excitation/segment",
+      "diffEnabled": false,
+      "diffMethod": "custom",
+      "diffTopicPath": "",
+      "showFullMessageForDiff": false,
+      "expansion": "all"
+    },
+    "RosOut!exc_log": {
+      "searchTerms": [],
+      "minLogLevel": 1,
+      "nameFilter": {}
+    }
+  },
+  "globalVariables": {},
+  "userNodes": {},
+  "playbackConfig": {
+    "speed": 1
+  },
+  "drawerConfig": {
+    "tracks": []
+  },
+  "layout": {
+    "first": {
+      "first": "Plot!exc_lin",
+      "second": {
+        "first": "Plot!exc_ang",
+        "second": "Plot!exc_lat",
+        "direction": "column",
+        "splitPercentage": 55
+      },
+      "direction": "column",
+      "splitPercentage": 36
+    },
+    "second": {
+      "first": {
+        "first": "3D!exc_map",
+        "second": "Image!exc_cam",
+        "direction": "column",
+        "splitPercentage": 58
+      },
+      "second": {
+        "first": "RawMessages!exc_seg",
+        "second": "RosOut!exc_log",
+        "direction": "column",
+        "splitPercentage": 30
+      },
+      "direction": "row",
+      "splitPercentage": 62
+    },
+    "direction": "row",
+    "splitPercentage": 52
+  }
+}

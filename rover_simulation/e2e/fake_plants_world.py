@@ -2,9 +2,10 @@
 
 The REAL image_checkpoint_controller_node (started by plants_controller.launch.py, so with
 explore:=true) and carrot_controller_node run against:
-  - the plant of fake_world.py (1.3 s command delay, k_v 1.11, k_w PLANT_KW_MOVING / 1.18 in
-    place), integrated on the wall clock, with dead-reckoning errors on the published odometry
-    and an odom origin offset from the mission frame;
+  - the plant of the team's own Mini+ as identified on 2026-10-12 (config/rover_dynamics.yaml:
+    0.65 s dead time, lags of 0.74 / 0.62 s, a dead zone when turning in place; PLANT=competition
+    for the competition rovers'), integrated on the wall clock, with dead-reckoning errors on the
+    published odometry and an odom origin offset from the mission frame;
   - the floor of test/explore_search_sim.py, which the mission knows nothing about: two 2 m
     corridors in an L, a 5 x 4 m room, four potted plants (discs: obstacles too);
   - /erc/free_space from test/obstacles.profile and /erc/objects as object_detector_node
@@ -37,8 +38,15 @@ sys.path.insert(0, os.path.join(HERE, '..', '..', 'erc_inference'))
 import explore_search_sim as ess  # noqa: E402
 import obstacles as obs  # noqa: E402
 
-PLANT_KW_MOVING = float(os.environ.get('PLANT_KW_MOVING', 1.1))
-PLANT_KW_IN_PLACE = float(os.environ.get('PLANT_KW_IN_PLACE', 1.18))
+# The plant is THIS unit's, as identified (erc_inference/config/rover_dynamics.yaml). PLANT=competition
+# gives the competition rovers' instead (fake_world.py's: 1.3 s, k_v 1.11 with a 0.15 floor, turn gain
+# 1.1 moving / 1.18 in place with a 0.15 floor, tau 0.47 / 0.35 s); KW_MOVING_SCALE scales the turn gain
+# while moving, the part that did not repeat between the two runs (0.4x-0.9x at 0.15 m/s).
+import yaml  # noqa: E402
+with open(os.path.join(HERE, '..', '..', 'erc_inference', 'config', 'rover_dynamics.yaml')) as _fh:
+    DYN = yaml.safe_load(_fh)
+PLANT = os.environ.get('PLANT', 'unit')
+KW_MOVING_SCALE = float(os.environ.get('KW_MOVING_SCALE', 1.0))
 WHEEL_SCALE = float(os.environ.get('WHEEL_SCALE', 0.01))
 GYRO_SCALE = float(os.environ.get('GYRO_SCALE', 0.01))
 GYRO_BIAS_DEG_MIN = float(os.environ.get('GYRO_BIAS_DEG_MIN', 0.5))
@@ -120,14 +128,26 @@ class World(Node):
         now = self._now()
         dt = 0.05 if self.last is None else min(0.2, now - self.last)
         self.last = now
-        while len(self.cmds) > 1 and self.cmds[1][0] <= now - 1.3:
+        if PLANT == 'competition':
+            delay, tau_v, tau_w = 1.3, 0.47, 0.35
+        else:
+            delay, tau_v, tau_w = DYN['dead_time_s'], DYN['tau_v_s'], DYN['tau_w_s']
+        while len(self.cmds) > 1 and self.cmds[1][0] <= now - delay:
             self.cmds.popleft()
         _, lin, ang = self.cmds[0]
-        tv = 1.11 * lin if abs(lin) >= 0.15 else 0.0
-        moving = abs(self.v) > 0.03 or tv != 0.0
-        tw = (PLANT_KW_MOVING * ang) if moving else (PLANT_KW_IN_PLACE * ang if abs(ang) >= 0.15 else 0.0)
-        self.v += (tv - self.v) * min(1, dt / 0.47)
-        self.w += (tw - self.w) * min(1, dt / 0.35)
+        if PLANT == 'competition':
+            tv = 1.11 * lin if abs(lin) >= 0.15 else 0.0
+            moving = abs(self.v) > 0.03 or tv != 0.0
+            tw = (1.1 * ang) if moving else (1.18 * ang if abs(ang) >= 0.15 else 0.0)
+        else:
+            tv = DYN['k_v'] * lin if abs(lin) >= DYN['v_floor'] else 0.0
+            moving = abs(self.v) > 0.03 or tv != 0.0
+            if moving:
+                tw = KW_MOVING_SCALE * (DYN['k_w0'] + DYN['k_w1'] * abs(self.v)) * ang
+            else:                      # in place: a dead zone, then a steep slope
+                tw = math.copysign(DYN['w_rest_slope'] * max(0.0, abs(ang) - DYN['w_rest_deadband']), ang)
+        self.v += (tv - self.v) * min(1, dt / tau_v)
+        self.w += (tw - self.w) * min(1, dt / tau_w)
         self.th += self.w * dt
         nx, ny = self.x + self.v * math.cos(self.th) * dt, self.y + self.v * math.sin(self.th) * dt
         c = obs.clearance((nx, ny), self.world_all)
