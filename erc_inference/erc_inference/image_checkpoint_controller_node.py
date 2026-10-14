@@ -306,9 +306,13 @@ class ImageCheckpointControllerNode(IndoorMissionNode):
         hit = np.isfinite(r) & (r < msg.range_max - 0.05)
         r = np.where(np.isfinite(r), r, msg.range_max)
         t = self._now()
-        self.envelope.observe_free_space(t, b, np.where(hit, r, msg.range_max), msg.range_max)
         stamp = msg.header.stamp.sec + 1e-9 * msg.header.stamp.nanosec
         age = self._ros_s() - stamp if stamp > 0 else float('nan')
+        # the profile is as old as the camera frame it was made from (free_space_node stamps it with
+        # that since 12-oct): the envelope's and the mission's own staleness limits count from there
+        if math.isfinite(age):
+            t -= min(max(age, 0.0), 10.0)
+        self.envelope.observe_free_space(t, b, np.where(hit, r, msg.range_max), msg.range_max)
         self._scan_ages.append(age)
         if t - self._last_age_log >= 30.0 and self._scan_ages:
             a = np.array([v for v in self._scan_ages if np.isfinite(v)])

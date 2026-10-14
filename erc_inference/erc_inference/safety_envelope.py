@@ -76,6 +76,24 @@ DEFAULTS = {
     'safety.clear_confirm_ticks': 3,
     'safety.free_space_timeout_s': 1.5,
     'safety.stop_if_perception_stale': True,
+    # With no fresh profile nothing is known about what is beside the rover either: stop the turn as
+    # well. False: only the advance stops, as in the competition.
+    'safety.stale_stops_turning': False,
+    # > 0: with anything nearer than this within +-too_close_sector_deg the only motion is straight
+    # back, for at most too_close_backoff_s; no turning. This rover climbs what its wheels touch:
+    # on 12-oct it turned in place with a post 0.2 m in front of it and rolled onto its side
+    # (rosbags/mission_1012_1607_macetas, 345 s). 0: off.
+    'safety.too_close_m': 0.0,
+    # > 0: no faster than slow_vel with anything nearer than this in the stop sector. At 0.27 m/s
+    # the rover covers 0.45 m between a thing appearing in the profile and the stop taking effect
+    # (profile ~0.4 s old, command ~1.3 s to act); at 0.15, 0.25 m -- which is what lets
+    # stop_distance_m be short enough to go through a door. Needs min_moving_linear_vel <= slow_vel
+    # (the team's own unit moves from 0.10 m/s; the competition rovers did not below 0.25).
+    'safety.slow_distance_m': 0.0,
+    'safety.slow_vel': 0.15,
+    'safety.too_close_sector_deg': 40.0,
+    'safety.too_close_backoff_s': 2.0,
+    'safety.too_close_clear_m': 0.15,       # ... until it is this much further than too_close_m
     # Blocked with a turn too small to move the rover (below ~0.15 rad/s it does not turn in
     # place): turn in place toward the more open side instead, until the sector clears. Without
     # it the rover waits forever in front of a cone it has just reached (test/image_goal_sim.py).
@@ -151,6 +169,7 @@ class SafetyEnvelope:
         self._blocked_n = 0
         self._clear_n = 0
         self._obstacle_stop = False
+        self._close_since: Optional[float] = None
 
     # -- inputs -------------------------------------------------------------
 
@@ -248,6 +267,23 @@ class SafetyEnvelope:
                 self._obstacle_stop = False
         return self._obstacle_stop, f'obstacle {self.ahead_m(p):.2f} m ahead' if self._obstacle_stop else ''
 
+    def _too_close(self, now, p):
+        """-> '' (free to move), 'back' (straight back) or 'hold' (it has backed off as long as
+        allowed and the thing is still there: stand still)."""
+        limit = p.get('safety.too_close_m', 0.0)
+        if limit <= 0.0 or self._scan is None or now - self._scan[0] > p['safety.free_space_timeout_s']:
+            self._close_since = None
+            return ''
+        _t, bearings, ranges, range_max = self._scan
+        half = p['safety.too_close_sector_deg']
+        near = min((r for b, r in zip(bearings, ranges) if abs(b) <= half and math.isfinite(r)), default=range_max)
+        if near >= limit + (p['safety.too_close_clear_m'] if self._close_since is not None else 0.0):
+            self._close_since = None
+            return ''
+        if self._close_since is None:
+            self._close_since = now
+        return 'back' if now - self._close_since <= p['safety.too_close_backoff_s'] else 'hold'
+
     # -- all together -------------------------------------------------------
 
     def limit(self, now: float, linear: float, angular: float, p) -> Tuple[float, float, bool, str]:
@@ -257,9 +293,23 @@ class SafetyEnvelope:
             if linear < 0.0 and abs(angular) < 1e-6:
                 return max(linear, -p['safety.max_reverse_vel']), 0.0, False, f'[safety] tilted: backing off ({tilt_note})'
             return 0.0, 0.0, True, f'[safety] STOP {tilt_note}'
+        close = self._too_close(now, p)
+        if close:
+            if linear < 0.0 and abs(angular) < 1e-6:         # the caller is already backing off
+                return max(linear, -p['safety.max_reverse_vel']), 0.0, False, '[safety] too close: backing off'
+            if close == 'back':
+                back = min(p['safety.max_reverse_vel'], max(p['safety.min_moving_linear_vel'], 0.1))
+                return -back, 0.0, True, '[safety] too close: straight back, no turning'
+            return 0.0, 0.0, True, '[safety] STOP too close and still there after backing off'
         lin, ang, cap_note = cap(linear, angular, p)
         blocked, obs_note = self._obstacle_gate(now, p)
         hard = False
+        if blocked and obs_note.startswith('perception stale') and p.get('safety.stale_stops_turning', False):
+            return 0.0, 0.0, True, '[safety] STOP ' + obs_note
+        slow = p.get('safety.slow_distance_m', 0.0)
+        if slow > 0.0 and lin > p['safety.slow_vel'] and self._scan is not None and self.ahead_m(p) < slow:
+            lin = p['safety.slow_vel']
+            cap_note = (cap_note + ',' if cap_note else '') + 'slow: something ahead'
         if blocked and lin > 0.0:
             lin, hard = 0.0, True
             if abs(ang) < p['safety.min_turn_w'] and p['safety.unblock_turn_w'] > 0.0 and self._scan is not None \

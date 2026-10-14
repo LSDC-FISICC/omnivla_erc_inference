@@ -122,3 +122,61 @@ def test_in_place_dead_zone_is_inverted_and_predicted():
     # 1 s of 0.3 rad/s commanded in place: 0.34 rad on this unit, not 0.3 x a gain
     _x, _y, yaw = predict_pose(0.0, 0.0, 0.0, [(0.0, 0.0, 0.3)], 1.0, 1.0, rest_deadband=0.10, rest_slope=1.7)
     assert abs(yaw - 0.34) < 0.01
+
+
+# -- what the three runs of 12-oct 16:00 added: the rover climbs what it touches ----------------
+
+def reflex_envelope():
+    p = dict(SAFETY_DEFAULTS, **SAFETY_INDOOR)
+    p.update({'safety.tilt_enabled': False, 'safety.obstacle_enabled': True, 'safety.stop_distance_m': 0.9,
+              'safety.stop_confirm_ticks': 1, 'safety.stale_stops_turning': True, 'safety.too_close_m': 0.35})
+    return SafetyEnvelope(), p
+
+
+def profile(e, t, ahead):
+    r = np.full(len(BEARINGS), 3.0)
+    r[np.abs(BEARINGS) <= 20.0] = ahead
+    e.observe_free_space(t, BEARINGS, r, 3.0)
+
+
+def test_nothing_is_driven_at_within_the_stop_distance_but_it_may_turn():
+    e, p = reflex_envelope()
+    profile(e, 0.0, 2.0)
+    assert e.limit(0.1, 0.25, 0.0, p)[0] == 0.25
+    profile(e, 0.4, 0.8)
+    v, w, _hard, note = e.limit(0.5, 0.25, 0.2, p)
+    assert v == 0.0 and w == 0.2 and 'obstacle' in note
+
+
+def test_too_close_is_straight_back_and_never_a_turn():
+    e, p = reflex_envelope()
+    profile(e, 0.0, 0.2)                                 # the post of mission_1012_1607, 345 s
+    assert e.limit(0.1, 0.0, -0.3, p)[:2] == (-0.25, 0.0)
+    assert e.limit(0.2, 0.25, 0.0, p)[:2] == (-0.25, 0.0)
+    profile(e, 1.0, 0.45)                                # backed off, not yet clear of it by the margin
+    assert e.limit(1.1, 0.0, -0.3, p)[:2] == (-0.25, 0.0)
+    profile(e, 1.5, 0.6)
+    assert e.limit(1.6, 0.0, -0.3, p)[:2] == (0.0, -0.3)   # now it may turn (not advance: 0.6 < 0.9)
+    profile(e, 2.0, 0.2)
+    for k in range(30):                                  # still there after too_close_backoff_s: stand still
+        t = 2.1 + 0.1 * k
+        profile(e, t, 0.2)
+        out = e.limit(t, 0.0, -0.3, p)
+    assert out[:2] == (0.0, 0.0)
+    assert e.limit(5.2, -0.25, 0.0, p)[:2] == (-0.25, 0.0)   # the mission's own back-off passes
+
+
+def test_with_no_fresh_profile_nothing_moves():
+    e, p = reflex_envelope()
+    profile(e, 0.0, 3.0)
+    assert e.limit(1.0, 0.25, 0.1, p)[:2] == (0.25, 0.1)
+    assert e.limit(1.6, 0.25, 0.1, p)[:2] == (0.0, 0.0)      # 1.5 s without one: the wall of 1559 came in 4.8
+    assert e.limit(1.7, 0.0, 0.3, p)[:2] == (0.0, 0.0)
+
+
+def test_a_band_at_1p8_m_does_not_close_the_corridor_and_turning_back_waits():
+    r = CORRIDOR.copy()
+    r[8:17] = 1.8                                        # mission_1012_1556, 10 s: nothing was there
+    m = mission()
+    step = drive(m, r, 2.0)
+    assert step.carrot is not None and any('open ahead' in n for n in m.notes)
