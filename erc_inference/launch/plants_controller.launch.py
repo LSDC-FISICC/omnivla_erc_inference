@@ -37,7 +37,8 @@ Arguments:
   arrive_m     a plant counts once the rover is within this of it (default 1.0)
   standoff_m   the route to a plant ends this far short of it (default 0.9)
   stop_when_explored  true (default): also end when nothing is left to explore
-  forget_m     the map keeps what was seen in the last this-many metres driven (default 25; 0: all)
+  forget_m     the map keeps what was seen in the last this-many metres driven (default 10; 0: all)
+  radius_m     ... and only within this of the rover: a local map (default 5; 0: all)
 More of the node's parameters: `ros2 run erc_inference image_checkpoint_controller_node
 --ros-args -p ...` with the ones set below.
 """
@@ -106,6 +107,7 @@ def generate_launch_description():
             'nav2_frames': True,
             'explore.stop_when_explored': arg('stop_when_explored', bool),
             'explore.map_forget_m': arg('forget_m', float),
+            'explore.map_radius_m': arg('radius_m', float),
             'mission_timeout_s': arg('timeout_s', float),
             # its own file: a state saved by the cone mission must never be resumed here
             'state_file': os.path.expanduser('~/.ros/erc_plants_mission_state.json'),
@@ -133,7 +135,9 @@ def generate_launch_description():
                               description='the route to a plant ends this far short of it (m); below arrive_m'),
         DeclareLaunchArgument('apart_m', default_value='1.5',
                               description='a plant this close to one already shown is that same plant: not shown again'),
-        DeclareLaunchArgument('forget_m', default_value='25.0',
+        DeclareLaunchArgument('radius_m', default_value='5.0',
+                              description='the map is local: what is further than this from the rover is dropped (m; 0: kept)'),
+        DeclareLaunchArgument('forget_m', default_value='10.0',
                               description='the map keeps what was seen in the last this-many metres driven (0: all)'),
         DeclareLaunchArgument('stop_when_explored', default_value='true',
                               description='end the mission when no frontier is left'),

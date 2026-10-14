@@ -34,16 +34,17 @@ runs since 12-oct): the rover never turns to search and never goes to an object.
     the carrot through what the profile shows, while moving, and slows down gradually -- instead
     of handing the carrot to a follower. With the carrot and MPPI the rover moved 23-30 % of the
     time on 14-oct, stopping 6-7 times a minute.
-  * look_around off: no scans. With nowhere to go the rover stands still no_way_wait_s, then
-    makes quarter turns towards the open side, looking again after each (and starts the map
-    again if it is boxed in by its own drifted map); a full turn with no way on ends the mission.
-    A frontier behind it is taken only after turn_back_after_s with nothing ahead.
+  * look_around off: no scans. With nowhere to go the rover waits no_way_wait_s (2 s), then turns
+    towards the open side and stops turning at the first way on -- an open way ahead or a frontier
+    (and starts the map again if it is boxed in by its own drifted map); a full turn with no way
+    on ends the mission. A frontier behind it is taken after turn_back_after_s (2 s).
 
 What it does not have, and what follows from that:
   * No drift correction. The map and the pose drift together, so what is near the rover is
     consistent with what it sees, but a place mapped long ago is displaced when the rover
-    comes back to it. So the map forgets: a cell is dropped map_forget_m (25 m) of driving
-    after it was last seen, and so are the objects not shown yet. Nothing here closes loops;
+    comes back to it. So the map forgets: a cell is dropped map_forget_m (10 m) of driving
+    after it was last seen, and so are the objects not shown yet -- and every cell further than
+    map_radius_m (5 m) from the rover: the map is local (14-oct). Nothing here closes loops;
     an object shown before the rover drove a long loop can be shown again.
   * The profile reaches 3 m in +-60 deg and only +-map_fov_deg enters the map: rooms wider
     than ~5 m are explored along their walls, slowly.
@@ -85,7 +86,10 @@ DEFAULTS = dict(
     route_clear_m=4.0,          # route length ahead checked against the map
     live_within_m=2.5,          # the approach follows the last live_s of sightings only this close
     arrive_lead_m=0.3,          # the stop is commanded this far before arrive_m (see update)
-    map_forget_m=25.0,          # the map holds what was seen in the last this-many metres DRIVEN (0: all of
+    map_radius_m=5.0,           # the map is LOCAL: cells further than this from the rover are dropped (0: kept).
+                                # Without a lidar the pose drifts and the map never closes; what is far is the
+                                # least true, and its leftovers drew routes to spaces that were not there (14-oct)
+    map_forget_m=10.0,          # (25 until 14-oct)          # the map holds what was seen in the last this-many metres DRIVEN (0: all of
                                 # it). The pose is wheels + gyro, nothing absolute: it drifts, and what was
                                 # mapped long ago comes back displaced, a second wall beside the first.
                                 # Rather than blanking the map every 25 m -- which would also blank what is
@@ -125,10 +129,11 @@ DEFAULTS = dict(
     forward_profile_age_s=1.5,
     look_around=True,           # False: no turning in place to look for a way on
     turn_back_deg=100.0,        # look_around off: a frontier whose route starts further than this off the
-    turn_back_after_s=6.0,      # heading is taken only after this long with nothing better -- whoever
-                                # walked in front, or the band the depth model drew, is gone by then
-    no_way_wait_s=10.0,         # look_around off: nowhere to go for this long (people move away) -> a quarter
-    no_way_turn_wait_s=3.0,     # turn, and this long after each, up to a full turn; then "explored"
+    turn_back_after_s=2.0,      # heading is taken only after this long with nothing better (6 s until 14-oct:
+                                # the user wants it to wait less and take the first way that opens)
+    no_way_wait_s=2.0,          # look_around off: nowhere to go for this long -> turn towards the open side
+    look_w=0.25,                # ... at this command: ~15 deg/s on this unit, under forward_max_turn_dps, so
+                                # the open way ahead is looked for in every profile while it turns
 )
 
 DEFAULTS.update({f'reactive_{k}': v for k, v in REACTIVE_DEFAULTS.items()})   # drive 'reactive'
@@ -184,8 +189,7 @@ class ExploreSearchMission:
         self._nothing_since = None       # since when there has been nowhere to go (look_around off)
         self._pick_t = -math.inf
         self._back_since = None          # since when the only way on has been behind the rover
-        self._turns = 0                  # quarter turns made since there was nowhere to go
-        self._turn_side = 1.0
+        self._look = None                # turning to find a way on: {'side', 'turned' (deg), 'yaw'}
         self._last_check = -math.inf
         self._backoff_until = None
         self._stuck_at = []              # (t, x, y) of recent stuck events
@@ -353,10 +357,12 @@ class ExploreSearchMission:
             if d < 1.0:                      # a jump is a new anchor, not driving
                 self.odometer += d
         self._odo_xy = (x, y)
-        if self.odometer - self._forgot_at < 1.0:
+        if self.odometer - self._forgot_at < 0.5:
             return
         self._forgot_at = self.odometer
         m = self.map
+        if self.p['map_radius_m'] > 0.0:
+            m.forget_beyond(x, y, float(self.p['map_radius_m']))
         half = 0.5 * m.w * m.p['resolution_m']
         if max(abs(x - (m.ox + half)), abs(y - (m.oy + half))) > 0.5 * half:
             m.recenter(x, y)
@@ -635,6 +641,24 @@ class ExploreSearchMission:
             self.notes.append(f'{t:.1f} {c.cls} {self.index}/{self.n_shows} counted: #{c.id} at ({e[0]:.1f},{e[1]:.1f}), '
                               f'{d:.1f} m away, {len(c.points)} sightings')
 
+    def _look_step(self, t, yaw):
+        """The turn while looking for a way on; None once a full turn has been made (and the mission
+        is then over if stop_when_explored)."""
+        p = self.p
+        lk = self._look
+        lk['turned'] += abs(math.degrees(_wrap(yaw - lk['yaw'])))
+        lk['yaw'] = yaw
+        if lk['turned'] >= 360.0:
+            self._look = None
+            if self.replanner.scans > 0 and p['stop_when_explored']:
+                self.explored = True
+                self.notes.append(f'{t:.1f} a full turn and no way on: nothing left to explore, '
+                                  f'{self.index}/{self.n_shows} objects')
+                return Step(None, (0.0, 0.0), False, DONE, 'explored')
+            return None
+        self._trail = []
+        return Step(None, (0.0, lk['side'] * p['look_w']), False, EXPLORE, 'turning to find a way on')
+
     # -- scans -------------------------------------------------------------------
 
     def _scan_step(self, t, yaw, rate):
@@ -789,6 +813,7 @@ class ExploreSearchMission:
             self.state = EXPLORE
             self._nothing_since = None
             self._back_since = None
+            self._look = None
         else:
             self.state = EXPLORE
             if self._route_kind == FORWARD:      # the way ahead closed: the map decides
@@ -811,7 +836,11 @@ class ExploreSearchMission:
                 if how == 'failed' and self.frontier is not None:
                     self._tried.append((t, *self.frontier))
                 if (self._nothing_since is not None or self._back_since is not None) and t - self._pick_t < 1.0:
-                    return Step(None, (0.0, 0.0), False, EXPLORE, 'no way on')     # A* once a second, not every tick
+                    if self._look is not None:                                    # A* once a second, not every
+                        step = self._look_step(t, yaw)                            # tick; the look turn goes on
+                        if step is not None:
+                            return step
+                    return Step(None, (0.0, 0.0), False, EXPLORE, 'no way on')
                 self._pick_t = t
                 if self._pick_frontier(t, x, y, yaw):
                     first = self._first_leg_deg(x, y, yaw)
@@ -826,53 +855,44 @@ class ExploreSearchMission:
                         return Step(None, (0.0, 0.0), False, EXPLORE, 'waiting before turning back')
                     self._back_since = None
                     self._nothing_since = None
+                    self._look = None
                     self.notes.append(f'{t:.1f} frontier at ({self.frontier[0]:.1f},{self.frontier[1]:.1f}): '
                                       f'{float(self.cum[-1]):.1f} m, starts {self._first_leg_deg(x, y, yaw):+.0f} deg '
                                       f'from the heading')
                 elif not p['look_around']:
-                    # Nowhere to go from what has been seen. Not a look around: stand still first --
-                    # whoever stands in the way may move. After no_way_wait_s, a quarter turn towards
-                    # the more open side and another look, up to a full turn: the end of a corridor is
-                    # left by turning, there is no other way (with none of this the mission ended
-                    # facing the wall beside a door, half the floor unseen: ROS e2e, 12-oct). Then
-                    # "explored".
+                    # Nowhere to go from what has been seen: no_way_wait_s still (whoever stepped in
+                    # front may step away), then turn towards the more open side, slowly enough that
+                    # the profile can be used while turning, until a way on shows up -- the open way
+                    # ahead (checked first, every tick) or a frontier. A full turn with none: explored.
+                    # Not quarter turns with a wait after each: the user wants it moving, and taking
+                    # the first way that opens (14-oct).
                     if self._nothing_since is None:
                         self._nothing_since = t
-                        self._turns = 0
-                        self.notes.append(f'{t:.1f} no way on from here: waiting')
-                    if t - self._nothing_since > (p['no_way_wait_s'] if self._turns == 0 else p['no_way_turn_wait_s']):
-                        if self._turns == 0:
-                            self._tried = []
-                            if len(self._frontiers(x, y)[0]) > 0:
-                                # Frontiers on the map and a path to none of them: the rover is standing
-                                # inside a wall of its own map -- one drawn on the way out, the pose having
-                                # drifted since (explore_search_sim --count seed 0: 41 frontiers, no path to
-                                # any). The map is started again; what was counted stays counted.
-                                m = self.map
-                                m.L[:] = 0.0
-                                m.seen[:] = False
-                                m.travel[:] = -np.inf
-                                m._dist = None
-                                self._fwd_hold_until = -math.inf
-                                self.notes.append(f'{t:.1f} still no way on: the map is started again')
-                            b, r, _h = self._last_profile if self._last_profile is not None else (np.zeros(1),) * 3
-                            left, right = r[b > 5.0], r[b < -5.0]
-                            self._turn_side = 1.0 if (left.mean() if len(left) else 0.0) >= (right.mean() if len(right) else 0.0) \
-                                else -1.0
-                        if self._turns >= 4:
-                            if self.replanner.scans > 0 and p['stop_when_explored']:
-                                self.explored = True
-                                self.notes.append(f'{t:.1f} nothing left to explore: {self.index}/{self.n_shows} objects')
-                                return Step(None, (0.0, 0.0), False, DONE, 'explored')
-                            return Step(None, (0.0, 0.0), False, EXPLORE, 'no way on')
-                        self._turns += 1
-                        self._nothing_since = t
-                        self._scan_queue = [yaw + self._turn_side * math.pi / 2]
-                        self._scan_target = None
-                        self.state = SCAN
-                        self.notes.append(f'{t:.1f} still no way on: a quarter turn to the '
-                                          f'{"left" if self._turn_side > 0 else "right"} ({self._turns}/4)')
-                        return Step(None, (0.0, 0.0), False, SCAN, 'turning to find a way on')
+                        self._look = None
+                        self.notes.append(f'{t:.1f} no way on from here')
+                    if self._look is None and t - self._nothing_since >= p['no_way_wait_s']:
+                        self._tried = []
+                        if len(self._frontiers(x, y)[0]) > 0:
+                            # Frontiers on the map and a path to none of them: the rover is standing
+                            # inside a wall of its own map -- one drawn on the way out, the pose having
+                            # drifted since (explore_search_sim --count seed 0: 41 frontiers, no path to
+                            # any). The map is started again; what was counted stays counted.
+                            m = self.map
+                            m.L[:] = 0.0
+                            m.seen[:] = False
+                            m.travel[:] = -np.inf
+                            m._dist = None
+                            self._fwd_hold_until = -math.inf
+                            self.notes.append(f'{t:.1f} boxed in by its own map: the map is started again')
+                        b, r, _h = self._last_profile if self._last_profile is not None else (np.zeros(1),) * 3
+                        left, right = r[b > 5.0], r[b < -5.0]
+                        side = 1.0 if (left.mean() if len(left) else 0.0) >= (right.mean() if len(right) else 0.0) else -1.0
+                        self._look = {'side': side, 'turned': 0.0, 'yaw': yaw}
+                        self.notes.append(f'{t:.1f} turning {"left" if side > 0 else "right"} to find a way on')
+                    if self._look is not None:
+                        step = self._look_step(t, yaw)
+                        if step is not None:
+                            return step
                     return Step(None, (0.0, 0.0), False, EXPLORE, 'no way on')
                 else:
                     here = np.array([x, y])

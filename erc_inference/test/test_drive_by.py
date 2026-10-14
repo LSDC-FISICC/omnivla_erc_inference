@@ -41,14 +41,23 @@ def test_open_corridor_is_driven_straight_on_without_turning_first():
     assert any('open ahead' in n for n in m.notes)
 
 
-def test_someone_standing_in_front_closes_the_way_and_nothing_turns():
+def test_closed_ahead_it_waits_briefly_then_turns_and_takes_the_first_way_that_opens():
     r = CORRIDOR.copy()
-    r[9:15] = 0.6
+    r[4:21] = 0.6                                        # walled in within +-40 deg
     m = mission()
-    step = drive(m, r, 4.0)
-    assert m._opening(0.0) is None
-    assert step.command in (None, (0.0, 0.0))                        # a way round by the map, or standing still
+    step = drive(m, r, 1.5)
+    assert m._opening(0.0) is None and step.command == (0.0, 0.0)      # a moment still: no look around
+    for k in range(int(1.5 * 3), int(4.0 * 3)):          # after no_way_wait_s it turns, it does not stand
+        t = k / 3.0
+        m.observe_scan(t, 0.0, 0.0, 0.0, BEARINGS, r, r < 2.95)
+        step = m.update(t, 0.0, 0.0, 0.0, 0.0)
+    assert step.command is not None and step.command[0] == 0.0 and abs(step.command[1]) > 0.1
     assert not any('looking around' in n for n in m.notes)
+    t = 4.4
+    m.observe_scan(t, 0.0, 0.0, 0.0, BEARINGS, CORRIDOR, CORRIDOR < 2.95)    # the corridor comes into view
+    step = m.update(t + 0.1, 0.0, 0.0, 0.0, 0.0)
+    assert any('open ahead' in n for n in m.notes[-2:])
+    assert m._look is None
 
 
 def test_a_plant_counts_once_when_the_rover_drives_past_it():

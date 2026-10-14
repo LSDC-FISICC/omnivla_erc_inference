@@ -167,6 +167,21 @@ class LocalCostmap:
             self._dist = None
         return n
 
+    def forget_beyond(self, x, y, radius):
+        """Cells further than radius from (x, y) go back to unseen -> how many. A local map: what is
+        far was drawn from a pose that has drifted since, and its leftovers -- a wall a metre off,
+        a free strip through it -- drew routes to places that are not there (14-oct)."""
+        r = self.p['resolution_m']
+        rows, cols = np.ogrid[0:self.h, 0:self.w]
+        far = ((self.ox + (cols + 0.5) * r - x) ** 2 + (self.oy + (rows + 0.5) * r - y) ** 2) > radius * radius
+        old = self.seen & far
+        n = int(old.sum())
+        if n:
+            self.L[old] = 0.0
+            self.seen[old] = False
+            self._dist = None
+        return n
+
     def recenter(self, x, y):
         """Shift the grid by whole cells so that (x, y) is at its centre; what falls off is lost."""
         res = self.p['resolution_m']

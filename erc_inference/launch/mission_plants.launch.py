@@ -97,7 +97,7 @@ def generate_launch_description():
                               description='minimum confidence of a YOLO26 detection (raise it if it sees plants that are not)'),
         DeclareLaunchArgument('local_map', default_value='true',
                               description='also run local_map_node: /erc/local_map, the map with nobody driving'),
-        DeclareLaunchArgument('map_forget_m', default_value='25.0',
+        DeclareLaunchArgument('map_forget_m', default_value='10.0',
                               description='local_map_node: keep what was seen in the last this-many metres driven (0: all)'),
         DeclareLaunchArgument('turn_enter_deg', default_value='30.0',
                               description='the carrot turns in place once the route is this far off the heading'),

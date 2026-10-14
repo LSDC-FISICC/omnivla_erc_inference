@@ -55,8 +55,9 @@ class LocalMapNode(Node):
         self.declare_parameter('map_topic', '/erc/local_map')
         self.declare_parameter('mission_objects_topic', '/erc/explore/objects')
         self.declare_parameter('map_half_m', 30.0)           # the grid: a square this far each way, kept around the rover
-        self.declare_parameter('map_forget_m', 25.0)         # a cell is dropped this many metres DRIVEN after it was
+        self.declare_parameter('map_forget_m', 10.0)         # a cell is dropped this many metres DRIVEN after it was
                                                              # last seen (0: never): the pose drifts, old map lies
+        self.declare_parameter('map_radius_m', 5.0)          # ... and when further than this from the rover (0: kept)
         self.declare_parameter('publish_rate_hz', 1.0)
         for name, default in LOCAL_INDOOR.items():
             self.declare_parameter(f'local.{name}', default)
@@ -119,10 +120,13 @@ class LocalMapNode(Node):
         if d < 1.0:
             self._odometer += d
         self._odo_xy = (x, y)
-        if self._odometer - self._forgot_at < 1.0:
+        if self._odometer - self._forgot_at < 0.5:
             return
         self._forgot_at = self._odometer
         m = self._replanner.map
+        radius = float(self.get_parameter('map_radius_m').value)
+        if radius > 0.0:
+            m.forget_beyond(x, y, radius)
         half = 0.5 * m.w * m.p['resolution_m']
         if max(abs(x - (m.ox + half)), abs(y - (m.oy + half))) > 0.5 * half:
             m.recenter(x, y)
