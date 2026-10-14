@@ -32,6 +32,7 @@ Arguments:
   apart_m      a plant this close to one already counted is the same plant (default 1.5)
   slow_m, stop_m, too_close_m   the reflexes above (defaults 1.0, 0.6, 0.35 m)
   drive        reactive (default) or route
+  turn         right (default), left or open: which way it turns at a corner or a corridor's end
   approach     false (default). true: go to each plant and show it, with these three:
   show_s       how long it holds still in front of each plant (default 5)
   arrive_m     a plant counts once the rover is within this of it (default 1.0)
@@ -85,6 +86,9 @@ def generate_launch_description():
             # slows down gradually) or 'route' (the follower mission_plants.launch.py started:
             # carrot, or MPPI with controller:=mppi)
             'explore.drive': LaunchConfiguration('drive'),
+            # at a corner or the end of a corridor: turn this way until a corridor not just come along
+            # opens (the building: rings of corridors taken with right turns, joined at the lobby)
+            'explore.turn_preference': LaunchConfiguration('turn'),
             'tick_rate_hz': 5.0,
             # A tilt needs the accelerometer to agree: on 12-oct the attitude filter read 15-17 deg
             # three times while turning in place on a flat floor (the accelerometer: 0.8 deg), and
@@ -119,6 +123,8 @@ def generate_launch_description():
                               description='false: drive past and count; true: go to each plant, face it, hold still'),
         DeclareLaunchArgument('count_m', default_value='2.0',
                               description='driving past: a plant counts once the rover is within this of it (m)'),
+        DeclareLaunchArgument('turn', default_value='right',
+                              description="at a corner: turn 'right' / 'left' until a new corridor opens; 'open': the map decides"),
         DeclareLaunchArgument('drive', default_value='reactive',
                               description="'reactive': the mission steers itself, smoothly; 'route': the carrot or "
                                           "MPPI of mission_plants.launch.py follows its route"),

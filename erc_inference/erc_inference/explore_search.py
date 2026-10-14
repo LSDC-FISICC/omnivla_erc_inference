@@ -132,6 +132,12 @@ DEFAULTS = dict(
     turn_back_after_s=2.0,      # heading is taken only after this long with nothing better (6 s until 14-oct:
                                 # the user wants it to wait less and take the first way that opens)
     no_way_wait_s=2.0,          # look_around off: nowhere to go for this long -> turn towards the open side
+    turn_preference='open',     # look_around off, the way ahead closed: 'right' / 'left' -- turn that way until a
+                                # corridor the rover has not just come along opens (the team's building: rings
+                                # of corridors taken with right turns, 14-oct); 'open': the map decides
+    corner_wait_s=0.5,
+    crumbs_m=15.0,              # the way it came: the last this-many metres driven, a point every 0.3 m. Not a
+    crumb_avoid_m=0.8,          # map -- an opening leading within this of it is "back", not a new corridor
     look_w=0.25,                # ... at this command: ~15 deg/s on this unit, under forward_max_turn_dps, so
                                 # the open way ahead is looked for in every profile while it turns
 )
@@ -190,6 +196,9 @@ class ExploreSearchMission:
         self._pick_t = -math.inf
         self._back_since = None          # since when the only way on has been behind the rover
         self._look = None                # turning to find a way on: {'side', 'turned' (deg), 'yaw'}
+        self._crumbs = []                # (x, y, odometer): the way it came
+        self._corner_failed = False      # a full turn at a corner found nothing new
+        self._allow_back_until = -math.inf   # odometer: until then the way it came counts as a way on
         self._last_check = -math.inf
         self._backoff_until = None
         self._stuck_at = []              # (t, x, y) of recent stuck events
@@ -357,6 +366,10 @@ class ExploreSearchMission:
             if d < 1.0:                      # a jump is a new anchor, not driving
                 self.odometer += d
         self._odo_xy = (x, y)
+        if not self._crumbs or math.hypot(x - self._crumbs[-1][0], y - self._crumbs[-1][1]) >= 0.3:
+            self._crumbs.append((x, y, self.odometer))
+            while self._crumbs and self._crumbs[0][2] < self.odometer - self.p['crumbs_m']:
+                self._crumbs.pop(0)
         if self.odometer - self._forgot_at < 0.5:
             return
         self._forgot_at = self.odometer
@@ -569,6 +582,21 @@ class ExploreSearchMission:
         first = int(np.argmax(unseen))
         return not wall[:first].any()
 
+    def _back_on_trail(self, x, y, ang):
+        """True when the way along ang leads back where the rover came from (its last crumbs_m, not
+        the last 2 m), unless that has been allowed for a while."""
+        if self.odometer < self._allow_back_until:
+            return False
+        old = [(cx, cy) for cx, cy, co in self._crumbs if co < self.odometer - 2.0]
+        if not old:
+            return False
+        old = np.array(old)
+        for d in (1.5, 2.5, 3.5):
+            px, py = x + d * math.cos(ang), y + d * math.sin(ang)
+            if float(np.hypot(old[:, 0] - px, old[:, 1] - py).min()) < self.p['crumb_avoid_m']:
+                return True
+        return False
+
     def _committed(self, x, y):
         """True while the rover is on its way to a frontier the map chose and that frontier is still
         one. The way ahead does not take over then: with both deciding, each for a second or two --
@@ -607,6 +635,8 @@ class ExploreSearchMission:
             if abs(turn) < math.radians(40.0):          # half-way each second: one odd profile does not swing it
                 ang = self._fwd_dir[1] + 0.5 * turn
         if not self._leads_to_unseen(x, y, ang, got[1]):
+            return keep
+        if p['turn_preference'] in ('right', 'left') and self._back_on_trail(x, y, ang):
             return keep
         reach = max(1.0, min(p['forward_reach_m'], got[1] - 0.5))
         if self._route_kind != FORWARD:
@@ -814,10 +844,37 @@ class ExploreSearchMission:
             self._nothing_since = None
             self._back_since = None
             self._look = None
+            self._corner_failed = False
         else:
             self.state = EXPLORE
             if self._route_kind == FORWARD:      # the way ahead closed: the map decides
                 self._route_kind = None
+            if (p['turn_preference'] in ('right', 'left') and not p['look_around']
+                    and not self._committed(x, y) and not self._corner_failed):
+                # A corner or the end of a corridor: turn the preferred way until a corridor it has not
+                # just come along opens -- the open way ahead, checked first on every tick, takes over.
+                if self._look is None or not self._look.get('corner'):
+                    if self._nothing_since is None:
+                        self._nothing_since = t
+                        self.notes.append(f'{t:.1f} the way ahead closed: turning {p["turn_preference"]} '
+                                          f'for a corridor not taken yet')
+                    if t - self._nothing_since < p['corner_wait_s']:
+                        return Step(None, (0.0, 0.0), False, EXPLORE, 'the way ahead closed')
+                    self._look = {'side': -1.0 if p['turn_preference'] == 'right' else 1.0, 'turned': 0.0,
+                                  'yaw': yaw, 'corner': True}
+                lk = self._look
+                lk['turned'] += abs(math.degrees(_wrap(yaw - lk['yaw'])))
+                lk['yaw'] = yaw
+                if lk['turned'] < 360.0:
+                    self._trail = []
+                    return Step(None, (0.0, lk['side'] * p['look_w']), False, EXPLORE, 'turning for a new corridor')
+                # a full turn and nothing it has not come along: back the way it came, for a while; the
+                # map decides meanwhile
+                self._look = None
+                self._nothing_since = None
+                self._corner_failed = True
+                self._allow_back_until = self.odometer + 0.5 * p['crumbs_m']
+                self.notes.append(f'{t:.1f} a full turn and no corridor not taken: going back the way it came')
             if self._route_kind == EXPLORE and self.frontier is None:
                 self._route_kind = None          # a frontier was looked for and none found: no route in force
             if self._route_kind == EXPLORE and self._route_blocked(t):

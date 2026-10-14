@@ -33,8 +33,26 @@ PLANT_R = 0.2
 
 
 def world():
-    """Walls of the floor (m). The rover starts at (0, 0) facing +x, in the first corridor."""
+    """Walls of the floor (m). The rover starts at (0, 0) facing +x, in the first corridor.
+    WORLD=loops: the team's building as the user described it (14-oct) -- a ring of 2.4 m corridors
+    round a block, taken with right turns; at its last corner the corridor goes straight on through a
+    lobby into another corridor."""
     W = lambda a, b: obs.Segment(a, b)
+    if os.environ.get('WORLD') == 'loops':
+        return [
+            # the block the ring goes round: x 0.4..11.6, y -9.6..-1.2
+            W((0.4, -1.2), (11.6, -1.2)), W((11.6, -1.2), (11.6, -9.6)),
+            W((11.6, -9.6), (0.4, -9.6)), W((0.4, -9.6), (0.4, -1.2)),
+            # the ring's outside: top y 1.2 (x -2..14), right x 14, bottom y -12 (x -2..14), left x -2
+            # down to the lobby
+            W((-2.0, 1.2), (14.0, 1.2)), W((14.0, 1.2), (14.0, -12.0)), W((14.0, -12.0), (-2.0, -12.0)),
+            W((-2.0, 1.2), (-2.0, -7.0)),
+            # the lobby: x -8..-2, y -14..-7, open to the ring at x -2 (y -7..-12) and to corridor C
+            W((-2.0, -7.0), (-8.0, -7.0)), W((-2.0, -12.0), (-2.0, -14.0)), W((-2.0, -14.0), (-8.0, -14.0)),
+            W((-8.0, -7.0), (-8.0, -9.6)), W((-8.0, -12.0), (-8.0, -14.0)),
+            # corridor C, straight on from the bottom of the ring: y -12..-9.6, x -20..-8, closed at x -20
+            W((-8.0, -9.6), (-20.0, -9.6)), W((-8.0, -12.0), (-20.0, -12.0)), W((-20.0, -9.6), (-20.0, -12.0)),
+        ]
     return [
         # corridor A: x -1.5..14, y -1..1; door to the room at x 5..6.2 on its north wall
         W((-1.5, -1.0), (14.0, -1.0)), W((-1.5, -1.0), (-1.5, 1.0)),
@@ -47,6 +65,9 @@ def world():
 
 
 PLANTS = np.array([[9.0, 0.6], [6.8, 4.2], [13.4, 7.0], [3.6, 4.4]])
+if os.environ.get('WORLD') == 'loops':
+    PLANTS = np.array([[5.0, 0.8], [9.5, -0.8], [13.6, -4.0], [12.0, -8.0], [6.0, -11.6], [2.0, -10.0],
+                       [-5.0, -8.0], [-14.0, -11.6]])
 if os.environ.get('PLANTS_XY'):          # "x,y;x,y;..." -- another arrangement, e.g. one in view from the start
     PLANTS = np.array([[float(v) for v in q.split(',')] for q in os.environ['PLANTS_XY'].split(';')])
 
@@ -63,6 +84,8 @@ def run(seed, n_goals=3, t_max=1800.0, delay_s=1.0, wheel_scale=0.97, gyro_scale
                   same_class_apart_m=1.5)
     if reactive:
         kw['drive'] = 'reactive'
+    if count and os.environ.get('TURN'):
+        kw['turn_preference'] = os.environ['TURN']          # TURN=right: as plants_controller.launch.py
     m = ExploreSearchMission([Goal(f'Maceta{i + 1}', 'potted plant', i + 1) for i in range(n_goals)],
                              (0.0, 0.0), dict(LOCAL_INDOOR), **kw)
     x = y = th = 0.0                 # truth

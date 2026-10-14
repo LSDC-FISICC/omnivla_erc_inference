@@ -236,3 +236,23 @@ def test_the_turn_already_commanded_is_not_commanded_again():
     ws = [d.step(0.2 * k, 0.0, (BEARINGS, r, r < 2.95), 0.0, 30.0)[1] for k in range(8)]
     assert max(ws) > 0.15
     assert ws[-1] < max(ws)
+
+
+def test_at_the_end_of_a_corridor_it_turns_right_and_not_back_the_way_it_came():
+    m = mission(turn_preference='right')
+    for k in range(40):                                  # 13 s along the corridor, +x, 0.25 m/s
+        t, x = k / 3.0, 0.25 * k / 3.0
+        m.observe_scan(t, x, 0.0, 0.0, BEARINGS, CORRIDOR, CORRIDOR < 2.95)
+        m.update(t, x, 0.0, 0.0, 0.0)
+    wall = np.full(len(BEARINGS), 0.8)                   # the end wall
+    t0, x = 40 / 3.0, 0.25 * 40 / 3.0
+    for k in range(15):                                  # the straight route is kept up to 3 s (one odd profile)
+        t = t0 + k / 3.0
+        m.observe_scan(t, x, 0.0, 0.0, BEARINGS, wall, wall < 2.95)
+        step = m.update(t, x, 0.0, 0.0, 0.0)
+    assert step.command is not None and step.command[0] == 0.0 and step.command[1] < 0.0     # right
+    assert any('turning right' in n for n in m.notes)
+    # facing back down the corridor it came along: open, but not a way on
+    back = math.pi
+    assert m._back_on_trail(x, 0.0, back)
+    assert not m._back_on_trail(x, 0.0, -math.pi / 2)
