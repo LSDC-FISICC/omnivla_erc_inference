@@ -10,6 +10,11 @@ mission_plants.launch.py; it is the only writer of /cmd_vel, so Ctrl-C here stop
 No known map: the rover's pose when the goal is sent is the map's origin (0, 0, facing +x).
 The map and the plants on it are published on /erc/explore/map and /erc/explore/objects.
 
+Who drives (drive, since 14-oct): 'reactive' (default), the mission itself -- it steers towards
+where it wants to go through what the profile shows, while moving, and slows down gradually
+(reactive_drive.py); whatever follower mission_plants.launch.py started is then not listened to.
+'route': the route goes to that follower, the carrot or MPPI (controller:=mppi there).
+
 What it does (since 12-oct): drives on wherever the profile shows an open way ahead that leads to
 ground not seen yet, and counts each potted plant as it comes within count_m of it. It does not
 turn in place to search, does not go to the plants and does not stop at them. With no open way
@@ -25,7 +30,8 @@ Arguments:
   timeout_s    the mission's time limit (default 1800)
   count_m      a plant counts once the rover is within this of it, driving by (default 2.0)
   apart_m      a plant this close to one already counted is the same plant (default 1.5)
-  slow_m, stop_m, too_close_m   the reflexes above (defaults 1.5, 0.6, 0.35 m)
+  slow_m, stop_m, too_close_m   the reflexes above (defaults 1.0, 0.6, 0.35 m)
+  drive        reactive (default) or route
   approach     false (default). true: go to each plant and show it, with these three:
   show_s       how long it holds still in front of each plant (default 5)
   arrive_m     a plant counts once the rover is within this of it (default 1.0)
@@ -74,6 +80,11 @@ def generate_launch_description():
             'explore.look_around': ParameterValue(approach, value_type=bool),
             'patrol.start_scan': ParameterValue(approach, value_type=bool),
             'explore.count_m': arg('count_m', float),
+            # who drives: 'reactive' (the mission itself, reactive_drive.py: steers while it moves,
+            # slows down gradually) or 'route' (the follower mission_plants.launch.py started:
+            # carrot, or MPPI with controller:=mppi)
+            'explore.drive': LaunchConfiguration('drive'),
+            'tick_rate_hz': 5.0,
             # A tilt needs the accelerometer to agree: on 12-oct the attitude filter read 15-17 deg
             # three times while turning in place on a flat floor (the accelerometer: 0.8 deg), and
             # each time the mission backed off and marked an obstacle ahead that was not there.
@@ -106,9 +117,12 @@ def generate_launch_description():
                               description='false: drive past and count; true: go to each plant, face it, hold still'),
         DeclareLaunchArgument('count_m', default_value='2.0',
                               description='driving past: a plant counts once the rover is within this of it (m)'),
+        DeclareLaunchArgument('drive', default_value='reactive',
+                              description="'reactive': the mission steers itself, smoothly; 'route': the carrot or "
+                                          "MPPI of mission_plants.launch.py follows its route"),
         DeclareLaunchArgument('stop_m', default_value='0.6',
                               description='nothing nearer than this within +-20 deg ahead is driven at (m)'),
-        DeclareLaunchArgument('slow_m', default_value='1.5',
+        DeclareLaunchArgument('slow_m', default_value='1.0',
                               description='0.15 m/s instead of 0.25 with anything nearer than this ahead (m; 0: off)'),
         DeclareLaunchArgument('too_close_m', default_value='0.35',
                               description='with anything nearer than this within +-40 deg: straight back, no turning (0: off)'),

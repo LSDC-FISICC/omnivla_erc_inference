@@ -51,7 +51,8 @@ if os.environ.get('PLANTS_XY'):          # "x,y;x,y;..." -- another arrangement,
     PLANTS = np.array([[float(v) for v in q.split(',')] for q in os.environ['PLANTS_XY'].split(';')])
 
 
-def run(seed, n_goals=3, t_max=1800.0, delay_s=1.0, wheel_scale=0.97, gyro_scale=1.03, record=False, count=False):
+def run(seed, n_goals=3, t_max=1800.0, delay_s=1.0, wheel_scale=0.97, gyro_scale=1.03, record=False, count=False,
+        reactive=False):
     rng = np.random.default_rng(seed)
     walls = world()
     things = walls + [obs.Disc(tuple(p), PLANT_R) for p in PLANTS]
@@ -60,6 +61,8 @@ def run(seed, n_goals=3, t_max=1800.0, delay_s=1.0, wheel_scale=0.97, gyro_scale
     if count:                        # driving past and counting, as plants_controller.launch.py runs it
         kw.update(start_scan=False, count_on_sight=True, forward_first=True, look_around=False,
                   same_class_apart_m=1.5)
+    if reactive:
+        kw['drive'] = 'reactive'
     m = ExploreSearchMission([Goal(f'Maceta{i + 1}', 'potted plant', i + 1) for i in range(n_goals)],
                              (0.0, 0.0), dict(LOCAL_INDOOR), **kw)
     x = y = th = 0.0                 # truth
@@ -160,14 +163,15 @@ def main():
     ap.add_argument('--delay', type=float, default=1.0)
     ap.add_argument('--plot', default='')
     ap.add_argument('--count', action='store_true', help='drive past and count (no scans, no approach)')
+    ap.add_argument('--reactive', action='store_true', help='the mission drives itself (reactive_drive)')
     a = ap.parse_args()
     for seed in range(a.seeds):
         if a.plot and seed == 0:
-            out, m, trail = run(seed, a.goals, delay_s=a.delay, record=True, count=a.count)
+            out, m, trail = run(seed, a.goals, delay_s=a.delay, record=True, count=a.count, reactive=a.reactive)
             plot(m, trail, a.plot)
             print('\n'.join(m.notes[:60]))
         else:
-            out = run(seed, a.goals, delay_s=a.delay, count=a.count)
+            out = run(seed, a.goals, delay_s=a.delay, count=a.count, reactive=a.reactive)
         print(out)
 
 

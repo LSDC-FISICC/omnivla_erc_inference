@@ -30,6 +30,10 @@ runs since 12-oct): the rover never turns to search and never goes to an object.
     and A* above decide.
   * count_on_sight: an object counts when the rover comes within count_m of its track, as it
     drives by. Never one within same_class_apart_m of one already counted.
+  * drive 'reactive' (since 14-oct): the mission drives itself -- reactive_drive.py steers towards
+    the carrot through what the profile shows, while moving, and slows down gradually -- instead
+    of handing the carrot to a follower. With the carrot and MPPI the rover moved 23-30 % of the
+    time on 14-oct, stopping 6-7 times a minute.
   * look_around off: no scans. With nowhere to go the rover stands still no_way_wait_s, then
     makes quarter turns towards the open side, looking again after each (and starts the map
     again if it is boxed in by its own drifted map); a full turn with no way on ends the mission.
@@ -56,6 +60,8 @@ from erc_inference import local_planner as lp
 from erc_inference.image_goal_mission import Goal, _cumlen, _wrap, point_at, project_forward
 from erc_inference.loop_patrol import ARRIVED, DONE, GOTO, SCAN, SHOW, Step
 from erc_inference.object_tracker import ObjectTracker, Track
+from erc_inference.reactive_drive import DEFAULTS as REACTIVE_DEFAULTS
+from erc_inference.reactive_drive import ReactiveDrive
 from erc_inference.loop_patrol import DEFAULTS as PATROL_DEFAULTS
 
 EXPLORE = 'explore'
@@ -90,6 +96,9 @@ DEFAULTS = dict(
                                 # delay, and read as "stuck" with nothing ahead (ROS e2e, 9-oct). Only for
     stuck_turn_grace_s=30.0,    # this long: a turn that never ends is being stuck too
     # driving past and counting (see the module docstring)
+    drive='route',              # 'route': the route goes out as a carrot for the follower (carrot node or
+                                # MPPI); 'reactive': the mission drives itself with reactive_drive, steering
+                                # towards the carrot through what the profile shows (smooth, for this unit)
     count_on_sight=False,       # an object counts when the rover is within count_m of it; no GOTO, no SHOW
     count_m=2.0,
     count_min_sightings=8,      # ...and seen this many times: a track of 3-5 sightings is a piece of another,
@@ -122,6 +131,8 @@ DEFAULTS = dict(
     no_way_turn_wait_s=3.0,     # turn, and this long after each, up to a full turn; then "explored"
 )
 
+DEFAULTS.update({f'reactive_{k}': v for k, v in REACTIVE_DEFAULTS.items()})   # drive 'reactive'
+
 FORWARD = 'forward'             # a route kind, not a state: the state is EXPLORE
 
 
@@ -139,6 +150,8 @@ class ExploreSearchMission:
         self.replanner = lp.LocalReplanner(np.array([self.start - h, self.start + h]), **lp_kw)
         self.map = self.replanner.map
         self.cones = ObjectTracker()        # the objects, one track each; the attribute name is loop_patrol's
+        self.driver = ReactiveDrive(**{k[len('reactive_'):]: v for k, v in self.p.items() if k.startswith('reactive_')})
+        self._profile_yaw = 0.0
         self.odometer = 0.0                 # metres driven, for forgetting
         self._odo_xy = None
         self._forgot_at = 0.0
@@ -228,6 +241,7 @@ class ExploreSearchMission:
         b, r, h = np.asarray(bearings_deg, float), np.asarray(ranges, float), np.asarray(hit, bool)
         self._last_profile = (b, r, h)
         self._profile_t = t
+        self._profile_yaw = yaw
         self.map.odometer = self.odometer
         self.replanner.observe(t, x, y, yaw, b, r, h)
 
@@ -884,6 +898,13 @@ class ExploreSearchMission:
         if self._check_stuck(t, x, y, yaw):
             self.block_ahead(t, x, y, yaw, 'stuck')
             return Step(None, (p['backoff_v'], 0.0), False, self.state, 'backing off')
+        if p['drive'] == 'reactive':
+            c = self._carrot()
+            if self._last_profile is None or t - self._profile_t > p['forward_profile_age_s']:
+                return Step(c, (0.0, 0.0), False, self.state, 'no fresh profile', self.pts)
+            goal = math.degrees(_wrap(math.atan2(c[1] - y, c[0] - x) - yaw))
+            cmd = self.driver.step(t, yaw, self._last_profile, self._profile_yaw, goal)
+            return Step(c, cmd, False, self.state, self.driver.info.get('mode', ''), self.pts)
         return Step(self._carrot(), None, False, self.state, '', self.pts)
 
     def _show(self, t, x, y, yaw, est, rate):

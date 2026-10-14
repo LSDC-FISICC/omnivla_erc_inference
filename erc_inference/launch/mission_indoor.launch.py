@@ -154,10 +154,14 @@ def generate_launch_description():
                  'w_rest_deadband': float(dyn['w_rest_deadband']),
                  'w_rest_slope': float(dyn['w_rest_slope']),
                  'v_breakaway': max(0.05, float(dyn['v_floor'])),
-                 # the mission node's envelope stops anything slower (min_moving_linear_vel). The turn in
+                 # this unit moves from 0.10 m/s, and plants_controller sets the envelope's floor there:
+                 # at 0.25 MPPI's 0.07 m/s became 0.25 at the same curvature, and the turn saturated
+                 # (14-oct). The turn in
                  # place is the follower's own 50 / 20 deg, on the PREDICTED heading: with the carrot's
                  # 30 / 10 it swung +-30 deg about the route and turned in place 43 % of the time (e2e)
-                 'v_floor': 0.25}]),
+                 'v_floor': 0.10,
+                 # 0.2-2.0 let the learned gain fall to 0.20 on 14-oct, commands x5, the turn saturated
+                 'k_w_bounds': [0.7, 1.6]}]),
     ]
 
     # No GPS wait inside, so no TimerAction as in the outdoor launches.

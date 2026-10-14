@@ -19,7 +19,8 @@ Then, in its own terminal -- it is the only writer of /cmd_vel, so Ctrl-C there 
     ros2 action send_goal --feedback /start_mission erc_inference_msgs/action/StartMission \\
         "{resume_from_latest_scanned: false}"
 
-Arguments: controller:=carrot|mppi (default carrot), record:=true (a rosbag of the run, rosbags/mission_<time>_macetas),
+Arguments: controller:=carrot|mppi (default carrot; used only with plants_controller.launch.py
+drive:=route -- with its default drive:=reactive the mission steers itself), record:=true (a rosbag of the run, rosbags/mission_<time>_macetas),
 local_map:=true|false (default true), debug_images:=true|false (default true: the frame with the ground and the obstacle
 band, and the model's distance, as JPEGs; the YOLO26 boxes are always published),
 foxglove:=true|false (default false: also start foxglove_bridge on 127.0.0.1:foxglove_port,
@@ -76,7 +77,8 @@ def generate_launch_description():
     # Started and closed by this launch, so Ctrl-C here closes the bag properly.
     bag = ExecuteProcess(
         cmd=['ros2', 'bag', 'record', '--all-topics',
-             '--exclude-regex', '/erc/(front|rear)_camera$|/erc/perception/distance$',
+             # /trajectories: MPPI's sampled trajectories, 12 GB in 20 minutes on 14-oct
+             '--exclude-regex', '/erc/(front|rear)_camera$|/erc/perception/distance$|/trajectories$',
              '-o', [LaunchConfiguration('bag_dir'), '/mission_', LaunchConfiguration('bag_name')]],
         output='log', condition=IfCondition(LaunchConfiguration('record')))
     reminder = LogInfo(msg=(

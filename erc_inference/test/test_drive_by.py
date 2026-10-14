@@ -180,3 +180,50 @@ def test_a_band_at_1p8_m_does_not_close_the_corridor_and_turning_back_waits():
     m = mission()
     step = drive(m, r, 2.0)
     assert step.carrot is not None and any('open ahead' in n for n in m.notes)
+
+
+# -- reactive_drive: the mission steering itself (14-oct) -----------------------------------------
+
+from erc_inference.reactive_drive import ReactiveDrive  # noqa: E402
+
+
+def drive_once(profile_ranges, goal_deg=0.0, n=8):
+    d = ReactiveDrive()
+    hit = profile_ranges < 2.95
+    v = w = 0.0
+    for k in range(n):
+        v, w = d.step(0.2 * k, 0.0, (BEARINGS, profile_ranges, hit), 0.0, goal_deg)
+    return d, v, w
+
+
+def test_an_open_corridor_is_driven_at_full_speed_without_turning():
+    d, v, w = drive_once(CORRIDOR)
+    assert v > 0.2 and abs(w) < 0.1 and d.info['mode'] == 'drive'
+
+
+def test_a_pot_ahead_on_the_left_is_passed_on_the_right_without_stopping():
+    # mission_1014_1405_carrot, 36-60 s: a pot 0.4-0.7 m ahead on the left, the corridor open on the
+    # right. The carrot drove at it, the envelope stopped it, it backed off, and again, for 24 s.
+    r = np.array([2.1, 2.4, 2.8, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0,
+                  0.7, 0.7, 0.6, 0.6, 0.6, 0.7, 0.7, 0.8, 0.8, 3.0, 3.0, 3.0, 3.0])
+    d, v, w = drive_once(r, goal_deg=5.0)
+    assert d.info['heading'] < -10.0          # chooses the right
+    assert w < 0.0 and v >= 0.10              # turns right while it keeps moving
+
+
+def test_walled_in_ahead_it_turns_in_place_towards_the_room():
+    r = np.full(len(BEARINGS), 0.5)
+    r[BEARINGS > 45] = 3.0
+    d, v, w = drive_once(r)
+    assert v == 0.0 and w > 0.0
+
+
+def test_the_turn_already_commanded_is_not_commanded_again():
+    # 30 deg to the left: the first command turns; with that turn in flight (1.3 s), the next ones
+    # ask less, though the profile still shows the opening 30 deg off
+    r = np.full(len(BEARINGS), 0.8)
+    r[(BEARINGS > 20) & (BEARINGS < 40)] = 3.0
+    d = ReactiveDrive()
+    ws = [d.step(0.2 * k, 0.0, (BEARINGS, r, r < 2.95), 0.0, 30.0)[1] for k in range(8)]
+    assert max(ws) > 0.15
+    assert ws[-1] < max(ws)

@@ -29,7 +29,7 @@ if [ "${CONTROLLER:-carrot}" = mppi ]; then
   ros2 run nav2_lifecycle_manager lifecycle_manager --ros-args -r __node:=lifecycle_manager_mppi \
     --params-file "$NAV2_YAML" > "$OUT.lifecycle.log" 2>&1 & LM=$!
   python3 -m erc_inference.nav2_route_follower_node --ros-args -p predict_delay_s:=1.33 -p k_v:=1.07 \
-    -p k_w_moving:=1.13 -p w_rest_deadband:=0.10 -p w_rest_slope:=1.7 -p v_breakaway:=0.05 -p v_floor:=0.25 \
+    -p k_w_moving:=1.13 -p w_rest_deadband:=0.10 -p w_rest_slope:=1.7 -p v_breakaway:=0.05 -p v_floor:=0.10 -p 'k_w_bounds:=[0.7, 1.6]' \
     ${EXTRA_FOLLOWER_ARGS:-} > "$OUT.follower.log" 2>&1 & CN=$!
   NAV2_PIDS="$CS $LM"
 else

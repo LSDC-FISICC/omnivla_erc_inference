@@ -71,6 +71,8 @@ class World(Node):
         self.t0 = self._now()
         self.last = None
         self.hits, self.hit_now, self.min_clear = [], False, 9.0
+        self.started, self.moving_s, self.run_s, self.switches, self.was_moving = False, 0.0, 0.0, 0, None
+        self.path_m, self.turn_deg = 0.0, 0.0
         self.pose_err = []
         self.est_pose = None
         self.maps, self.map_last, self.markers_last = 0, None, None
@@ -128,6 +130,8 @@ class World(Node):
             d = float(np.hypot(*(self.plants[which] - (self.x, self.y))))
             STATE['shown'].append((round(self.t()), which, round(d, 2)))
             STATE['done'] = len(STATE['shown']) >= self.n_goals
+        if 'Anchored' in m.msg:
+            self.started = True
         if 'nothing left to explore' in m.msg or 'Mission failed' in m.msg:
             STATE['done'] = True
 
@@ -167,6 +171,15 @@ class World(Node):
             self.x, self.y = nx, ny
             moved = self.v
         self.min_clear = min(self.min_clear, c)
+        if self.started:                 # smoothness: how much of the time it moves, how often it stops
+            mv = self.v > 0.05
+            self.moving_s += dt * mv
+            self.run_s += dt
+            if self.was_moving is not None and mv != self.was_moving:
+                self.switches += 1
+            self.was_moving = mv
+            self.path_m += abs(self.v) * dt
+            self.turn_deg += abs(math.degrees(self.w)) * dt
         self.eth += (self.w * (1 + GYRO_SCALE) + math.radians(GYRO_BIAS_DEG_MIN) / 60.0) * dt
         self.ex += moved * (1 + WHEEL_SCALE) * math.cos(self.eth) * dt
         self.ey += moved * (1 + WHEEL_SCALE) * math.sin(self.eth) * dt
@@ -236,6 +249,9 @@ def main():
     print(f'plants_e2e seed={seed}: t={t_end:.0f}s shown={len(shown)}/{n_goals} distinct={len({s[1] for s in shown})} '
           f'(t, plant, true m)={shown} hits={len(n.hits)} {n.hits[:6]} min_clear={n.min_clear:.2f} '
           f'pose_err p50={np.nanmedian(pe):.2f} max={np.nanmax(pe):.2f}', flush=True)
+    T = max(n.run_s, 1e-6)
+    print(f'smoothness: moving {100 * n.moving_s / T:.0f}% of {T:.0f} s, {60 * n.switches / 2 / T:.1f} stops/min, '
+          f'path {n.path_m:.0f} m, turned {n.turn_deg:.0f} deg ({n.turn_deg / max(n.path_m, 0.1):.0f} deg/m)', flush=True)
     g = n.map_last
     if g is None:
         print('map: NOTHING on /erc/explore/map', flush=True)
