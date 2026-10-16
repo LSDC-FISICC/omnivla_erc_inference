@@ -105,6 +105,9 @@ def generate_launch_description():
             'safety.min_moving_linear_vel': 0.10,          # this unit moves from 0.10 m/s (rover_dynamics.yaml)
             'safety.stop_confirm_ticks': 1,
             'safety.stale_stops_turning': True,
+            # no attitude for 1.5 s: stop. The bridge drops IMU samples this rover cannot produce (15-oct:
+            # the IMU stuck at full scale, the heading spun 7000 deg); with none, the heading is blind
+            'safety.stop_if_attitude_stale': True,
             'safety.too_close_m': arg('too_close_m', float),
             # what MPPI needs if it is the one driving (mission_plants.launch.py controller:=mppi);
             # with the carrot nobody listens

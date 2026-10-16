@@ -28,7 +28,7 @@ from geometry_msgs.msg import PoseStamped, Twist, Vector3
 from nav_msgs.msg import OccupancyGrid, Odometry
 from rcl_interfaces.msg import Log
 from rclpy.node import Node
-from sensor_msgs.msg import LaserScan
+from sensor_msgs.msg import Imu, LaserScan
 from std_msgs.msg import String
 from visualization_msgs.msg import MarkerArray
 
@@ -87,6 +87,9 @@ class World(Node):
         self.create_subscription(MarkerArray, '/erc/explore/objects', self._markers, 1)
         self.create_timer(0.05, self._step)
         self.create_timer(1 / 30, self._pub_odom)
+        # a level attitude with gravity, as imu_filter_madgwick publishes it: the mission stops without one
+        self.att = self.create_publisher(Imu, '/erc/imu_attitude', 10)
+        self.create_timer(0.1, self._pub_attitude)
         self.create_timer(1 / 3, self._camera)
         print('plants: ' + ', '.join(f'({p[0]:.1f},{p[1]:.1f})' for p in self.plants), flush=True)
 
@@ -188,6 +191,13 @@ class World(Node):
             self.hist.popleft()
         if self.est_pose is not None:
             self.pose_err.append(math.hypot(self.est_pose[0] - self.x, self.est_pose[1] - self.y))
+
+    def _pub_attitude(self):
+        m = Imu()
+        m.header.stamp = self.get_clock().now().to_msg()
+        m.orientation.z, m.orientation.w = math.sin(self.eth / 2), math.cos(self.eth / 2)
+        m.linear_acceleration.z = 9.81
+        self.att.publish(m)
 
     def _pub_odom(self):
         ox, oy, oth = ODOM_OFFSET
