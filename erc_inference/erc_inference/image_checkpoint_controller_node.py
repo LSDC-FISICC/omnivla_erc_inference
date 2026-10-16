@@ -124,6 +124,9 @@ class ImageCheckpointControllerNode(IndoorMissionNode):
         # '' = not used. cones_topic may be '' too, so that only objects are searched for.
         self.declare_parameter('objects_topic', '')
         self.declare_parameter('object_classes', ['potted plant'])
+        # people (YOLO26 'person', when the detector looks for it): kept off the map, waited for when in
+        # the way (explore_search.observe_people). Empty: people are whatever the profile makes of them.
+        self.declare_parameter('person_classes', ['person'])
         # No known corridors: explore_search.ExploreSearchMission builds the map from /erc/free_space,
         # explores it and visits the objects it finds. route_file is then only the start pose, and the
         # wall-based drift correction is off (there are no known walls). The map (OccupancyGrid) and
@@ -362,6 +365,17 @@ class ImageCheckpointControllerNode(IndoorMissionNode):
             return
         wanted = set(self._param('object_classes'))
         t = self._now()
+        persons = set(self._param('person_classes'))
+        if persons and hasattr(self.mission, 'observe_people'):
+            stamp = float(doc.get('stamp', 0.0))
+            age = self._ros_s() - stamp if stamp > 0 else 0.0
+            t_frame = t - min(max(age, 0.0), 10.0)          # the frame's time, as the profiles get
+            people = [(float(d['bearing_right_deg']), float(d['bearing_left_deg']),
+                       d['range_m'] if d.get('range_m') is not None else d.get('range_scan_m'))
+                      for d in dets if d.get('label') in persons and 'bearing_left_deg' in d]
+            with self._mission_lock:
+                if self.mission is not None:
+                    self.mission.observe_people(t_frame, pose.x, pose.y, pose.yaw, people)
         # no range: the object is not on the floor, or there was no fresh distance image for it
         frame = [(d['label'], float(d['bearing_deg']), float(d['range_m'])) for d in dets
                  if d.get('label') in wanted and d.get('range_m') is not None]

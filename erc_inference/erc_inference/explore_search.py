@@ -61,6 +61,7 @@ from erc_inference import local_planner as lp
 from erc_inference.image_goal_mission import Goal, _cumlen, _wrap, point_at, project_forward
 from erc_inference.loop_patrol import ARRIVED, DONE, GOTO, SCAN, SHOW, Step
 from erc_inference.object_tracker import ObjectTracker, Track
+from erc_inference.people_mask import PeopleMask
 from erc_inference.reactive_drive import DEFAULTS as REACTIVE_DEFAULTS
 from erc_inference.reactive_drive import ReactiveDrive
 from erc_inference.loop_patrol import DEFAULTS as PATROL_DEFAULTS
@@ -140,6 +141,29 @@ DEFAULTS = dict(
     crumb_avoid_m=0.8,          # map -- an opening leading within this of it is "back", not a new corridor
     look_w=0.25,                # ... at this command: ~15 deg/s on this unit, under forward_max_turn_dps, so
                                 # the open way ahead is looked for in every profile while it turns
+    # People (observe_people; YOLO26 'person'). On 12-oct two people walking up the corridor went into the
+    # map as a wall across it, and a person in front closes the open way ahead as a wall does: the rover
+    # turned looking for another corridor. A person is not part of the building: what the profile reports
+    # where a person is does not go on the map, and with one in the way the rover stands still until they
+    # are gone and the profile has looked at the floor there again (16-oct, the user's idea).
+    people_wait=True,           # False: people are only kept off the map
+    person_mask_s=0.8,          # a profile within this of a sighting has that person's bins kept off the map
+    person_mask_deg=4.0,        # margin each side of the box ...
+    person_mask_m=0.4,          # ... plus this much sideways at their range (they walk; the frames differ)
+    person_clear_m=0.6,         # the hits within this of a sighted person, along their box, are dropped
+    person_wait_m=3.0,          # in the way: nearer than this ahead (the profile reaches 3 m) ...
+    person_wait_half_m=0.6,     # ... and within this of the rover's line
+    person_keep_m=4.0,          # waiting, someone is still in the way this near ahead ...
+    person_keep_half_m=1.0,     # ... and this near the line. Without the margin, two people standing 3-3.5 m
+                                # ahead -- the depth range is good to ~8 % -- went in and out of the way, and
+                                # the wait broke into 3-7 stops of 1-4 s (explore_search_sim PEOPLE=1)
+    person_confirm=2,           # waiting starts with this many sightings in the way within person_gone_s: one
+                                # frame alone stopped nothing worth it -- 7 of the 18 episodes in rosbags/
+                                # mission_1015_2151 were one frame, each a ~2 s stop
+    person_gone_s=1.0,          # driving on: no one in the way for this long ...
+    person_profiles=2,          # ... and this many profiles taken after the last sighting
+    person_wait_max_s=20.0,     # no longer than this: then they are driven round (the profile still sees them,
+                                # and so do the reflexes) -- for as long again before waiting once more
 )
 
 DEFAULTS.update({f'reactive_{k}': v for k, v in REACTIVE_DEFAULTS.items()})   # drive 'reactive'
@@ -205,6 +229,13 @@ class ExploreSearchMission:
         self.stucks = 0
         self.explored = False
         self._show_phase, self._show_t0 = None, 0.0
+        self.people = PeopleMask(**{k[len('person_'):]: v for k, v in self.p.items() if k.startswith('person_')})
+        self._person_seen_t = -math.inf  # the last time someone was in the way
+        self._in_way = []                # times of the recent sightings in the way
+        self._profiles_after = 0         # profiles taken since then
+        self._waiting_since = None
+        self._no_wait_until = -math.inf
+        self.people_waits = []           # (t start, s waited, 'gone' | 'timeout')
         if self.p['start_scan']:
             # there and back, as loop_patrol: the turns cancel, and with them the gyro's scale error
             q = math.pi / 2
@@ -252,11 +283,62 @@ class ExploreSearchMission:
 
     def observe_scan(self, t, x, y, yaw, bearings_deg, ranges, hit):
         b, r, h = np.asarray(bearings_deg, float), np.asarray(ranges, float), np.asarray(hit, bool)
-        self._last_profile = (b, r, h)
+        self._last_profile = (b, r, h)       # as it came: the driving steers round people too
         self._profile_t = t
         self._profile_yaw = yaw
+        if t > self._person_seen_t:
+            self._profiles_after += 1
         self.map.odometer = self.odometer
+        r, h = self.people.filter(t, yaw, b, r, h)
         self.replanner.observe(t, x, y, yaw, b, r, h)
+
+    def observe_people(self, t, x, y, yaw, people):
+        """One camera frame's people, [(right_deg, left_deg, range_m or None), ...]: the bearings of the
+        box's bottom corners (left-positive) and the range to them, seen at time t from (x, y, yaw).
+        Kept off the map (people_mask.py); one in the way makes the rover wait (_people_step)."""
+        p = self.p
+        self.people.observe(t, x, y, yaw, people, self.map)
+        for right, left, rng in people:
+            if rng is None:
+                continue
+            # in the way: some of the box within person_wait_half_m of the rover's line, ahead, near
+            right, left = min(right, left), max(right, left)
+            lo, hi = rng * math.sin(math.radians(right)), rng * math.sin(math.radians(left))
+            ahead = rng * math.cos(math.radians(0.5 * (right + left)))
+            waiting = self._waiting_since is not None
+            near = p['person_keep_m'] if waiting else p['person_wait_m']
+            half = p['person_keep_half_m'] if waiting else p['person_wait_half_m']
+            if 0.0 < ahead <= near and lo <= half and hi >= -half:
+                self._person_seen_t = max(self._person_seen_t, t)
+                self._profiles_after = 0
+                self._in_way = [u for u in self._in_way if t - u <= p['person_gone_s']] + [t]
+
+    def _people_step(self, t):
+        """Someone in the way: stand still until they are gone and the profile has looked again."""
+        p = self.p
+        there = t - self._person_seen_t <= p['person_gone_s']
+        if self._waiting_since is None:
+            seen = [u for u in self._in_way if t - u <= p['person_gone_s']]
+            if not there or len(seen) < p['person_confirm'] or t < self._no_wait_until:
+                return None
+            self._waiting_since = t
+            self._trail = []
+            self.notes.append(f'{t:.1f} someone in the way: waiting for them to go')
+        waited = t - self._waiting_since
+        if waited > p['person_wait_max_s']:
+            self.people_waits.append((self._waiting_since, waited, 'timeout'))
+            self.notes.append(f'{t:.1f} still someone in the way after {waited:.0f} s: driving round them')
+            self._waiting_since = None
+            self._no_wait_until = t + p['person_wait_max_s']
+            return None
+        if there or self._profiles_after < p['person_profiles']:
+            return Step(None, (0.0, 0.0), False, self.state, 'someone in the way: waiting')
+        self.people_waits.append((self._waiting_since, waited, 'gone'))
+        self.notes.append(f'{t:.1f} the way is clear of people after {waited:.1f} s: on')
+        self._waiting_since = None
+        self._trail = []
+        self._route_kind = None              # the way ahead is looked at afresh
+        return None
 
     def confirm(self, t, accepted: bool):
         if self.target is not None:
@@ -805,6 +887,10 @@ class ExploreSearchMission:
             if t < self._backoff_until:
                 return Step(None, (p['backoff_v'], 0.0), False, self.state, 'backing off')
             self._backoff_until = None
+        if p['people_wait'] and self.state in (EXPLORE, GOTO):
+            step = self._people_step(t)
+            if step is not None:
+                return step
         if self.state == SCAN:
             if est is not None:              # something to go to: the look-around can wait
                 self._scan_queue, self._scan_target = [], None

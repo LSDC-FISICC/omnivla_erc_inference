@@ -37,6 +37,7 @@ from visualization_msgs.msg import MarkerArray
 from erc_inference import local_planner as lp
 from erc_inference.loop_patrol import DEFAULTS as PATROL_DEFAULTS
 from erc_inference.loop_patrol import LOCAL_INDOOR
+from erc_inference.people_mask import PeopleMask
 from erc_inference.object_tracker import ObjectTracker
 from erc_inference.map_viz import grid_message, object_markers
 
@@ -52,6 +53,7 @@ class LocalMapNode(Node):
         self.declare_parameter('free_space_topic', '/erc/free_space')
         self.declare_parameter('objects_topic', '/erc/objects')
         self.declare_parameter('object_classes', ['potted plant'])
+        self.declare_parameter('person_classes', ['person'])     # kept off the map, as the mission does
         self.declare_parameter('map_topic', '/erc/local_map')
         self.declare_parameter('mission_objects_topic', '/erc/explore/objects')
         self.declare_parameter('map_half_m', 30.0)           # the grid: a square this far each way, kept around the rover
@@ -90,6 +92,7 @@ class LocalMapNode(Node):
         kw['margin_m'] = 0.0
         self._replanner = lp.LocalReplanner(np.array([[x - h, y - h], [x + h, y + h]]), **kw)
         self._objects = ObjectTracker()
+        self._people = PeopleMask()
         self._trail = []
         self._odometer, self._odo_xy, self._forgot_at = 0.0, (x, y), 0.0
         self._frame = None
@@ -160,6 +163,7 @@ class LocalMapNode(Node):
         b = np.degrees(msg.angle_min + np.arange(len(r)) * msg.angle_increment)
         hit = np.isfinite(r) & (r < msg.range_max - 0.05)
         r = np.where(np.isfinite(r), r, msg.range_max)
+        r, hit = self._people.filter(msg.header.stamp.sec + 1e-9 * msg.header.stamp.nanosec, pose[3], b, r, hit)
         # the planner's own gate: scans are skipped while the heading turns faster than it can trust
         self._replanner.map.odometer = self._odometer
         self._replanner.observe(pose[0], pose[1], pose[2], pose[3], b, r, hit)
@@ -172,6 +176,12 @@ class LocalMapNode(Node):
         pose = self._pose_at(float(doc.get('stamp', 0.0)))
         if pose is None or self._objects is None:
             return
+        persons = set(self.get_parameter('person_classes').value)
+        self._people.observe(float(doc.get('stamp', 0.0)), pose[1], pose[2], pose[3], [
+            (float(d['bearing_right_deg']), float(d['bearing_left_deg']),
+             d['range_m'] if d.get('range_m') is not None else d.get('range_scan_m'))
+            for d in doc.get('detections', []) if d.get('label') in persons and 'bearing_left_deg' in d],
+            self._replanner.map if self._replanner is not None else None)
         if self._turn_rate_dps() > PATROL_DEFAULTS['cone_max_turn_dps']:
             return                        # the image is older than the heading: a turning rover misplaces it
         wanted = set(self.get_parameter('object_classes').value)

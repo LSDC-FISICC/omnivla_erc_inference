@@ -11,6 +11,13 @@ plain carrot follower drives (v 0.25 m/s, turn in place beyond 45 deg): not Moti
 and not controller_sim's plant, so this checks the mission's logic and map, not the tuning.
 
     python3 test/explore_search_sim.py [--seeds 6] [--plot out.png]
+
+PEOPLE=1 (with WORLD=loops): people in the corridors -- one walking up the first corridor towards the
+rover, two standing talking in it for 45 s, one crossing the second corridor twice. They are in the
+profile as any obstacle; with PEOPLE_SEEN=0 YOLO does not report them (the mission before 16-oct),
+otherwise it does, 85 % of frames (explore_search.observe_people). Reported: phantoms -- occupied
+cells of the map more than 0.5 m from any wall or plant, mean and max over the run -- people_hits,
+and the waits.
 """
 import argparse
 import math
@@ -30,6 +37,37 @@ from erc_inference.image_goal_mission import Goal  # noqa: E402
 from erc_inference.loop_patrol import LOCAL_INDOOR, PATROL_COMPETITION  # noqa: E402
 
 PLANT_R = 0.2
+PERSON_R = 0.25
+
+# (t, x, y) keyframes of each person; not there before the first or after the last
+PEOPLE = [
+    [(5.0, 13.0, 0.7), (18.3, 1.0, 0.7)],                         # walks up the first corridor at 0.9 m/s, keeping left
+    [(0.0, 8.0, 0.5), (45.0, 8.0, 0.5)],                          # two standing talking in it ...
+    [(0.0, 8.0, -0.3), (45.0, 8.0, -0.3)],                        # ... for 45 s, then gone
+    [(60.0, 11.8, -5.0), (63.0, 13.8, -5.0)],                     # crosses the second corridor
+    [(90.0, 13.8, -5.5), (93.0, 11.8, -5.5)],                     # ... and back
+]
+
+
+def person_path_dist(x, y):
+    best = math.inf
+    for keys in PEOPLE:
+        for (_t0, x0, y0), (_t1, x1, y1) in zip(keys[:-1], keys[1:]):
+            best = min(best, obs.Segment((x0, y0), (x1, y1)).distance_to((x, y)))
+    return best
+
+
+def people_at(t):
+    out = []
+    for keys in PEOPLE:
+        if not keys[0][0] <= t <= keys[-1][0]:
+            continue
+        for (t0, x0, y0), (t1, x1, y1) in zip(keys[:-1], keys[1:]):
+            if t0 <= t <= t1:
+                a = (t - t0) / max(t1 - t0, 1e-6)
+                out.append((x0 + a * (x1 - x0), y0 + a * (y1 - y0)))
+                break
+    return out
 
 
 def world():
@@ -95,10 +133,44 @@ def run(seed, n_goals=3, t_max=1800.0, delay_s=1.0, wheel_scale=0.97, gyro_scale
     v = w = 0.0
     hits, shown, trail, step = 0, [], [], None
     in_contact = False
+    with_people = os.environ.get('PEOPLE') == '1'
+    people_seen = os.environ.get('PEOPLE_SEEN', '1') == '1'
+    static = list(things)
+    phantoms, people_hits, in_person, hit_log = [], 0, False, []
     while t < t_max and not m.done:
         k = int(round(t / dt))
+        crowd = people_at(t) if with_people else []
+        things = static + [obs.Disc(q, PERSON_R) for q in crowd]
         if k % 3 == 0:               # perception and the mission at ~3 Hz
             b, free, caps = obs.profile(x, y, th, things, rng)
+            if crowd and people_seen:
+                seen = []
+                for px, py in crowd:
+                    r = math.hypot(px - x, py - y)
+                    brg = math.degrees((math.atan2(py - y, px - x) - th + math.pi) % (2 * math.pi) - math.pi)
+                    d = np.array([px - x, py - y]) / max(r, 1e-6)
+                    blocked = min((s.ray_hit(np.array([x, y]), d, r) for s in walls), default=math.inf) < r - 0.05
+                    if 0.4 < r < 8.0 and abs(brg) < 50 and not blocked and rng.random() < 0.85:
+                        half = math.degrees(math.asin(min(1.0, PERSON_R / r)))
+                        c = brg + rng.normal(0, 1.5)
+                        seen.append((c - half, c + half, max(0.1, (r - PERSON_R) * (0.92 + rng.normal(0, 0.08)))))
+                m.observe_people(t, ex, ey, eth, seen)
+            if with_people and k % 30 == 0:
+                # the map's occupied cells, taken to the true frame about the rover (the drift is local there)
+                occ = np.argwhere(m.map.occupied())
+                if len(occ):
+                    res = m.map.p['resolution_m']
+                    px = m.map.ox + (occ[:, 1] + 0.5) * res - ex
+                    py = m.map.oy + (occ[:, 0] + 0.5) * res - ey
+                    a = th - eth
+                    wx = x + math.cos(a) * px - math.sin(a) * py
+                    wy = y + math.sin(a) * px + math.cos(a) * py
+                    # where a person stood or walked, and no wall or plant: what they left on the map
+                    far = [min(o.distance_to((u, v)) for o in static) > 0.5 and person_path_dist(u, v) < 0.6
+                           for u, v in zip(wx, wy)]
+                    phantoms.append(int(np.sum(far)))
+                else:
+                    phantoms.append(0)
             m.observe_scan(t, ex, ey, eth, b, np.minimum(free, obs.MAX_RANGE_M), free < caps - 0.05)
             frame = []
             for px, py in PLANTS:
@@ -136,6 +208,11 @@ def run(seed, n_goals=3, t_max=1800.0, delay_s=1.0, wheel_scale=0.97, gyro_scale
         v, w = queue.popleft()
         nx, ny = x + v * math.cos(th) * dt, y + v * math.sin(th) * dt
         contact = obs.collided((nx, ny), things)
+        touching = [i for i, q in enumerate(crowd) if math.hypot(nx - q[0], ny - q[1]) <= PERSON_R + obs.FOOTPRINT_W / 2]
+        if touching and not in_person:
+            people_hits += 1
+            hit_log.append((round(t, 1), touching, round(v, 2)))
+        in_person = touching
         if contact:                  # a bump: it does not go through, and it is counted once
             hits += not in_contact
         else:
@@ -151,6 +228,10 @@ def run(seed, n_goals=3, t_max=1800.0, delay_s=1.0, wheel_scale=0.97, gyro_scale
                distinct=len({s[2] for s in shown}), show_dist=[s[1] for s in shown],
                mark_err=[s[4] for s in shown], objects=len(m.objects()),
                pose_err=round(math.hypot(ex - x, ey - y), 2))
+    if with_people:
+        out.update(phantoms_mean=round(float(np.mean(phantoms)), 1) if phantoms else 0,
+                   phantoms_max=max(phantoms, default=0), people_hits=people_hits, hit_log=hit_log,
+                   waits=[(round(a), round(w, 1), why) for a, w, why in m.people_waits])
     return (out, m, np.array(trail)) if record else out
 
 
