@@ -92,8 +92,21 @@ DEFAULTS = {
     'safety.slow_distance_m': 0.0,
     'safety.slow_vel': 0.15,
     'safety.too_close_sector_deg': 40.0,
-    'safety.too_close_backoff_s': 2.0,
+    # 4 s, not 2: the command takes ~1 s to act and the rover backs at 0.10 m/s, so 2 s moved it
+    # ~0.1 m, never the 0.15 m beyond too_close_m that clears it (rosbags/mission_1016_1159).
+    'safety.too_close_backoff_s': 4.0,
     'safety.too_close_clear_m': 0.15,       # ... until it is this much further than too_close_m
+    # Still there after backing off: stand still this long, then back off again, at most this many
+    # times in all; then stand still for good. Once, it stood against a door jamb until restarted.
+    'safety.too_close_retry_s': 3.0,
+    'safety.too_close_tries': 3,
+    # Reverse only as far as the caller says is known free behind (set_back_room; the plant mission's
+    # map): no reverse once that room is down to what the rover still travels after the stop -- |v| x
+    # back_delay_s -- plus back_margin_m. With no such word from the caller (other missions), reverse
+    # is limited by time alone, as before.
+    'safety.back_delay_s': 1.0,
+    'safety.back_margin_m': 0.05,
+    'safety.back_room_max_age_s': 1.0,
     # Blocked with a turn too small to move the rover (below ~0.15 rad/s it does not turn in
     # place): turn in place toward the more open side instead, until the sector clears. Without
     # it the rover waits forever in front of a cone it has just reached (test/image_goal_sim.py).
@@ -170,6 +183,8 @@ class SafetyEnvelope:
         self._clear_n = 0
         self._obstacle_stop = False
         self._close_since: Optional[float] = None
+        self._close_tries = 0
+        self._back_room = None          # (t, metres known free straight behind)
 
     # -- inputs -------------------------------------------------------------
 
@@ -198,6 +213,17 @@ class SafetyEnvelope:
         if not a:
             return None
         return tuple(float(v) for v in np.median(np.array(a), axis=0))
+
+    def set_back_room(self, t, metres):
+        """How far straight back is known to be free (the mission's map); None: not known."""
+        self._back_room = None if metres is None else (t, float(metres))
+
+    def _reverse_ok(self, now, linear, p):
+        """A reverse command at this speed has room behind it (always, if nobody said otherwise)."""
+        if self._back_room is None or now - self._back_room[0] > p.get('safety.back_room_max_age_s', 1.0):
+            return True
+        need = abs(linear) * p.get('safety.back_delay_s', 1.0) + p.get('safety.back_margin_m', 0.05)
+        return self._back_room[1] > need
 
     def observe_free_space(self, t, bearings_deg: Sequence[float], ranges: Sequence[float], range_max: float):
         self._scan = (t, list(bearings_deg), list(ranges), float(range_max))
@@ -281,8 +307,15 @@ class SafetyEnvelope:
             self._close_since = None
             return ''
         if self._close_since is None:
-            self._close_since = now
-        return 'back' if now - self._close_since <= p['safety.too_close_backoff_s'] else 'hold'
+            self._close_since, self._close_tries = now, 1
+        since = now - self._close_since
+        if since <= p['safety.too_close_backoff_s']:
+            return 'back'
+        if (self._close_tries < int(p.get('safety.too_close_tries', 1))
+                and since > p['safety.too_close_backoff_s'] + p.get('safety.too_close_retry_s', 0.0)):
+            self._close_since, self._close_tries = now, self._close_tries + 1
+            return 'back'
+        return 'hold'
 
     # -- all together -------------------------------------------------------
 
@@ -296,12 +329,20 @@ class SafetyEnvelope:
         close = self._too_close(now, p)
         if close:
             if linear < 0.0 and abs(angular) < 1e-6:         # the caller is already backing off
-                return max(linear, -p['safety.max_reverse_vel']), 0.0, False, '[safety] too close: backing off'
+                lin = max(linear, -p['safety.max_reverse_vel'])
+                if not self._reverse_ok(now, lin, p):
+                    return 0.0, 0.0, True, '[safety] STOP too close, and nothing known free behind'
+                return lin, 0.0, False, '[safety] too close: backing off'
             if close == 'back':
                 back = min(p['safety.max_reverse_vel'], max(p['safety.min_moving_linear_vel'], 0.1))
+                if not self._reverse_ok(now, -back, p):
+                    return 0.0, 0.0, True, '[safety] STOP too close, and nothing known free behind'
                 return -back, 0.0, True, '[safety] too close: straight back, no turning'
             return 0.0, 0.0, True, '[safety] STOP too close and still there after backing off'
         lin, ang, cap_note = cap(linear, angular, p)
+        if lin < 0.0 and not self._reverse_ok(now, lin, p):     # the mission's back-off, say: not blind
+            lin = 0.0
+            cap_note = (cap_note + ',' if cap_note else '') + 'nothing known free behind'
         blocked, obs_note = self._obstacle_gate(now, p)
         hard = False
         if blocked and obs_note.startswith('perception stale') and p.get('safety.stale_stops_turning', False):

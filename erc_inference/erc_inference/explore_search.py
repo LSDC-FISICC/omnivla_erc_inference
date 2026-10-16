@@ -162,6 +162,13 @@ DEFAULTS = dict(
                                 # mission_1015_2151 were one frame, each a ~2 s stop
     person_gone_s=1.0,          # driving on: no one in the way for this long ...
     person_profiles=2,          # ... and this many profiles taken after the last sighting
+    # Backing up (room_behind -> safety_envelope.set_back_room): only over ground the map knows is free --
+    # cells seen free, or the rover's own trail -- never blind. Measured from the rear edge, straight back,
+    # at the centre and both sides of the rover.
+    back_rear_m=0.2,            # centre of the rover to its rear edge
+    back_half_m=0.15,           # half the rover's width
+    back_max_m=1.0,
+    back_trail_m=0.25,          # this near a point of the trail is ground it drove over
     person_wait_max_s=20.0,     # no longer than this: then they are driven round (the profile still sees them,
                                 # and so do the reflexes) -- for as long again before waiting once more
 )
@@ -312,6 +319,31 @@ class ExploreSearchMission:
                 self._person_seen_t = max(self._person_seen_t, t)
                 self._profiles_after = 0
                 self._in_way = [u for u in self._in_way if t - u <= p['person_gone_s']] + [t]
+
+    def room_behind(self, x, y, yaw):
+        """Metres the rover can back straight up over ground the map knows is free (seen free, or on
+        its own trail), up to back_max_m. Occupied or never seen: that is where it stops. The rover has
+        no camera looking back: in an office on 16-oct it could not get out of the door, and backing
+        by time would have run its rear into whatever was there."""
+        p, m = self.p, self.map
+        res = m.p['resolution_m']
+        occ = m.occupied()
+        trail = np.array([(cx, cy) for cx, cy, _o in self._crumbs] + [(x, y)])
+        c, s = math.cos(yaw), math.sin(yaw)
+        step = 0.5 * res
+        d = 0.0
+        while d < p['back_max_m']:
+            for lat in (-p['back_half_m'], 0.0, p['back_half_m']):
+                px = x - (p['back_rear_m'] + d + step) * c - lat * s
+                py = y - (p['back_rear_m'] + d + step) * s + lat * c
+                r, k = (int(v) for v in m.cell(px, py))
+                if not (0 <= r < m.h and 0 <= k < m.w) or occ[r, k]:
+                    return d
+                on_trail = float(np.hypot(trail[:, 0] - px, trail[:, 1] - py).min()) <= p['back_trail_m']
+                if not on_trail and not (m.seen[r, k] and m.L[r, k] <= 0.0):
+                    return d
+            d += step
+        return p['back_max_m']
 
     def _people_step(self, t):
         """Someone in the way: stand still until they are gone and the profile has looked again."""

@@ -668,5 +668,16 @@ class CommandShaper:
         self.linear.reset()
         self.angular.reset()
 
+    def cut(self, linear, angular):
+        """A hard limit from the safety envelope: a channel told to stop or to reverse drops to zero
+        at once; one still going the way it is told keeps its value and ramps on from there.
+        reset() on every hard tick held a reflex's own motion to one acceleration step: the
+        envelope's straight-back at 0.10 m/s came out as 0.03, which does not move this rover,
+        and it stood against a door jamb until the mission was restarted, three times
+        (rosbags/mission_1016_1159_reactivo, 382, 630 and 700 s)."""
+        for ch, target in ((self.linear, linear), (self.angular, angular)):
+            if target == 0.0 or ch.value * target < 0.0:
+                ch.reset()
+
     def step(self, linear, angular, dt):
         return self.linear.step(linear, dt), self.angular.step(angular, dt)

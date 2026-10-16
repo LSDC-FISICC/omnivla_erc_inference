@@ -427,7 +427,7 @@ class ImageCheckpointControllerNode(IndoorMissionNode):
             dt = 0.0 if self._last_output_time is None else now - self._last_output_time
             self._last_output_time = now
             if hard:
-                self._shaper.reset()
+                self._shaper.cut(v, w)          # not reset(): a reflex's own back-off must get out
             self._shaper.configure(*self._shaper_limits())
             linear, angular = self._shaper.step(v, w, dt)
         out = Twist()
@@ -636,6 +636,8 @@ class ImageCheckpointControllerNode(IndoorMissionNode):
                 with self._mission_lock:
                     m = self.mission
                     step = m.update(t, pose.x, pose.y, pose.yaw, math.radians(self._turn_rate_dps()))
+                    if hasattr(m, 'room_behind'):       # reverse only over ground the map knows is free
+                        self.envelope.set_back_room(self._now(), m.room_behind(pose.x, pose.y, pose.yaw))
                     for n in m.notes[last_note:]:
                         self.get_logger().info(f'[patrol] {n}')
                     last_note = len(m.notes)

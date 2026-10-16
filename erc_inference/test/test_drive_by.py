@@ -167,12 +167,50 @@ def test_too_close_is_straight_back_and_never_a_turn():
     profile(e, 1.5, 0.6)
     assert e.limit(1.6, 0.0, -0.3, p)[:2] == (0.0, -0.3)   # now it may turn (not advance: 0.6 < 0.9)
     profile(e, 2.0, 0.2)
-    for k in range(30):                                  # still there after too_close_backoff_s: stand still
+    for k in range(50):                                  # still there after too_close_backoff_s: stand still
         t = 2.1 + 0.1 * k
         profile(e, t, 0.2)
         out = e.limit(t, 0.0, -0.3, p)
     assert out[:2] == (0.0, 0.0)
-    assert e.limit(5.2, -0.25, 0.0, p)[:2] == (-0.25, 0.0)   # the mission's own back-off passes
+    assert e.limit(7.2, -0.25, 0.0, p)[:2] == (-0.25, 0.0)   # the mission's own back-off passes
+
+
+def test_too_close_and_still_there_backs_off_again_a_few_times_then_stands():
+    # the door jamb of mission_1016_1159 (630 s): 0.17 m off, and one back-off never got it clear
+    e, p = reflex_envelope()
+    outs = []
+    for k in range(400):
+        t = 0.1 * k
+        profile(e, t, 0.2)
+        outs.append((t, e.limit(t, 0.25, 0.0, p)[0]))
+    backing = [t for t, v in outs if v < 0.0]
+    stands = [t for t, v in outs if v == 0.0]
+    gaps = [b - a for a, b in zip(backing[:-1], backing[1:]) if b - a > 0.15]
+    assert len(gaps) == p['safety.too_close_tries'] - 1                     # three back-offs ...
+    assert all(abs(g - p['safety.too_close_retry_s']) < 0.25 for g in gaps)  # ... 3 s apart
+    assert stands and stands[-1] > backing[-1]                             # ... then it stands
+
+
+def test_a_hard_back_off_reaches_its_speed_through_the_shaper():
+    # The node cut the shaper on every hard tick: the envelope's 0.10 m/s back came out as 0.03 and
+    # the rover did not move (mission_1016_1159). cut() keeps a channel going the way it is told.
+    from erc_inference.motion_control import CommandShaper
+    sh = CommandShaper(0.3, 0.6, 0.6, 1.2)
+    sh.step(0.25, 0.0, 1.0)                              # driving forward
+    out = None
+    for _ in range(20):                                  # 2 s of hard 'straight back' at 0.10 m/s
+        sh.cut(-0.10, 0.0)
+        out = sh.step(-0.10, 0.0, 0.1)
+    assert abs(out[0] + 0.10) < 1e-9
+    sh.cut(-0.10, 0.0)                                   # forward to back: the forward motion is gone at once
+    sh2 = CommandShaper(0.3, 0.6, 0.6, 1.2)
+    sh2.step(0.25, 0.0, 1.0)
+    sh2.cut(-0.10, 0.0)
+    assert sh2.step(-0.10, 0.0, 0.1)[0] <= 0.0
+    for _ in range(20):                                  # and a hard turn in place to unblock gets its rate
+        sh2.cut(0.0, 0.3)
+        out = sh2.step(0.0, 0.3, 0.1)
+    assert abs(out[1] - 0.3) < 1e-9
 
 
 def test_with_no_fresh_profile_nothing_moves():
@@ -256,3 +294,39 @@ def test_at_the_end_of_a_corridor_it_turns_right_and_not_back_the_way_it_came():
     back = math.pi
     assert m._back_on_trail(x, 0.0, back)
     assert not m._back_on_trail(x, 0.0, -math.pi / 2)
+
+
+# -- backing up only over ground the map knows is free (16-oct: the office door) -------------------
+
+def test_room_behind_is_the_trail_and_what_was_seen_free_never_the_unknown():
+    m = mission()
+    assert m.room_behind(0.0, 0.0, 0.0) == 0.0                       # nothing known behind at the start
+    for k in range(21):                                              # drove 2 m along +x
+        m._travel(0.1 * k, 0.0)
+    assert m.room_behind(2.0, 0.0, 0.0) == m.p['back_max_m']          # its own trail is behind it
+    r = m.map.p['resolution_m']
+    row, col = (int(v) for v in m.map.cell(1.4, 0.0))                # something put on the trail since
+    m.map.L[row, col] = m.map.p['max_logodds']
+    m.map.seen[row, col] = True
+    m.map._dist = None
+    room = m.room_behind(2.0, 0.0, 0.0)
+    assert 2.0 - m.p['back_rear_m'] - room - r <= 1.4 <= 2.0 - m.p['back_rear_m'] - room + 1e-9
+
+
+def test_reverse_goes_no_further_than_the_room_behind():
+    e, p = reflex_envelope()
+    profile(e, 0.0, 0.2)                                             # too close ahead
+    e.set_back_room(0.0, 0.0)                                        # and nothing known free behind
+    v, w, _h, note = e.limit(0.1, 0.25, 0.0, p)
+    assert (v, w) == (0.0, 0.0) and 'nothing known free behind' in note
+    e.set_back_room(0.2, 0.6)                                        # room: back
+    assert e.limit(0.3, 0.25, 0.0, p)[0] < 0.0
+    e2, p2 = reflex_envelope()
+    profile(e2, 0.0, 2.0)
+    e2.set_back_room(0.0, 0.2)                                       # the mission's own back-off at 0.25:
+    assert e2.limit(0.1, -0.25, 0.0, p2)[0] == 0.0                   # needs 0.30 m
+    e2.set_back_room(0.1, 0.5)
+    assert e2.limit(0.2, -0.25, 0.0, p2)[0] == -0.25
+    e3, p3 = reflex_envelope()                                       # nobody says: by time, as before
+    profile(e3, 0.0, 0.2)
+    assert e3.limit(0.1, 0.25, 0.0, p3)[0] < 0.0
