@@ -1,4 +1,4 @@
-"""Motion control laws for omnivla_edge_node and checkpoint_controller_node.
+"""Motion control laws for carrot_controller_node and checkpoint_controller_node.
 
 Kept free of ROS and torch so test/controller_sim.py drives the rover model with
 exactly the code that runs on the robot.

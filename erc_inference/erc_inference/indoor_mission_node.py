@@ -11,10 +11,10 @@ alone:
   yaw, no GPS, no magnetometer -- magnetometers are unreliable next to steel
   and wiring) re-anchored to the track frame of `route_file` at mission start.
   See indoor_track.py for the frame and why the datum is where it is.
-- The inference node is fed that pose as a pseudo-fix on `fix_topic` and a
-  compass heading on `heading_topic`. mission_indoor.launch.py points the
-  model node's gps_topic/compass_topic at them, so omnivla_edge_node and
-  omnivla_original_node run unmodified, with the same controller.yaml.
+- The controller is fed that pose as a pseudo-fix on `fix_topic` and a
+  compass heading on `heading_topic`. mission_indoor.launch.py points
+  carrot_controller_node's gps_topic/compass_topic at them, so it runs
+  unmodified, with the same controller.yaml.
 - Route: the checkpoints and corridor corners in `route_file`, driven with the
   same carrot as outdoors (checkpoint_controller_node.project_forward /
   point_at), re-published as /goal_gps + /goal_compass with modality 4 (pose

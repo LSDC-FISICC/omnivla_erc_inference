@@ -1,22 +1,16 @@
-# Motion controller for the model nodes: turns localization and the model's
-# selected waypoint into /omnivla/cmd_vel. checkpoint_controller_node then applies
-# acceleration limits (max_linear_accel & co., its own parameters) on the way to
-# /cmd_vel.
-#
-# scripts/omni_vla_wrapper (edge) and scripts/omni_vla_original_wrapper (original)
-# both load this file, so the two models run the same control law. Defaults live
-# in erc_inference/motion_control.py (DEFAULT_PARAMS); every value can also be
+# Motion controller (motion_control.MotionController) for carrot_controller_node: turns the
+# carrot and localization into /omnivla/cmd_vel. checkpoint_controller_node then applies
+# acceleration limits (max_linear_accel & co., its own parameters) on the way to /cmd_vel.
+# Defaults live in erc_inference/motion_control.py (DEFAULT_PARAMS); every value can also be
 # changed while the rover drives, e.g.
-#   ros2 param set /omnivla_edge_node polar.steering_source model
-#   ros2 param set /omnivla_edge_node polar.min_linear_vel 0.2
+#   ros2 param set /carrot_controller_node polar.min_linear_vel 0.2
 #
-# Every change here should be re-run through test/controller_sim.py, which
-# loads this file.
+# Every change here should be re-run through test/controller_sim.py, which loads this file.
 #
-# Write every float with a decimal point: ROS 2 rejects `60` for a parameter
-# declared as 60.0 ("wrong parameter type").
+# Write every float with a decimal point: ROS 2 rejects `60` for a parameter declared as 60.0
+# ("wrong parameter type").
 
-# Node-scoped, NOT under /**: each node has its own checkpoint, and the wildcard
+/**: each node has its own checkpoint, and the wildcard
 # would point omnivla_original_node at the edge .pth. It also has to stay out of
 # the /** block because test_motion_control and controller_sim assert that block
 # only sets parameters motion_control.DEFAULT_PARAMS declares.

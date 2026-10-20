@@ -10,9 +10,8 @@ Earth-rover-ros2-bridge/docs/PLAN_OFFROAD.md.
     erc_perception    free_space_node (UniDepthV2 by default) -> /erc/free_space, with
                       drop_detection ON by default: it stops at the top of every descent,
                       which here is the safe side of a 0.7 m drop.
-    erc_inference     carrot_controller_node (model:=none, default) at 0.25 m/s with
-                      turn-in-place from 45 deg, reading the mission's pseudo-fix; or an
-                      OmniVLA node (model:=edge|original) remapped the same way.
+    erc_inference     carrot_controller_node at 0.25 m/s with turn-in-place from 45 deg,
+                      reading the mission's pseudo-fix.
 
     erc_perception    flag_detector_node -> /erc/flags: the blue checkpoint flags (CPU).
 
@@ -30,7 +29,7 @@ earlier photo-homing mission, for a goal that is a view and not a flag:
 
 goal_image here only goes into the reminder printed at the end, so the command can be copied.
 
-Arguments: model:=none|edge|original, depth_backend:=unidepth|da3, drop_detection:=true|false,
+Arguments: depth_backend:=unidepth|da3, drop_detection:=true|false,
 clearance_m:= (empty: perception.yaml's 0.045 m, the rover's ground clearance),
 flag_height_m:=0.15 (the flag cloth's vertical extent, assumed; the mission refits it),
 goal_image:=/path.jpg (reminder only).
@@ -40,9 +39,9 @@ LIVE operation only; it starts the SDK bridge.
 
 import os
 
-from ament_index_python.packages import get_package_prefix, get_package_share_directory
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription, LogInfo
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, LogInfo
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import EqualsSubstitution, LaunchConfiguration
@@ -56,12 +55,11 @@ HEADING_TOPIC = '/erc/indoor/heading_deg'
 
 
 def generate_launch_description():
-    lib = os.path.join(get_package_prefix('erc_inference'), 'lib', 'erc_inference')
     controller_yaml = os.path.join(get_package_share_directory('erc_inference'), 'config', 'controller.yaml')
     args = [
         DeclareLaunchArgument('model', default_value='none',
-                              description="'none': carrot_controller_node (no model); 'edge' (OmniVLA-edge) or "
-                                          "'original' (OmniVLA 7B)"),
+                              description="'none': carrot_controller_node (the only option since the "
+                                          "OmniVLA nodes were removed, 20-oct)"),
         DeclareLaunchArgument('depth_backend', default_value='unidepth',
                               description="free_space_node depth model: 'unidepth' (UniDepthV2) or 'da3'"),
         DeclareLaunchArgument('drop_detection', default_value='true',
@@ -84,7 +82,6 @@ def generate_launch_description():
         Node(package='erc_bridge', executable='erc_status_node', name='erc_status_node', output='screen'),
     ]
 
-    remap = ['--ros-args', '-p', f'gps_topic:={FIX_TOPIC}', '-p', f'compass_topic:={HEADING_TOPIC}']
     inference = [
         # As indoors: 0.25 m/s (the floor), turn in place from 45 deg; obstacles are the mission
         # node's (local planner + tilt), the carrot's own side-step stays off.
@@ -94,10 +91,6 @@ def generate_launch_description():
                                            'max_linear_vel': 0.25, 'goal_turn.enter_deg': 45.0,
                                            'goal_turn.exit_deg': 15.0}],
              condition=IfCondition(EqualsSubstitution(LaunchConfiguration('model'), 'none'))),
-        ExecuteProcess(cmd=[os.path.join(lib, 'omni_vla_wrapper')] + remap, output='screen',
-                       condition=IfCondition(EqualsSubstitution(LaunchConfiguration('model'), 'edge'))),
-        ExecuteProcess(cmd=[os.path.join(lib, 'omni_vla_original_wrapper')] + remap, output='screen',
-                       condition=IfCondition(EqualsSubstitution(LaunchConfiguration('model'), 'original'))),
     ]
 
     localization = IncludeLaunchDescription(

@@ -211,8 +211,7 @@ class CarrotControllerNode(Node):
             if c.name == 'polar.steering_source' and c.value != 'carrot':
                 return SetParametersResult(
                     successful=False,
-                    reason='this node has no model; only steering_source=carrot runs here. '
-                           'Use omnivla_edge_node for plan/model.')
+                    reason='only steering_source=carrot runs here (the model nodes were removed).')
         errors = parameter_errors(self._control_params(
             {c.name: c.value for c in changes if c.name in DEFAULT_PARAMS}))
         if errors:

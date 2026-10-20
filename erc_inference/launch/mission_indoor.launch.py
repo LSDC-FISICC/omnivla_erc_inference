@@ -11,8 +11,7 @@ Earth-rover-ros2-bridge/docs/PLAN_INDOOR_NYU.md.
     erc_perception    free_space_node (UniDepthV2 by default) -> /erc/free_space, and
                       cone_detector_node -> /erc/cones. Both needed by the mission.
     erc_inference     carrot_controller_node (model:=none, default) at 0.25 m/s with
-                      turn-in-place from 45 deg, reading the mission's pseudo-fix; or an
-                      OmniVLA node (model:=edge|original) remapped the same way.
+                      turn-in-place from 45 deg, reading the mission's pseudo-fix.
 
 Not here, by hand -- it is the only writer of /cmd_vel, so killing it takes the rover back:
 
@@ -33,7 +32,7 @@ then run with -p nav2_frames:=true (plants_controller.launch.py does): it publis
 TF leg_local -> rover_leg and the profile in rover_leg that MPPI works in. In simulation only so
 far (rover_simulation/e2e/run_e2e_plants.sh with CONTROLLER=mppi).
 
-Arguments: mission:=images|track, model:=none|mppi|edge|original, perception:=false|true
+Arguments: mission:=images|track, model:=none|mppi, perception:=false|true
 (forced on with mission:=images), depth_backend:=unidepth|da3, cone_height_m:=0.23.
 target:=cones|plants: with plants, object_detector_node (YOLO26) runs instead of the cone
 detector and the mission node is started as the search mission (see `plants` below).
@@ -44,7 +43,7 @@ LIVE operation only; it starts the SDK bridge.
 import os
 
 import yaml
-from ament_index_python.packages import get_package_prefix, get_package_share_directory
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription,
                             LogInfo)
@@ -62,7 +61,6 @@ INDOOR_HEADING_TOPIC = '/erc/indoor/heading_deg'
 
 
 def generate_launch_description():
-    lib = os.path.join(get_package_prefix('erc_inference'), 'lib', 'erc_inference')
 
     controller_yaml = os.path.join(get_package_share_directory('erc_inference'), 'config', 'controller.yaml')
     args = [
@@ -70,8 +68,8 @@ def generate_launch_description():
                               description="'images': image_checkpoint_controller_node (the NYU mission: cone "
                                           "images, known corridors); 'track': indoor_mission_node (track file)"),
         DeclareLaunchArgument('model', default_value='none',
-                              description="'none': carrot_controller_node (no model); 'mppi': Nav2 MPPI on the "
-                                          "mission's route; 'edge' (OmniVLA-edge) or 'original' (OmniVLA 7B)"),
+                              description="'none': carrot_controller_node; 'mppi': Nav2 MPPI on the "
+                                          "mission's route"),
         DeclareLaunchArgument('perception', default_value='false',
                               description='run erc_perception free_space_node; forced on with mission:=images'),
         DeclareLaunchArgument('depth_backend', default_value='unidepth',
@@ -102,12 +100,6 @@ def generate_launch_description():
              name='erc_status_node', output='screen'),
     ]
 
-    # Both wrappers end in `--ros-args --params-file controller.yaml "$@"`; this
-    # second --ros-args block only moves the two input topics.
-    remap = ['--ros-args',
-             '-p', f'gps_topic:={INDOOR_FIX_TOPIC}',
-             '-p', f'compass_topic:={INDOOR_HEADING_TOPIC}']
-    # Started early: loading the checkpoint is the slowest thing here.
     inference = [
         # No model: the carrot drives, as in mission_carrot. Indoors at 0.25 m/s (the floor the
         # rover moves at), and turning in place once the carrot is 45 deg off rather than 90:
@@ -123,10 +115,6 @@ def generate_launch_description():
                                            'goal_turn.exit_deg': ParameterValue(LaunchConfiguration('turn_exit_deg'),
                                                                                 value_type=float)}],
              condition=IfCondition(EqualsSubstitution(LaunchConfiguration('model'), 'none'))),
-        ExecuteProcess(cmd=[os.path.join(lib, 'omni_vla_wrapper')] + remap, output='screen',
-                       condition=IfCondition(EqualsSubstitution(LaunchConfiguration('model'), 'edge'))),
-        ExecuteProcess(cmd=[os.path.join(lib, 'omni_vla_original_wrapper')] + remap, output='screen',
-                       condition=IfCondition(EqualsSubstitution(LaunchConfiguration('model'), 'original'))),
     ]
 
     # Nav2's MPPI instead of the carrot. The follower's predictor and command snapping take the

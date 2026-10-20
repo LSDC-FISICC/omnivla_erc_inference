@@ -10,7 +10,7 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        ('share/' + package_name + '/launch', ['launch/omnivla_edge.launch.py', 'launch/omnivla_original.launch.py', 'launch/mission.launch.py', 'launch/mission_omnivla.launch.py', 'launch/mission_carrot.launch.py', 'launch/mission_nav2.launch.py', 'launch/mission_carrot_unidepth.launch.py', 'launch/mission_nav2_unidepth.launch.py', 'launch/mission_mexico.launch.py', 'launch/mission_indoor.launch.py', 'launch/mission_offroad.launch.py', 'launch/mission_plants.launch.py', 'launch/plants_controller.launch.py']),
+        ('share/' + package_name + '/launch', ['launch/mission_carrot.launch.py', 'launch/mission_nav2.launch.py', 'launch/mission_carrot_unidepth.launch.py', 'launch/mission_nav2_unidepth.launch.py', 'launch/mission_mexico.launch.py', 'launch/mission_indoor.launch.py', 'launch/mission_offroad.launch.py', 'launch/mission_plants.launch.py', 'launch/plants_controller.launch.py']),
         ('share/' + package_name + '/config', ['config/controller.yaml', 'config/nav2_mppi.yaml', 'config/indoor_nyu_track.yaml',
                                                'config/indoor_nyu_goals.yaml', 'config/indoor_plants_goals.yaml', 'config/rover_dynamics.yaml',
                                                'config/offroad_arena.yaml']),
@@ -22,9 +22,6 @@ setup(
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    scripts=['scripts/omni_vla_wrapper',
-             'scripts/omni_vla_edge_wrapper',
-             'scripts/omni_vla_original_wrapper'], # Instala el ejecutable envuelto
     maintainer='jabes',
     maintainer_email='jabes@todo.todo',
     description='TODO: Package description',
@@ -36,9 +33,6 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'omni_vla_edge_node = erc_inference.omni_vla_edge_node:main',
-            'omnivla_edge_node = erc_inference.omnivla_edge_node:main',
-            'omnivla_original_node = erc_inference.omnivla_original_node:main',
             'checkpoint_controller_node = erc_inference.checkpoint_controller_node:main',
             'carrot_controller_node = erc_inference.carrot_controller_node:main',
             'nav2_route_follower_node = erc_inference.nav2_route_follower_node:main',

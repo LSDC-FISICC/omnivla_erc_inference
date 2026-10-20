@@ -11,7 +11,7 @@ Layers:
     erc_bridge        erc_data_node, erc_screenshot_node, erc_control_node,
                       erc_status_node (read-only latency instrumentation)
     erc_static_map    erc_static_map_node, erc_astar_planner_node
-    erc_inference     carrot_controller_node   <- instead of omni_vla_wrapper
+    erc_inference     carrot_controller_node
     erc_perception    free_space_node, SHADOW  (arg perception, default true)
     erc_localization  localization_global.launch.py
 
