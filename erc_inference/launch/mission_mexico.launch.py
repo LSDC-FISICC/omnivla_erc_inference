@@ -76,5 +76,7 @@ def generate_launch_description():
                               # off on purpose: on rolling grass it would stop at every hill
                               # top and descent (the camera cannot tell them from a drop)
                               'drop_detection': 'false',
+                              'ground_model': 'slope',
+                              'ground_fit_from': '0.75',
                               'clearance_m': LaunchConfiguration('clearance_m')}.items()),
     ])

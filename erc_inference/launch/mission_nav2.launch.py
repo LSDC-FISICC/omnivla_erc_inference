@@ -74,7 +74,10 @@ def generate_launch_description():
         PythonLaunchDescriptionSource(
             os.path.join(get_package_share_directory('erc_perception'), 'launch', 'free_space.launch.py')),
         launch_arguments={'obstacle_mode': LaunchConfiguration('obstacle_mode'),
-                          'depth_backend': LaunchConfiguration('depth_backend')}.items(),
+                          'depth_backend': LaunchConfiguration('depth_backend'),
+                          # slopes are ground, as in mission_carrot (20-oct)
+                          'ground_model': 'slope',
+                          'ground_fit_from': '0.75'}.items(),
         condition=real)
     localization = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(

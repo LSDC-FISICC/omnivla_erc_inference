@@ -60,7 +60,7 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from geometry_msgs.msg import PointStamped, PoseStamped, TransformStamped, Twist
 from nav_msgs.msg import OccupancyGrid, Path
-from sensor_msgs.msg import LaserScan, NavSatFix
+from sensor_msgs.msg import Imu, LaserScan, NavSatFix
 from std_msgs.msg import Bool, Float32, String
 
 from erc_inference_msgs.action import StartMission
@@ -71,6 +71,10 @@ from tf2_ros import TransformBroadcaster
 from erc_inference import local_planner
 from erc_inference import local_recovery
 from erc_inference.motion_control import CommandShaper
+from erc_inference.people_mask import WAIT_DEFAULTS as PEOPLE_WAIT_DEFAULTS
+from erc_inference.people_mask import PeopleMask, PeopleWait
+from erc_inference.safety_envelope import DEFAULTS as SAFETY_DEFAULTS
+from erc_inference.safety_envelope import SafetyEnvelope
 
 
 # nav_msgs/OccupancyGrid convention: 0-100 is a probability of occupancy and
@@ -280,6 +284,36 @@ class CheckpointControllerNode(Node):
         self.declare_parameter('heading_anchored_topic', '/erc/heading_anchored')
         self.declare_parameter('anchor_drive_max_m', 10.0)
         self.declare_parameter('anchor_drive_timeout_s', 60.0)
+        # Tilt stop (20-oct). Outdoors the rover must drive up and down slopes -- the organisers' tracks
+        # go to 18 deg -- so the stop is well above that: 25 deg from the attitude at mission start,
+        # with the accelerometer agreeing (the attitude filter alone read 15-17 deg turning in place on
+        # a flat floor, 12-oct). The rollovers were at 41 deg of pitch (mission_16sept) and climbing
+        # past 37.8 deg (off-road, 29-sept). Tilted: stop, then back down the way it came,
+        # tilt.backoff_s at tilt.backoff_v, again after tilt.retry_s while still tilted, at most
+        # tilt.tries times. It drives on once the tilt is under tilt.resume_deg -- above the 18 deg
+        # of a slope it may be standing on. With local_replan the place is marked as an obstacle so
+        # the route goes round it. Off with tilt_stop:=false.
+        self.declare_parameter('tilt_stop', True)
+        self.declare_parameter('attitude_topic', '/erc/imu_attitude')
+        self.declare_parameter('tilt.max_deg', 25.0)
+        self.declare_parameter('tilt.resume_deg', 20.0)
+        self.declare_parameter('tilt.resume_s', 1.0)
+        self.declare_parameter('tilt.accel_confirm_deg', 6.0)
+        self.declare_parameter('tilt.backoff_s', 1.5)
+        self.declare_parameter('tilt.backoff_v', 0.25)
+        self.declare_parameter('tilt.retry_s', 3.0)
+        self.declare_parameter('tilt.tries', 3)
+        self.declare_parameter('tilt.mark_m', 0.6)
+        # People (20-oct): YOLO26 'person' on objects_topic (object_detector_node; '' = off). One in the
+        # way -- 2 sightings within 1 s, 3 m ahead or less, 0.6 m or less from the rover's line --
+        # holds the rover until they are gone and two new profiles have seen the ground there (20 s
+        # at most); their bearings are kept off the local map. The rule of the indoor plant mission
+        # (people_mask.PeopleWait).
+        self.declare_parameter('objects_topic', '/erc/objects')
+        self.declare_parameter('person_classes', ['person'])
+        self.declare_parameter('people_wait', True)
+        for name, default in PEOPLE_WAIT_DEFAULTS.items():
+            self.declare_parameter(f'people.{name}', default)
 
         self._lock = threading.RLock()
         self._gps_condition = threading.Condition(self._lock)
@@ -301,6 +335,15 @@ class CheckpointControllerNode(Node):
         self._static_map = None        # this leg's OSM costmap, for the local planner
         self._heading_anchored: Optional[bool] = None   # None: nobody said (old heading_node)
         self._anchor_epoch = 0         # anchor / re-anchor events seen: the heading jumped
+        self._envelope = SafetyEnvelope()
+        self._tilt_back_until = None   # backing off a tilt until this monotonic time
+        self._tilt_tries = 0
+        self._tilt_next_try = 0.0
+        self._was_tilted = False
+        self._tilt_mark = False        # mark the place ahead in the local map (next _local_step)
+        self._people_mask = PeopleMask()
+        self._people_wait = PeopleWait(**{n: self._param(f'people.{n}') for n in PEOPLE_WAIT_DEFAULTS})
+        self._people_hold = False
 
         self._model_cmd_sub = self.create_subscription(
             Twist, self._param('model_cmd_vel_topic'), self._model_cmd_callback, 10
@@ -316,6 +359,11 @@ class CheckpointControllerNode(Node):
             String, self._param('debug_topic'), self._debug_callback, 10)
         self._anchored_sub = self.create_subscription(
             Bool, self._param('heading_anchored_topic'), self._anchored_callback, LATCHED_QOS)
+        self._attitude_sub = self.create_subscription(
+            Imu, self._param('attitude_topic'), self._attitude_callback, 10)
+        if self._param('objects_topic'):
+            self._objects_sub = self.create_subscription(
+                String, self._param('objects_topic'), self._objects_callback, 10)
         self._local_map_pub = self.create_publisher(OccupancyGrid, self._param('local_costmap_topic'), 1)
         self._local_route_pub = self.create_publisher(Path, self._param('local_route_topic'), LATCHED_QOS)
         self._global_route_pub = self.create_publisher(Path, self._param('global_route_topic'), LATCHED_QOS)
@@ -387,6 +435,7 @@ class CheckpointControllerNode(Node):
     def _scan_callback(self, msg: LaserScan):
         with self._lock:
             active = self._mission_active
+            self._people_wait.profile(self._frame_time(msg.header.stamp))
         if active:
             leg = LaserScan()
             leg.header.stamp, leg.header.frame_id = msg.header.stamp, 'rover_leg'
@@ -399,6 +448,89 @@ class CheckpointControllerNode(Node):
                 # the loop in _follow_route drains these within ~0.1 s
                 self._scans.append((time.monotonic(), msg, self._heading_deg))
                 del self._scans[:-10]
+
+    def _frame_time(self, stamp):
+        """A message stamp (ROS time of the camera frame) on the monotonic clock this node keeps."""
+        s = stamp.sec + 1e-9 * stamp.nanosec
+        age = self.get_clock().now().nanoseconds * 1e-9 - s if s > 0 else 0.0
+        return time.monotonic() - min(max(age, 0.0), 10.0)
+
+    def _attitude_callback(self, msg: Imu):
+        now = time.monotonic()
+        q, a = msg.orientation, msg.linear_acceleration
+        with self._lock:
+            self._envelope.observe_attitude(now, q.x, q.y, q.z, q.w)
+            self._envelope.observe_accel(now, a.x, a.y, a.z)
+
+    def _objects_callback(self, msg: String):
+        persons = set(self._param('person_classes'))
+        try:
+            doc = json.loads(msg.data)
+        except ValueError:
+            return
+        people = [(float(d['bearing_right_deg']), float(d['bearing_left_deg']),
+                   d['range_m'] if d.get('range_m') is not None else d.get('range_scan_m'))
+                  for d in doc.get('detections', []) if d.get('label') in persons and 'bearing_left_deg' in d]
+        stamp = float(doc.get('stamp', 0.0))
+        age = self.get_clock().now().nanoseconds * 1e-9 - stamp if stamp > 0 else 0.0
+        t = time.monotonic() - min(max(age, 0.0), 10.0)
+        with self._lock:
+            heading = self._heading_deg
+            if heading is not None:
+                self._people_mask.observe(t, 0.0, 0.0, math.radians(90.0 - heading), people)
+            self._people_wait.observe(t, people)
+
+    def _safety_params(self):
+        """The envelope with its tilt layer only: speed caps and obstacle layers stay with the control
+        law and the carrot controller's reflexes, as before."""
+        p = dict(SAFETY_DEFAULTS)
+        p.update({'safety.max_linear_vel': 10.0, 'safety.max_angular_vel': 10.0,
+                  'safety.max_lateral_accel': 100.0, 'safety.min_moving_linear_vel': 0.0,
+                  'safety.max_reverse_vel': float(self._param('tilt.backoff_v')),
+                  'safety.obstacle_enabled': False, 'safety.too_close_m': 0.0, 'safety.slow_distance_m': 0.0,
+                  'safety.stop_if_attitude_stale': False,
+                  'safety.tilt_enabled': bool(self._param('tilt_stop')),
+                  'safety.max_tilt_deg': float(self._param('tilt.max_deg')),
+                  'safety.tilt_resume_deg': float(self._param('tilt.resume_deg')),
+                  'safety.tilt_resume_s': float(self._param('tilt.resume_s')),
+                  'safety.tilt_accel_confirm_deg': float(self._param('tilt.accel_confirm_deg'))})
+        return p
+
+    def _reflexes(self, now, v, w):
+        """People and tilt on the command about to go out. Called with the lock held.
+        -> (v, w, hard, note)."""
+        note = None
+        if self._param('people_wait') and self._param('objects_topic'):
+            hold, pnote = self._people_wait.step(now)
+            if pnote:
+                note = pnote
+            self._people_hold = hold
+            if hold:
+                v, w = 0.0, 0.0
+        p = self._safety_params()
+        if not p['safety.tilt_enabled']:
+            return v, w, False, note
+        tilted = self._envelope._tilt_gate(now, p)[0]
+        if tilted and not self._was_tilted:
+            self._tilt_tries, self._tilt_next_try = 0, now
+            self._tilt_mark = True
+            note = f'tilt {self._envelope.tilt_deg:.1f} deg: stop, back down the way it came'
+        if not tilted and self._was_tilted:
+            note = f'level again ({self._envelope.tilt_deg:.1f} deg): on'
+            self._tilt_back_until = None
+        self._was_tilted = tilted
+        if tilted:
+            if self._tilt_back_until is None and now >= self._tilt_next_try \
+                    and self._tilt_tries < int(self._param('tilt.tries')):
+                self._tilt_tries += 1
+                self._tilt_back_until = now + float(self._param('tilt.backoff_s'))
+            if self._tilt_back_until is not None and now < self._tilt_back_until:
+                v, w = -float(self._param('tilt.backoff_v')), 0.0
+            elif self._tilt_back_until is not None:
+                self._tilt_back_until = None
+                self._tilt_next_try = now + float(self._param('tilt.retry_s'))
+        v, w, hard, _n = self._envelope.limit(now, v, w, p)
+        return v, w, hard, note
 
     def _shaper_limits(self):
         return (float(self._param('max_linear_accel')), float(self._param('max_linear_decel')),
@@ -416,8 +548,16 @@ class CheckpointControllerNode(Node):
                 target.linear.x, target.angular.z = self._recovery_cmd
             dt = 0.0 if self._last_output_time is None else now - self._last_output_time
             self._last_output_time = now
+            v, w = target.linear.x, target.angular.z
+            note = None
+            if self._mission_active:
+                v, w, hard, note = self._reflexes(now, v, w)
+                if hard:
+                    self._shaper.cut(v, w)
             self._shaper.configure(*self._shaper_limits())
-            linear, angular = self._shaper.step(target.linear.x, target.angular.z, dt)
+            linear, angular = self._shaper.step(v, w, dt)
+        if note:
+            self.get_logger().info(f'[reflex] {note}')
         output = Twist()
         output.linear.x = linear
         output.angular.z = angular
@@ -921,7 +1061,24 @@ class CheckpointControllerNode(Node):
             # the profile reports range_max where it found nothing: free, not a hit
             hit = np.isfinite(r) & (r < scan.range_max - 0.05)
             r = np.where(np.isfinite(r), r, scan.range_max)
-            replanner.observe(_t, east, north, math.radians(90.0 - heading_deg), bearings, r, hit)
+            yaw = math.radians(90.0 - heading_deg)
+            r, hit = self._people_mask.filter(self._frame_time(scan.header.stamp), yaw, bearings, r, hit)
+            replanner.observe(_t, east, north, yaw, bearings, r, hit)
+        if self._tilt_mark and self._heading_deg is not None:
+            # what tipped the rover is ahead of it: an obstacle, so the route goes round it
+            self._tilt_mark = False
+            yaw = math.radians(90.0 - self._heading_deg)
+            m = replanner.map
+            d = float(self._param('tilt.mark_m'))
+            for along in (0.5 * d, d):
+                for side in (-0.3, 0.0, 0.3):
+                    x = east + along * math.cos(yaw) - side * math.sin(yaw)
+                    y = north + along * math.sin(yaw) + side * math.cos(yaw)
+                    row, col = (int(v) for v in m.cell(x, y))
+                    if 0 <= row < m.h and 0 <= col < m.w:
+                        m.L[row, col] = m.p['max_logodds']
+                        m.seen[row, col] = True
+            m._dist = None
         if not check:
             return None, ''
         new_pts, note = replanner.check(now, east, north, pts, cum, s_proj, extra_lethal)
@@ -1048,6 +1205,8 @@ class CheckpointControllerNode(Node):
                 self._mission_active = True
                 self._motion_allowed = False
                 self._stop_requested = True
+                self._envelope.arm()          # the attitude now is "level": the tilt stop counts from it
+                self._was_tilted, self._tilt_back_until = False, None
 
             arrival_for_sequence = None
             arrival_threshold_m = float(self._param('checkpoint_proximity_m'))

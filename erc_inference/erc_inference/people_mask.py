@@ -86,3 +86,75 @@ class PeopleMask:
             win = m.L[rows[0]:rows[-1] + 1, cols[0]:cols[-1] + 1]
             win[sel] = np.minimum(win[sel], 0.0)
             m._dist = None
+
+
+WAIT_DEFAULTS = dict(
+    wait_m=3.0,           # in the way: this near ahead ...
+    wait_half_m=0.6,      # ... and this near the rover's line, on confirm sightings within gone_s
+    confirm=2,
+    keep_m=4.0,           # waiting, still in the way this near ...
+    keep_half_m=1.0,      # ... and this near the line (the range is good to ~8 %)
+    gone_s=1.0,           # on again: nobody in the way for this long ...
+    profiles=2,           # ... and this many profiles taken since
+    max_s=20.0,           # no longer than this; then not again for as long
+)
+
+
+class PeopleWait:
+    """Someone in the way: stand still until they are gone and the profile has looked again.
+
+    The rule of explore_search._people_step (the plant mission), for missions that keep their
+    own state machine (checkpoint_controller_node outdoors). observe() takes one frame's people,
+    profile() each new free-space profile, step() says whether to hold."""
+
+    def __init__(self, **kw):
+        self.p = dict(WAIT_DEFAULTS)
+        self.p.update({k: v for k, v in kw.items() if k in WAIT_DEFAULTS})
+        self.seen_t = -math.inf
+        self.in_way = []
+        self.profiles_after = 0
+        self.since = None
+        self.no_wait_until = -math.inf
+        self.waits = []              # (t start, s waited, 'gone' | 'timeout')
+
+    def observe(self, t, people):
+        """people: [(right_deg, left_deg, range_m or None), ...] of a frame taken at time t."""
+        p = self.p
+        waiting = self.since is not None
+        near = p['keep_m'] if waiting else p['wait_m']
+        half = p['keep_half_m'] if waiting else p['wait_half_m']
+        for right, left, rng in people:
+            if rng is None:
+                continue
+            right, left = min(right, left), max(right, left)
+            lo, hi = rng * math.sin(math.radians(right)), rng * math.sin(math.radians(left))
+            ahead = rng * math.cos(math.radians(0.5 * (right + left)))
+            if 0.0 < ahead <= near and lo <= half and hi >= -half:
+                self.seen_t = max(self.seen_t, t)
+                self.profiles_after = 0
+                self.in_way = [u for u in self.in_way if t - u <= p['gone_s']] + [t]
+
+    def profile(self, t):
+        if t > self.seen_t:
+            self.profiles_after += 1
+
+    def step(self, t):
+        """-> (hold, note): hold True while waiting; note when the state changes."""
+        p = self.p
+        there = t - self.seen_t <= p['gone_s']
+        if self.since is None:
+            recent = [u for u in self.in_way if t - u <= p['gone_s']]
+            if not there or len(recent) < p['confirm'] or t < self.no_wait_until:
+                return False, None
+            self.since = t
+            return True, 'someone in the way: waiting for them to go'
+        waited = t - self.since
+        if waited > p['max_s']:
+            self.waits.append((self.since, waited, 'timeout'))
+            self.since, self.no_wait_until = None, t + p['max_s']
+            return False, f'still someone in the way after {waited:.0f} s: going on'
+        if there or self.profiles_after < p['profiles']:
+            return True, None
+        self.waits.append((self.since, waited, 'gone'))
+        self.since = None
+        return False, f'the way is clear of people after {waited:.1f} s: on'

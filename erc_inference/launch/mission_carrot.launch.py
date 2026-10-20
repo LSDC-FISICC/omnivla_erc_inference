@@ -73,7 +73,7 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import (DeclareLaunchArgument, IncludeLaunchDescription,
+from launch.actions import (DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription,
                             LogInfo, TimerAction)
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
@@ -102,6 +102,20 @@ def generate_launch_description():
         DeclareLaunchArgument('drop_detection', default_value='false',
                               description='free_space_node (unidepth): report drop-offs / stairs '
                                           'going down; also stops at descents and hill tops'),
+        # Outdoors the rover drives slopes (the organisers' tracks go to 18 deg): with the ground a
+        # single plane fitted near the wheels, every ramp ahead read as a wall at its foot. 'slope'
+        # lets the ground rise up to 20 deg/m; kerbs, steps and walls still stand out (20-oct,
+        # erc_perception test/test_ground_slope.py). The plane is fitted on the lower quarter, as in
+        # September: the lower 40 % is validated indoors only, and on the Costa Rica ramp frame it
+        # brought a phantom from 1.97 to 1.58 m.
+        DeclareLaunchArgument('ground_model', default_value='slope',
+                              description="free_space_node (unidepth): 'slope' (outdoor) or 'plane'"),
+        DeclareLaunchArgument('ground_fit_from', default_value='0.75',
+                              description='free_space_node: fit the ground plane below this fraction of the image'),
+        DeclareLaunchArgument('people', default_value='true',
+                              description="YOLO26 'person' -> /erc/objects: checkpoint_controller_node "
+                                          'waits for someone in the way and keeps them off its local map'),
+        DeclareLaunchArgument('yolo_conf', default_value='0.5', description='YOLO26 minimum confidence'),
         DeclareLaunchArgument('obstacle_stop', default_value='false',
                               description='brake on /erc/free_space; never field-tested'),
         DeclareLaunchArgument('stop_distance_m', default_value='1.2',
@@ -148,8 +162,17 @@ def generate_launch_description():
                          'free_space.launch.py')),
         launch_arguments={'obstacle_mode': LaunchConfiguration('obstacle_mode'),
                           'depth_backend': LaunchConfiguration('depth_backend'),
-                          'drop_detection': LaunchConfiguration('drop_detection')}.items(),
+                          'drop_detection': LaunchConfiguration('drop_detection'),
+                          'ground_model': LaunchConfiguration('ground_model'),
+                          'ground_fit_from': LaunchConfiguration('ground_fit_from')}.items(),
         condition=IfCondition(LaunchConfiguration('perception')))
+
+    # people only (no plants outdoors); ranged from free_space_node's distance image (unidepth), or
+    # from the profile with da3
+    people = ExecuteProcess(
+        cmd=['ros2', 'run', 'erc_perception', 'yolo_wrapper', '--ros-args',
+             '-p', ['conf:=', LaunchConfiguration('yolo_conf')], '-p', "classes:=['person']"],
+        output='screen', condition=IfCondition(LaunchConfiguration('people')))
 
     localization = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -165,6 +188,7 @@ def generate_launch_description():
         args + bridge + static_map + [
             controller,
             perception,
+            people,
             TimerAction(period=LOCALIZATION_DELAY_S, actions=[localization]),
             reminder,
         ])

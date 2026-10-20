@@ -109,7 +109,10 @@ def generate_launch_description():
             os.path.join(get_package_share_directory('erc_perception'), 'launch', 'free_space.launch.py')),
         launch_arguments={'depth_backend': LaunchConfiguration('depth_backend'),
                           'drop_detection': LaunchConfiguration('drop_detection'),
-                          'clearance_m': LaunchConfiguration('clearance_m')}.items())
+                          'clearance_m': LaunchConfiguration('clearance_m'),
+                          # slopes are ground, as in mission_carrot (20-oct)
+                          'ground_model': 'slope',
+                          'ground_fit_from': '0.75'}.items())
 
     flags = Node(package='erc_perception', executable='flag_detector_node', name='flag_detector_node',
                  output='screen',
