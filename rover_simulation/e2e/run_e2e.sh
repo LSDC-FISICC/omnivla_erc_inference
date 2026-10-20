@@ -8,9 +8,9 @@
 # HEADING_SRC=gyro_gps|fused: the fake world publishes raw gyro/wheels/GPS/magnetometer instead of
 #   the heading and Earth-rover-ros2-bridge's heading_node.py estimates it (see fake_world.py).
 #   MAG_MODE=frozen|good: that magnetometer. MAG_CAL=valid: fused gets a valid calibration file.
-# Logs go to ./out/. Needs a workspace with erc_inference_msgs / erc_static_map_msgs.
+# Logs go to ./out/. Needs a workspace with erc_controller_msgs / erc_static_map_msgs.
 HERE=$(cd "$(dirname "$0")" && pwd)
-SRC=$(cd "$HERE/../../erc_inference" && pwd)
+SRC=$(cd "$HERE/../../erc_controller" && pwd)
 source /opt/ros/jazzy/setup.bash
 source ${WS:-$HOME/lsdc_ws}/install/setup.bash
 export ROS_DOMAIN_ID=${ROS_DOMAIN_ID_E2E:-78} PYTHONPATH=$SRC:$PYTHONPATH
@@ -28,15 +28,15 @@ if [ "$HEADING_SRC" = gyro_gps ] || [ "$HEADING_SRC" = fused ]; then
     -p mag_calibration_file:="$CAL" > "$OUT.heading.log" 2>&1 & HN=$!
 fi
 sleep 2
-python3 -m erc_inference.carrot_controller_node --ros-args --params-file "$SRC/config/controller.yaml" \
+python3 -m erc_controller.carrot_controller_node --ros-args --params-file "$SRC/config/controller.yaml" \
   -p obstacle_sidestep:=true > "$OUT.carrot.log" 2>&1 & CN=$!
-python3 -m erc_inference.checkpoint_controller_node --ros-args \
+python3 -m erc_controller.checkpoint_controller_node --ros-args \
   -p checkpoint_list_url:=http://127.0.0.1:8765/checkpoints-list \
   -p checkpoint_reached_url:=http://127.0.0.1:8765/checkpoint-reached \
   -p costmap_service_timeout_s:=1.0 -p planner_service_timeout_s:=1.0 \
   -p local_replan:=$LR -p carrot_distance_m:=$C $CP_EXTRA > "$OUT.cp.log" 2>&1 & CP=$!
 sleep 4
-ros2 action send_goal /start_mission erc_inference_msgs/action/StartMission \
+ros2 action send_goal /start_mission erc_controller_msgs/action/StartMission \
   "{resume_from_latest_scanned: false}" > "$OUT.action.log" 2>&1 & AG=$!
 wait $FW
 kill -INT $CN $CP $HN 2>/dev/null; sleep 1; kill $CN $CP $HN 2>/dev/null

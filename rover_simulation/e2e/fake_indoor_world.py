@@ -22,8 +22,8 @@ from rcl_interfaces.msg import Log
 from rclpy.node import Node
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(HERE, '..', '..', 'erc_inference', 'test'))
-sys.path.insert(0, os.path.join(HERE, '..', '..', 'erc_inference'))
+sys.path.insert(0, os.path.join(HERE, '..', '..', 'erc_controller', 'test'))
+sys.path.insert(0, os.path.join(HERE, '..', '..', 'erc_controller'))
 import obstacles as obs  # noqa: E402
 from indoor_sim import nyu_walls  # noqa: E402
 

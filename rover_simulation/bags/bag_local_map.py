@@ -10,10 +10,10 @@ did not follow these plans. Runs under /usr/bin/python3 (rosbag2_py):
     python3 bag_local_map.py <bag> map.png <leg start, unix s> 3 # + first 3 replans -> map_replan.png
 """
 import os, sys
-sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'erc_inference')))
+sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'erc_controller')))
 import re, math, numpy as np
 import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt
-from erc_inference import local_planner as lp
+from erc_controller import local_planner as lp
 import rosbag2_py
 from rclpy.serialization import deserialize_message
 from rosidl_runtime_py.utilities import get_message

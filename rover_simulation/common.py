@@ -1,21 +1,21 @@
 """Shared setup for the rover_simulation tools.
 
-The simulator engine lives in ../erc_inference/test/ (controller_sim.py,
+The simulator engine lives in ../erc_controller/test/ (controller_sim.py,
 obstacles.py) because the package's pytest suite imports it from there; the
-robot's own code it runs is ../erc_inference/erc_inference/. This puts both on
+robot's own code it runs is ../erc_controller/erc_controller/. This puts both on
 the path and wraps one simulated mission in a single call.
 """
 import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-PACKAGE = os.path.normpath(os.path.join(HERE, '..', 'erc_inference'))
+PACKAGE = os.path.normpath(os.path.join(HERE, '..', 'erc_controller'))
 sys.path.insert(0, os.path.join(PACKAGE, 'test'))
 sys.path.insert(0, PACKAGE)
 
 import controller_sim as cs  # noqa: E402
 import obstacles as obs  # noqa: E402
-from erc_inference.sidestep import SideStep  # noqa: E402
+from erc_controller.sidestep import SideStep  # noqa: E402
 
 # What each config name turns on, as mission_carrot.launch.py would:
 #   carrot  carrot_controller_node alone (no reaction to obstacles)

@@ -35,7 +35,7 @@ from sensor_msgs.msg import Imu, LaserScan, MagneticField, NavSatFix
 from std_msgs.msg import Float32, String
 
 import os
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'erc_inference', 'test'))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'erc_controller', 'test'))
 import obstacles as obs  # noqa: E402
 
 LAT0, LON0 = 30.4825077, 114.3026199

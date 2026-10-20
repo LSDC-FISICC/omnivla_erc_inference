@@ -27,7 +27,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 
 import common  # noqa: E402
-from erc_inference import local_planner as lp  # noqa: E402
+from erc_controller import local_planner as lp  # noqa: E402
 
 cs, obs = common.cs, common.obs
 BRIDGE = os.path.normpath(os.path.join(common.HERE, '..', '..', 'Earth-rover-ros2-bridge'))

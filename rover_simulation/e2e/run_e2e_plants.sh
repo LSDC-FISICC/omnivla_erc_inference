@@ -10,7 +10,7 @@
 #      ROS_DOMAIN_ID_E2E EXTRA_CARROT_ARGS (more -p name:=value for carrot_controller_node)
 #      EXTRA_LAUNCH_ARGS (more name:=value for plants_controller.launch.py)
 HERE=$(cd "$(dirname "$0")" && pwd)
-SRC=$(cd "$HERE/../../erc_inference" && pwd)
+SRC=$(cd "$HERE/../../erc_controller" && pwd)
 source /opt/ros/jazzy/setup.bash
 source ${WS:-$HOME/lsdc_ws}/install/setup.bash
 export ROS_DOMAIN_ID=${ROS_DOMAIN_ID_E2E:-84} PYTHONPATH=$SRC:${EXTRA_PYTHONPATH:-}:$PYTHONPATH
@@ -22,18 +22,18 @@ if [ "${CONTROLLER:-carrot}" = mppi ]; then
   # Nav2's MPPI drives, as mission_indoor.launch.py model:=mppi starts it (the follower's numbers
   # are that launch's, from config/rover_dynamics.yaml). `ros2 run` starts the executable as a
   # child: killed by what they are, on this domain only (see run_e2e_nav2.sh).
-  NAV2_YAML=$(python3 -m erc_inference.nav2_indoor "$SRC/config/nav2_mppi.yaml")
+  NAV2_YAML=$(python3 -m erc_controller.nav2_indoor "$SRC/config/nav2_mppi.yaml")
   ros2 run nav2_controller controller_server --ros-args --params-file "$NAV2_YAML" \
     -r cmd_vel:=/nav2/cmd_vel > "$OUT.controller.log" 2>&1 & CS=$!
   sleep 3
   ros2 run nav2_lifecycle_manager lifecycle_manager --ros-args -r __node:=lifecycle_manager_mppi \
     --params-file "$NAV2_YAML" > "$OUT.lifecycle.log" 2>&1 & LM=$!
-  python3 -m erc_inference.nav2_route_follower_node --ros-args -p predict_delay_s:=1.33 -p k_v:=1.07 \
+  python3 -m erc_controller.nav2_route_follower_node --ros-args -p predict_delay_s:=1.33 -p k_v:=1.07 \
     -p k_w_moving:=1.13 -p w_rest_deadband:=0.10 -p w_rest_slope:=1.7 -p v_breakaway:=0.05 -p v_floor:=0.10 -p 'k_w_bounds:=[0.7, 1.6]' \
     ${EXTRA_FOLLOWER_ARGS:-} > "$OUT.follower.log" 2>&1 & CN=$!
   NAV2_PIDS="$CS $LM"
 else
-python3 -m erc_inference.carrot_controller_node --ros-args --params-file "$SRC/config/controller.yaml" \
+python3 -m erc_controller.carrot_controller_node --ros-args --params-file "$SRC/config/controller.yaml" \
   -p gps_topic:=/erc/indoor/fix -p compass_topic:=/erc/indoor/heading_deg \
   -p max_linear_vel:=0.25 -p goal_turn.enter_deg:=30.0 -p goal_turn.exit_deg:=10.0 ${EXTRA_CARROT_ARGS:-} > "$OUT.carrot.log" 2>&1 & CN=$!
 fi
@@ -43,7 +43,7 @@ fi
 setsid python3 -c 'import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.execvp(sys.argv[1], sys.argv[1:])' \
   ros2 launch "$SRC/launch/plants_controller.launch.py" plants:=$N ${EXTRA_LAUNCH_ARGS:-} > "$OUT.mission.log" 2>&1 & MN=$!
 sleep 6
-ros2 action send_goal /start_mission erc_inference_msgs/action/StartMission \
+ros2 action send_goal /start_mission erc_controller_msgs/action/StartMission \
   "{resume_from_latest_scanned: false}" > "$OUT.action.log" 2>&1 & AG=$!
 wait $FW
 sleep 3                      # let the action report its result

@@ -32,8 +32,8 @@ from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(HERE, '..', '..', 'erc_inference', 'test'))
-sys.path.insert(0, os.path.join(HERE, '..', '..', 'erc_inference'))
+sys.path.insert(0, os.path.join(HERE, '..', '..', 'erc_controller', 'test'))
+sys.path.insert(0, os.path.join(HERE, '..', '..', 'erc_controller'))
 import cone_sim  # noqa: E402
 import image_goal_sim as igs  # noqa: E402
 import indoor_sim as isim  # noqa: E402

@@ -8,8 +8,8 @@ revisar los bags **después**. Aquí salieron los números de `docs/MissionCarro
 
 | | |
 |---|---|
-| **Motor del simulador** | `../erc_inference/test/controller_sim.py` (rover, localización, bucle de misión) y `../erc_inference/test/obstacles.py` (mundos y perfil de percepción simulado). Se quedan en `test/` porque `test_controller_sim.py` y `colcon test` los importan de ahí. |
-| **Código del robot que se ejecuta** | `../erc_inference/erc_inference/`: `motion_control.py`, `sidestep.py`, `local_planner.py` y la geometría de ruta de `checkpoint_controller_node.py`. Es el mismo código del rover, no una copia. |
+| **Motor del simulador** | `../erc_controller/test/controller_sim.py` (rover, localización, bucle de misión) y `../erc_controller/test/obstacles.py` (mundos y perfil de percepción simulado). Se quedan en `test/` porque `test_controller_sim.py` y `colcon test` los importan de ahí. |
+| **Código del robot que se ejecuta** | `../erc_controller/erc_controller/`: `motion_control.py`, `sidestep.py`, `local_planner.py` y la geometría de ruta de `checkpoint_controller_node.py`. Es el mismo código del rover, no una copia. |
 | `experiment_simple.py` | **Empieza aquí.** Un experimento en imágenes: costmap global (OSM) + ruta A\*, espacio libre, costmap local al replanificar y al final, trayectoria. |
 | `experiment_perception.py` | La cadena de percepción del mismo experimento: cámara renderizada con el modelo calibrado, profundidad, altura sobre el suelo, hazard, perfil (código de `free_space_node`) y homografía residual ideal. |
 | `common.py` | Rutas y `run()`: una misión simulada en una llamada. |
@@ -37,11 +37,11 @@ aquí se confirma en campo.
 ## Uso
 
 Simulación, con el Python del venv (tiene `utm`) y un workspace cargado (mensajes de
-`erc_inference_msgs` / `erc_static_map_msgs`):
+`erc_controller_msgs` / `erc_static_map_msgs`):
 
 ```bash
 source /opt/ros/jazzy/setup.bash && source ~/lsdc_ws/install/setup.bash
-cd ~/lsdc/erc-omni-vla/omnivla_erc_inference/rover_simulation
+cd ~/lsdc/erc-omni-vla/erc_controller/rover_simulation
 PY=~/lsdc/erc-omni-vla/.venv/bin/python3
 
 $PY experiment_simple.py                                          # -> experiment_simple.png
@@ -88,10 +88,10 @@ este/norte desde el inicio del tramo, el mismo marco del carrot):
 
 ```bash
 # en vivo
-rviz2 -d $(ros2 pkg prefix erc_inference)/share/erc_inference/rviz/local_planning.rviz
+rviz2 -d $(ros2 pkg prefix erc_controller)/share/erc_controller/rviz/local_planning.rviz
 # desde un bag
 ros2 bag play <bag> --clock
-rviz2 -d $(ros2 pkg prefix erc_inference)/share/erc_inference/rviz/local_planning.rviz --ros-args -p use_sim_time:=true
+rviz2 -d $(ros2 pkg prefix erc_controller)/share/erc_controller/rviz/local_planning.rviz --ros-args -p use_sim_time:=true
 ```
 
 Sin monitor en el DGX (acceso remoto):
@@ -116,7 +116,7 @@ reconstruye el mapa y las replanificaciones a PNG.
 
 ## Foxglove con pestañas: percepción, A\*, planificador local, replanificador, MPPI
 
-`erc_inference/foxglove/planning_tabs.json` (instalado en `share/erc_inference/foxglove/`). En
+`erc_controller/foxglove/planning_tabs.json` (instalado en `share/erc_controller/foxglove/`). En
 Foxglove: **Layouts → Import from file**. Funciona en vivo (`foxglove_bridge`) y sobre bags.
 
 Para el robot solo con el puente y la percepción (sin controlador de misión, p. ej.
@@ -134,7 +134,7 @@ Para el robot solo con el puente y la percepción (sin controlador de misión, p
 
 Qué hace falta para que cada pestaña tenga datos:
 - **UniDepthV2:** las imágenes salen solo con `debug_images:=true` (apagado por defecto), p. ej.
-  `ros2 launch erc_inference mission_carrot_unidepth.launch.py debug_images:=true`. Son JPEG de
+  `ros2 launch erc_controller mission_carrot_unidepth.launch.py debug_images:=true`. Son JPEG de
   512 px (~40 kB) a la tasa del perfil (3 Hz); no en `obstacle_mode:=contact`.
 - **Planificador local / Replanificador:** `checkpoint_controller_node` con `-p local_replan:=true`.
 - **MPPI:** `mission_nav2*.launch.py` (Nav2 publica las trayectorias porque `visualize: true` en

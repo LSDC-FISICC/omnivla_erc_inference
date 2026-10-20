@@ -33,17 +33,17 @@ from std_msgs.msg import String
 from visualization_msgs.msg import MarkerArray
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(HERE, '..', '..', 'erc_inference', 'test'))
-sys.path.insert(0, os.path.join(HERE, '..', '..', 'erc_inference'))
+sys.path.insert(0, os.path.join(HERE, '..', '..', 'erc_controller', 'test'))
+sys.path.insert(0, os.path.join(HERE, '..', '..', 'erc_controller'))
 import explore_search_sim as ess  # noqa: E402
 import obstacles as obs  # noqa: E402
 
-# The plant is THIS unit's, as identified (erc_inference/config/rover_dynamics.yaml). PLANT=competition
+# The plant is THIS unit's, as identified (erc_controller/config/rover_dynamics.yaml). PLANT=competition
 # gives the competition rovers' instead (fake_world.py's: 1.3 s, k_v 1.11 with a 0.15 floor, turn gain
 # 1.1 moving / 1.18 in place with a 0.15 floor, tau 0.47 / 0.35 s); KW_MOVING_SCALE scales the turn gain
 # while moving, the part that did not repeat between the two runs (0.4x-0.9x at 0.15 m/s).
 import yaml  # noqa: E402
-with open(os.path.join(HERE, '..', '..', 'erc_inference', 'config', 'rover_dynamics.yaml')) as _fh:
+with open(os.path.join(HERE, '..', '..', 'erc_controller', 'config', 'rover_dynamics.yaml')) as _fh:
     DYN = yaml.safe_load(_fh)
 PLANT = os.environ.get('PLANT', 'unit')
 KW_MOVING_SCALE = float(os.environ.get('KW_MOVING_SCALE', 1.0))

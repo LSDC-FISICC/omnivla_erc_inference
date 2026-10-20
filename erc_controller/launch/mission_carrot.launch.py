@@ -1,0 +1,194 @@
+"""The outdoor GPS mission stack: carrot-following polar control, nothing learned in the loop.
+
+Why. The replay of mission_wuhan_hard ran every recorded tick through the
+controller under steering_source=plan and =carrot and got the same oscillation
+to the decimal. The model's applied deviation had median 0.0 deg -- the 8 deg
+deadzone swallowed it. It was not steering. Taking it out also frees the GPU
+for the free-space profile (85 ms alone vs 205 ms sharing the device).
+
+Layers:
+
+    erc_bridge        erc_data_node, erc_screenshot_node, erc_control_node,
+                      erc_status_node (read-only latency instrumentation)
+    erc_static_map    erc_static_map_node, erc_astar_planner_node
+    erc_controller     carrot_controller_node
+    erc_perception    free_space_node, SHADOW  (arg perception, default true)
+    erc_localization  localization_global.launch.py
+
+Arguments:
+
+    perception:=true|false     run erc_perception's free-space profile. Shadow:
+                               it only publishes /erc/free_space for the bag.
+    obstacle_mode:=height|contact  how that profile decides what is an obstacle.
+                               contact: segmentation + ground contact, against the
+                               far-tree phantoms of parks (erc_perception
+                               free_space_node docstring). Needs transformers in
+                               .venv-depth.
+    depth_backend:=da3|unidepth  depth model of that profile. unidepth: UniDepthV2,
+                               no far compression (mission_carrot_unidepth.launch.py
+                               sets it). Needs ~/lsdc/erc-omni-vla/.venv-unidepth.
+    drop_detection:=false|true  (unidepth) also report where the ground ends
+                               abruptly -- raised edges, stairs going down -- as
+                               an obstacle. Stops at the top of descents and
+                               hills too: for parks/plazas, not rolling grass.
+    obstacle_stop:=false|true  let carrot_controller_node BRAKE when that
+                               profile sees something close straight ahead.
+                               Brakes, never steers -- see its docstring. Needs
+                               perception:=true. Never run in the field yet.
+    obstacle_sidestep:=false|true  instead of stopping for good: brake, turn ~60
+                               deg in place (route's side if open), advance 1.3 m,
+                               back to the carrot. Replaces obstacle_stop.
+                               Needs perception:=true. Never run in the field.
+    heading_source:=gyro_gps   heading from gyro + GPS, no magnetometer (units whose
+                               magnetometer does not see the rover turn: mission_botswana).
+                               Declared by erc_localization's localization_global.launch.py;
+                               reaches it from any mission launch. The first leg then starts
+                               with checkpoint_controller_node driving ~5 m straight ahead
+                               to anchor it (see heading_node.py).
+
+Still by hand, exactly as with mission.launch.py -- and this is where the carrot
+distance and the local obstacle map go, because both are
+checkpoint_controller_node's parameters:
+
+    ros2 run erc_controller checkpoint_controller_node --ros-args -p carrot_distance_m:=2.5
+    # or, with the local map + replanning around what OSM does not have
+    # (local_planner.py; needs perception:=true; never run in the field):
+    ros2 run erc_controller checkpoint_controller_node --ros-args \
+        -p carrot_distance_m:=1.5 -p local_replan:=true
+    ros2 action send_goal /start_mission erc_controller_msgs/action/StartMission \\
+        "{resume_from_latest_scanned: false}"
+
+2.5 m, not the 1.5 m default: 1.5 was chosen to keep the MODEL's goal inside its
+training distribution (median 1.6 m). Without the model that constraint is gone,
+and in simulation 2.5 m halves the weave (3.0 -> 1.6 sign changes/min) at the
+cost of p95 cross-track 0.98 -> 1.17 m from cutting corners. Do not use 2.5 m
+with mission.launch.py: it would push the model's goal out of range.
+
+With local_replan use 1.5 m: the carrot has to follow the local detours, and
+2.5 m cuts their corners. controller_sim, 8 seeds x 8 scenarios with
+obstacle_sidestep on: 1.5 m completed 63/64 with 0 collisions (2.5 m: 61/64).
+"""
+
+import os
+
+from ament_index_python.packages import get_package_share_directory
+from launch import LaunchDescription
+from launch.actions import (DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription,
+                            LogInfo, TimerAction)
+from launch.conditions import IfCondition
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
+
+# Same reason as mission.launch.py: localization_global blocks on the first GPS
+# fix, which only arrives once the bridge is up.
+LOCALIZATION_DELAY_S = 5.0
+
+
+def generate_launch_description():
+    controller_yaml = os.path.join(
+        get_package_share_directory('erc_controller'), 'config', 'controller.yaml')
+
+    args = [
+        DeclareLaunchArgument('perception', default_value='true',
+                              description='run erc_perception free_space_node (shadow)'),
+        DeclareLaunchArgument('obstacle_mode', default_value='height',
+                              description="free_space_node: 'height' or 'contact' (segmentation + "
+                                          "ground contact, against far-tree phantoms)"),
+        DeclareLaunchArgument('depth_backend', default_value='da3',
+                              description="free_space_node depth model: 'da3' or 'unidepth' "
+                                          "(UniDepthV2; see mission_*_unidepth.launch.py)"),
+        DeclareLaunchArgument('drop_detection', default_value='false',
+                              description='free_space_node (unidepth): report drop-offs / stairs '
+                                          'going down; also stops at descents and hill tops'),
+        # Outdoors the rover drives slopes (the organisers' tracks go to 18 deg): with the ground a
+        # single plane fitted near the wheels, every ramp ahead read as a wall at its foot. 'slope'
+        # lets the ground rise up to 20 deg/m; kerbs, steps and walls still stand out (20-oct,
+        # erc_perception test/test_ground_slope.py). The plane is fitted on the lower quarter, as in
+        # September: the lower 40 % is validated indoors only, and on the Costa Rica ramp frame it
+        # brought a phantom from 1.97 to 1.58 m.
+        DeclareLaunchArgument('ground_model', default_value='slope',
+                              description="free_space_node (unidepth): 'slope' (outdoor) or 'plane'"),
+        DeclareLaunchArgument('ground_fit_from', default_value='0.75',
+                              description='free_space_node: fit the ground plane below this fraction of the image'),
+        DeclareLaunchArgument('people', default_value='true',
+                              description="YOLO26 'person' -> /erc/objects: checkpoint_controller_node "
+                                          'waits for someone in the way and keeps them off its local map'),
+        DeclareLaunchArgument('yolo_conf', default_value='0.5', description='YOLO26 minimum confidence'),
+        DeclareLaunchArgument('obstacle_stop', default_value='false',
+                              description='brake on /erc/free_space; never field-tested'),
+        DeclareLaunchArgument('stop_distance_m', default_value='1.2',
+                              description='must cover the 1.3 s loop delay; 0.8 m hit in simulation'),
+        DeclareLaunchArgument('obstacle_sidestep', default_value='false',
+                              description='side-step around obstacles (sidestep.py); never field-tested'),
+    ]
+
+    bridge = [
+        Node(package='erc_bridge', executable='erc_data_node',
+             name='erc_data_node', output='screen'),
+        Node(package='erc_bridge', executable='erc_screenshot_node',
+             name='erc_screenshot_node', output='screen'),
+        Node(package='erc_bridge', executable='erc_control_node',
+             name='erc_control_node', output='screen'),
+        Node(package='erc_bridge', executable='erc_status_node',
+             name='erc_status_node', output='screen'),
+    ]
+
+    static_map = [
+        Node(package='erc_static_map', executable='erc_static_map_node',
+             name='erc_static_map_node', output='screen'),
+        Node(package='erc_static_map', executable='erc_astar_planner_node',
+             name='erc_astar_planner_node', output='screen'),
+    ]
+
+    # A plain Node, no wrapper: there is no model, so no conda/venv to enter.
+    # controller.yaml's /** block supplies the control parameters exactly as it
+    # does for the model nodes; the node forces steering_source to carrot.
+    controller = Node(
+        package='erc_controller', executable='carrot_controller_node',
+        name='carrot_controller_node', output='screen',
+        parameters=[controller_yaml, {
+            # bool/float through ParameterValue: a bare LaunchConfiguration is a
+            # string, and the node declared these as bool/double
+            'obstacle_stop': ParameterValue(LaunchConfiguration('obstacle_stop'), value_type=bool),
+            'stop_distance_m': ParameterValue(LaunchConfiguration('stop_distance_m'), value_type=float),
+            'obstacle_sidestep': ParameterValue(LaunchConfiguration('obstacle_sidestep'), value_type=bool),
+        }])
+
+    perception = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(get_package_share_directory('erc_perception'), 'launch',
+                         'free_space.launch.py')),
+        launch_arguments={'obstacle_mode': LaunchConfiguration('obstacle_mode'),
+                          'depth_backend': LaunchConfiguration('depth_backend'),
+                          'drop_detection': LaunchConfiguration('drop_detection'),
+                          'ground_model': LaunchConfiguration('ground_model'),
+                          'ground_fit_from': LaunchConfiguration('ground_fit_from')}.items(),
+        condition=IfCondition(LaunchConfiguration('perception')))
+
+    # people only (no plants outdoors); ranged from free_space_node's distance image (unidepth), or
+    # from the profile with da3
+    people = ExecuteProcess(
+        cmd=['ros2', 'run', 'erc_perception', 'yolo_wrapper', '--ros-args',
+             '-p', ['conf:=', LaunchConfiguration('yolo_conf')], '-p', "classes:=['person']"],
+        output='screen', condition=IfCondition(LaunchConfiguration('people')))
+
+    localization = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(get_package_share_directory('erc_localization'), 'launch',
+                         'localization_global.launch.py')))
+
+    reminder = LogInfo(msg=(
+        'mission_carrot up. Start by hand: ros2 run erc_controller '
+        'checkpoint_controller_node --ros-args -p carrot_distance_m:=2.5  '
+        '(with local map: -p carrot_distance_m:=1.5 -p local_replan:=true)'))
+
+    return LaunchDescription(
+        args + bridge + static_map + [
+            controller,
+            perception,
+            people,
+            TimerAction(period=LOCALIZATION_DELAY_S, actions=[localization]),
+            reminder,
+        ])
