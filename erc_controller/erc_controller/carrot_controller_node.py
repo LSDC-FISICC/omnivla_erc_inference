@@ -11,12 +11,12 @@ deadzone swallowed nearly all of it. It was not steering. NuevoPlanNavegacion
 Taking it out of the process also frees the GPU: DA3 for the free-space profile
 costs 85 ms alone against 205 ms when it shares the device (PLAN_CAMPO 2.4).
 
-What it does, identically to omnivla_edge_node minus the model:
+What it does:
   * goal in the robot frame from /erc/gps/filtered + /erc/heading_deg, via the
     same robot_frame_offset / goal_bearing_from_offset
   * motion_control.MotionController with steering_source forced to "carrot"
-  * publishes /omnivla/cmd_vel, so checkpoint_controller_node gates it exactly
-    as before, and /omnivla_debug in the SAME line format, so every analysis
+  * publishes /erc/controller/cmd_vel, so checkpoint_controller_node gates it exactly
+    as before, and /erc/controller/debug in the SAME line format, so every analysis
     tool already written against that log keeps working on new bags
 
 What it adds, OFF by default -- obstacle_stop:
@@ -88,7 +88,7 @@ _TO_UTM = {}
 def to_utm(lat, lon, zone_of=None):
     """(easting, northing) in the UTM zone of `zone_of` (default: this point).
 
-    pyproj, not the `utm` package omnivla_edge_node uses: this node runs as a
+    pyproj, not the `utm` package: this node runs as a
     plain entry point under /usr/bin/python3, which has pyproj (3.6.1 -- it is
     what checkpoint_controller_node already relies on) and NOT utm, so importing
     utm here would kill the node on its first line. Same projection, same
@@ -118,8 +118,8 @@ class CarrotControllerNode(Node):
         self.declare_parameter('compass_topic', '/erc/heading_deg')
         self.declare_parameter('goal_gps_topic', '/goal_gps')
         self.declare_parameter('enable_inference_topic', '/enable_inference')
-        self.declare_parameter('cmd_vel_topic', '/omnivla/cmd_vel')
-        self.declare_parameter('debug_topic', '/omnivla_debug')
+        self.declare_parameter('cmd_vel_topic', '/erc/controller/cmd_vel')
+        self.declare_parameter('debug_topic', '/erc/controller/debug')
         for name, default in DEFAULT_PARAMS.items():
             self.declare_parameter(name, default)
         # obstacle_stop: off unless asked for, see module docstring
@@ -187,12 +187,12 @@ class CarrotControllerNode(Node):
         if side:
             self.get_logger().warn(
                 'obstacle_sidestep is ON (replaces obstacle_stop). It has never run in the '
-                'field: watch /omnivla_debug for "[side-step]"; a give-up holds until '
+                'field: watch /erc/controller/debug for "[side-step]"; a give-up holds until '
                 '/enable_inference is toggled.')
         elif stop:
             self.get_logger().warn(
                 'obstacle_stop is ON. It has never run in the field: expect '
-                'false stops, and watch /omnivla_debug for "[obstacle-stop]".')
+                'false stops, and watch /erc/controller/debug for "[obstacle-stop]".')
 
     # -- parameters -----------------------------------------------------
     def _control_params(self, overrides=None):

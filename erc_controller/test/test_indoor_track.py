@@ -1,6 +1,6 @@
 """indoor_track: anchoring, the pseudo-fix, and the NYU route file.
 
-The pseudo-fix is only right if omnivla_edge_node, running its own arithmetic
+The pseudo-fix is only right if carrot_controller_node, running its own arithmetic
 on it (UTM delta -> robot_frame_offset -> goal_bearing_from_offset), recovers
 the goal's true offset in the track frame. That is tested end to end here.
 """

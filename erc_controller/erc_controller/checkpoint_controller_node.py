@@ -98,9 +98,8 @@ LETHAL_COST = 100
 # TRANSIENT_LOCAL with depth 1 makes a late joiner receive the current value
 # immediately. Both ends must declare it: a volatile publisher and a
 # transient-local subscriber are INCOMPATIBLE and never connect at all, which
-# is why omnivla_edge_node.py and prueba.py carry the same profile. It is also
-# why manual `ros2 topic pub` on these topics now needs
-# `--qos-durability transient_local` (see omnivla_edge_node.py's header).
+# is why every subscriber carries the same profile. It is also why manual
+# `ros2 topic pub` on these topics needs `--qos-durability transient_local`.
 LATCHED_QOS = QoSProfile(
     depth=1,
     history=HistoryPolicy.KEEP_LAST,
@@ -196,7 +195,7 @@ class CheckpointControllerNode(Node):
         # refreshes every ~1.3 s in 0.4 m steps. Needs erc_localization's
         # localization_global.launch.py running.
         self.declare_parameter('gps_topic', '/erc/gps/filtered')
-        self.declare_parameter('model_cmd_vel_topic', '/omnivla/cmd_vel')
+        self.declare_parameter('model_cmd_vel_topic', '/erc/controller/cmd_vel')
         self.declare_parameter('cmd_vel_topic', '/cmd_vel')
         self.declare_parameter('goal_gps_topic', '/goal_gps')
         self.declare_parameter('goal_compass_topic', '/goal_compass')
@@ -274,7 +273,7 @@ class CheckpointControllerNode(Node):
         for name, default in local_recovery.DEFAULTS.items():
             self.declare_parameter(f'recovery.{name}', False if name in ('look', 'explore') else default)
         # the carrot's side-step says what it is doing here; recovery waits while it manoeuvres
-        self.declare_parameter('debug_topic', '/omnivla_debug')
+        self.declare_parameter('debug_topic', '/erc/controller/debug')
         # heading_node's source gyro_gps (heading = gyro + GPS, for units whose magnetometer does
         # not see the rover turn: mission_botswana) only knows the absolute heading once the
         # rover has driven a few metres. Until /erc/heading_anchored says true, a leg starts by

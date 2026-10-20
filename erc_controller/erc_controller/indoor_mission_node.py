@@ -92,7 +92,7 @@ class IndoorMissionNode(Node):
         # How the SDK validates a checkpoint indoors is not in the NYU PDF. True
         # asks it exactly as outdoors; false accepts the dead-reckoned arrival.
         self.declare_parameter('confirm_with_sdk', bool(confirm_with_sdk))
-        self.declare_parameter('model_cmd_vel_topic', '/omnivla/cmd_vel')
+        self.declare_parameter('model_cmd_vel_topic', '/erc/controller/cmd_vel')
         self.declare_parameter('cmd_vel_topic', '/cmd_vel')
         self.declare_parameter('goal_gps_topic', '/goal_gps')
         self.declare_parameter('goal_compass_topic', '/goal_compass')

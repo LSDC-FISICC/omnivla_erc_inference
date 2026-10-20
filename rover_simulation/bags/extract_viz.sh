@@ -8,7 +8,7 @@ set -e
 IN=$1; OUT=${2:-${IN%/}_viz}
 TOPICS="/erc/global_route, /erc/local_route, /erc/local_costmap, /erc/carrot, /erc/free_space_leg,
         /erc/free_space, /tf, /tf_static, /erc_static_map/costmap, /erc_static_map/planned_path,
-        /erc/odometry/global, /omnivla_debug, /erc/free_space_debug, /rosout,
+        /erc/odometry/global, /erc/controller/debug, /erc/free_space_debug, /rosout,
         /erc/perception/overlay/compressed, /erc/perception/depth/compressed,
         /local_costmap/costmap, /local_costmap/published_footprint, /trajectories,
         /optimal_trajectory, /transformed_global_plan, /nav2/cmd_vel, /cmd_vel, /erc/gps/filtered,

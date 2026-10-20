@@ -57,7 +57,7 @@ def run(job):
     r = cs.simulate(cs.SCENARIOS[scenario], params, model, seed=seed, node=node, node_defaults=d, record=True)
     pol = [tk for tk in r.trace['ticks'] if tk[2] == 'polar']
     b = [abs(math.degrees(tk[3])) for tk in pol]
-    # the field's 5.4/min counts sign changes of the COMMANDED omega in /omnivla_debug
+    # the field's 5.4/min counts sign changes of the COMMANDED omega in /erc/controller/debug
     w = np.array([tk[6] for tk in pol])
     sg = np.sign(w[np.abs(w) > 1e-3])
     minutes = (pol[-1][0] - pol[0][0]) / 60.0 if len(pol) > 1 else 1.0

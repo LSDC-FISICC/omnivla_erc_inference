@@ -2,14 +2,14 @@
 """Closed-loop simulation of a checkpoint mission on a rover model fitted to field bags.
 
 Runs the code the robot runs, not a copy of it:
-- motion_control.MotionController: the control law inside omnivla_edge_node, fed
+- motion_control.MotionController: the control law inside carrot_controller_node, fed
   with config/controller.yaml over motion_control.DEFAULT_PARAMS.
 - motion_control.CommandShaper: the acceleration limits checkpoint_controller_node
   applies to /cmd_vel, with that node's declared defaults.
 - checkpoint_controller_node's route geometry (route_to_local, project_forward,
   point_at) and its carrot, arrival and rate parameters.
 - motion_control.robot_frame_offset on UTM deltas: the goal bearing exactly as
-  omnivla_edge_node computes it.
+  carrot_controller_node computes it.
 
 What is modelled rather than run, and where each number comes from:
 - Rover (RoverModel): command delay, first-order lags and gains from Tarea B and
@@ -61,7 +61,7 @@ from erc_controller import local_recovery as lrec  # noqa: E402
 
 NODE_PATH = os.path.join(PACKAGE_ROOT, "erc_controller", "checkpoint_controller_node.py")
 CONFIG_PATH = os.path.join(PACKAGE_ROOT, "config", "controller.yaml")
-# omnivla_edge_node constants the simulation must match.
+# controller constants the simulation must match.
 GOAL_RESET_DISTANCE_M = 3.0
 THRES_DIST = 30.0
 
@@ -608,7 +608,7 @@ def simulate(scenario: Scenario, params: dict, model: RoverModel, seed: int, rec
                 break
             phase = "start_leg"
 
-        # ---- omnivla_edge_node tick ----
+        # ---- controller tick ----
         if t >= next_tick:
             next_tick += tick_period
             if not enabled or goal is None:

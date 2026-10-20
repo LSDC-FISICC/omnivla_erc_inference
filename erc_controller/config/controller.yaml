@@ -1,5 +1,5 @@
 # Motion controller (motion_control.MotionController) for carrot_controller_node: turns the
-# carrot and localization into /omnivla/cmd_vel. checkpoint_controller_node then applies
+# carrot and localization into /erc/controller/cmd_vel. checkpoint_controller_node then applies
 # acceleration limits (max_linear_accel & co., its own parameters) on the way to /cmd_vel.
 # Defaults live in erc_controller/motion_control.py (DEFAULT_PARAMS); every value can also be
 # changed while the rover drives, e.g.

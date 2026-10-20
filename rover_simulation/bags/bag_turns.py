@@ -20,7 +20,7 @@ for bag in sys.argv[1:]:
         if tp=='/erc/heading_deg': H.append((t,deserialize_message(data,get_message(types[tp])).data))
         elif tp=='/cmd_vel':
             m=deserialize_message(data,get_message(types[tp])); C.append((t,m.linear.x,m.angular.z))
-        elif tp=='/omnivla_debug':
+        elif tp=='/erc/controller/debug':
             s=deserialize_message(data,get_message(types[tp])).data
             m=re.search(r'\[side-step\] (turn (left|right)|settle turned)',s)
             if m: E.append((t,m.group(1)))

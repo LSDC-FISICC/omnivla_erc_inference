@@ -38,7 +38,7 @@ odd stop: no bag has tall grass seen from a distance yet. There is no automatic
 stuck in grass and Ctrl-C terminal 3.
 
 Needs ~/lsdc/erc-omni-vla/.venv-unidepth (UniDepthV2, weights cached: no internet needed).
-UniDepthV2 takes ~6 s to load after the first image: wait until /omnivla_debug stops
+UniDepthV2 takes ~6 s to load after the first image: wait until /erc/controller/debug stops
 saying "perception stale" and `ros2 topic hz /erc/free_space` shows ~3 Hz.
 """
 import os

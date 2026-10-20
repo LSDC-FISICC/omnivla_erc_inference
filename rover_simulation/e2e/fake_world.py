@@ -134,7 +134,7 @@ class Fake(Node):
         # body-frame velocity, as ekf_local publishes it: MPPI starts from it
         self.odom = self.create_publisher(Odometry, '/erc/odometry/local', 10)
         self.create_subscription(Twist, '/cmd_vel', self._cmd, 10)
-        self.create_subscription(String, '/omnivla_debug', self._dbg, 10)
+        self.create_subscription(String, '/erc/controller/debug', self._dbg, 10)
         self.create_subscription(Log, '/rosout', self._log, 50)
         self.create_subscription(Path, '/erc/local_route', self._route, LATCHED)
         self.create_timer(0.05, self._step)

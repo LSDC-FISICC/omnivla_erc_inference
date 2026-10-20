@@ -16,7 +16,7 @@ Layers:
     erc_localization  localization_global.launch.py
     nav2              controller_server (MPPI + local_costmap), lifecycle_manager
     erc_controller     nav2_route_follower_node: route -> FollowPath, profile ->
-                      costmap, MPPI's command -> /omnivla/cmd_vel
+                      costmap, MPPI's command -> /erc/controller/cmd_vel
 
 Arguments:
 

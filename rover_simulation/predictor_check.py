@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Does a fuller Smith predictor help the carrot (and so the two OmniVLA nodes,
-which steer through the same MotionController)?
+"""Does a fuller Smith predictor help the carrot (MotionController)?
 
 The controller already has one, reduced to yaw (motion_control.DelayCompensator):
 it subtracts gain x the yaw-rate commands of the last 1.3 s from the carrot

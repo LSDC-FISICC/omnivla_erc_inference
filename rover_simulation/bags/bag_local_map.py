@@ -31,7 +31,7 @@ while r.has_next():
         m=deserialize_message(data,get_message(types[tp])); SC.append((t,np.array(m.ranges),m.angle_min,m.angle_increment,m.range_max))
     elif tp=='/goal_gps':
         m=deserialize_message(data,get_message(types[tp])); GOAL.append((t,m.latitude,m.longitude))
-    elif tp=='/omnivla_debug':
+    elif tp=='/erc/controller/debug':
         s=deserialize_message(data,get_message(types[tp])).data
         if '[side-step] brake ahead' in s: B.append(t)
 G=np.array(G);H=np.array(H)

@@ -533,7 +533,7 @@
       "publish": {}
     },
     "RawMessages!local_dbg": {
-      "topicPath": "/omnivla_debug",
+      "topicPath": "/erc/controller/debug",
       "diffEnabled": false,
       "diffMethod": "custom",
       "diffTopicPath": "",
@@ -799,7 +799,7 @@
       "followingViewWidth": 30
     },
     "RawMessages!mppi_dbg": {
-      "topicPath": "/omnivla_debug",
+      "topicPath": "/erc/controller/debug",
       "diffEnabled": false,
       "diffMethod": "custom",
       "diffTopicPath": "",

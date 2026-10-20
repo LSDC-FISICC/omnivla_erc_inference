@@ -16,7 +16,7 @@ x/y placed as east/north around a fixed datum, and a compass heading of
 90 - yaw. Nothing indoors is geo-referenced; the lat/lon only carries the
 metric offset the nodes turn back into meters.
 
-The datum sits on a UTM central meridian (-75, zone 18). omnivla_edge_node takes
+The datum sits on a UTM central meridian (-75, zone 18). carrot_controller_node takes
 the UTM delta between the pseudo-fix and the goal as meters. On the central
 meridian the grid convergence is zero, so grid north equals the pseudo-north
 used here, and the grid scale is 0.9996: a 1.5 m carrot comes out 0.6 mm

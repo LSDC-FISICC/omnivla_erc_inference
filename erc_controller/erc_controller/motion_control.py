@@ -388,7 +388,7 @@ class SlewLimiter:
 # chunk sit at +0.3 s ... +2.4 s. This is NOT the controller tick period.
 WAYPOINT_DT = 0.3
 
-# Every parameter MotionController reads, with its default. omnivla_edge_node
+# Every parameter MotionController reads, with its default. carrot_controller_node
 # declares its ROS parameters from this table and config/controller.yaml
 # overrides it, so the node and test/controller_sim.py cannot drift apart.
 # Rationale for each value lives in config/controller.yaml.

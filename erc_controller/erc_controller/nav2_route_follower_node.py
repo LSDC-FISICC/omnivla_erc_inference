@@ -19,7 +19,7 @@ This node does four things:
   4. MPPI's COMMAND -> the rover. MPPI knows nothing of this rover's floor: below
      ~0.25 m/s commanded it does not move (mission_16sept), and in place it needs
      ~0.15 rad/s to break away. snap_command() puts MPPI's output onto what the
-     rover can do and publishes it on /omnivla/cmd_vel, which
+     rover can do and publishes it on /erc/controller/cmd_vel, which
      checkpoint_controller_node gates and ramps exactly as it does the carrot's.
 
   5. PREDICTED POSE. MPPI decides for the state it is given, and its command
@@ -247,8 +247,8 @@ class Nav2RouteFollower(Node):
         self.declare_parameter('scan_in_topic', '/erc/free_space_leg')
         self.declare_parameter('scan_out_topic', '/erc/free_space_nav2')
         self.declare_parameter('nav2_cmd_topic', '/nav2/cmd_vel')
-        self.declare_parameter('cmd_out_topic', '/omnivla/cmd_vel')
-        self.declare_parameter('debug_topic', '/omnivla_debug')
+        self.declare_parameter('cmd_out_topic', '/erc/controller/cmd_vel')
+        self.declare_parameter('debug_topic', '/erc/controller/debug')
         self.declare_parameter('follow_path_action', 'follow_path')
         self.declare_parameter('clear_costmap_service', '/local_costmap/clear_entirely_local_costmap')
         self.declare_parameter('controller_id', 'FollowPath')

@@ -16,7 +16,7 @@ def reader():
 r,types=reader(); t0=None; brakes=[]; scans=[]
 while r.has_next():
     tp,data,t=r.read_next(); t*=1e-9; t0=t0 or t
-    if tp=='/omnivla_debug':
+    if tp=='/erc/controller/debug':
         s=deserialize_message(data,get_message(types[tp])).data
         m=re.search(r'\[side-step\] brake ahead=([\d.]+)',s)
         if m: brakes.append((t,float(m.group(1))))
