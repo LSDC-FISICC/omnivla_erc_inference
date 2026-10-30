@@ -55,6 +55,10 @@ Arguments:
                                mission_checkpoints_node; read-only). Default local_mission_server's
                                http://localhost:8001/checkpoints-list; the competition SDK: :8000.
                                mission_markers:=false leaves it out.
+    visual_heading:=true|false  SHADOW heading with the camera's yaw rate filling the gyro's gaps
+                               (erc_perception visual_yaw_node -> /erc/visual_imu, and a second
+                               heading_node, gyro_gps, on it -> /erc/heading_visual*). Nothing drives
+                               on it; bag /erc/heading_visual_deg and /erc/visual_yaw to compare.
     heading_source:=gyro_gps   heading from gyro + GPS, no magnetometer (units whose
                                magnetometer does not see the rover turn: mission_botswana).
                                Declared by erc_localization's localization_global.launch.py;
@@ -86,6 +90,16 @@ obstacle_sidestep on: 1.5 m completed 63/64 with 0 collisions (2.5 m: 61/64).
 """
 
 import os
+import tempfile
+
+import yaml
+
+
+class _QuotedStrings(yaml.SafeDumper):
+    pass
+
+
+_QuotedStrings.add_representer(str, lambda d, v: d.represent_scalar('tag:yaml.org,2002:str', v, style='"'))
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -145,6 +159,8 @@ def generate_launch_description():
                               description='publish the mission checkpoints for the Foxglove map (read-only)'),
         DeclareLaunchArgument('mission_url', default_value='http://localhost:8001/checkpoints-list',
                               description='/checkpoints-list for those markers'),
+        DeclareLaunchArgument('visual_heading', default_value='false',
+                              description='shadow heading from the camera yaw rate (/erc/heading_visual*)'),
         DeclareLaunchArgument('drive_mode', default_value='polar',
                               description="carrot_controller_node: 'polar' or 'reactive' (reactive_drive.py)"),
     ]
@@ -213,6 +229,25 @@ def generate_launch_description():
                    name='mission_checkpoints_node', output='screen',
                    parameters=[{'checkpoints_url': LaunchConfiguration('mission_url')}],
                    condition=IfCondition(LaunchConfiguration('mission_markers')))
+    # Shadow heading: the camera's yaw rate as a continuous gyro, into a second heading_node (gyro_gps) with the
+    # operative one's configuration and every output renamed -- the mission keeps reading /erc/heading*.
+    visual_yaw = Node(package='erc_perception', executable='visual_yaw_node', name='visual_yaw_node',
+                      output='screen', condition=IfCondition(LaunchConfiguration('visual_heading')))
+    heading_yaml = os.path.join(get_package_share_directory('erc_localization'), 'config', 'heading.yaml')
+    with open(heading_yaml) as f:
+        heading_params = dict(yaml.safe_load(f)['heading_node']['ros__parameters'])
+    heading_params.update(source='gyro_gps', imu_topic='/erc/visual_imu',
+                          heading_imu_topic='/erc/heading_visual', heading_deg_topic='/erc/heading_visual_deg',
+                          debug_topic='/erc/heading_visual_debug', anchored_topic='/erc/heading_visual_anchored',
+                          gyro_gps_debug_topic='/erc/heading_visual_gyro_gps')
+    # through a file with every string quoted: dumped bare, imu_axis_map's "y" reads as a boolean to ROS (YAML 1.1)
+    # and the node does not start ("Sequence should be of same type")
+    heading_file = os.path.join(tempfile.gettempdir(), 'heading_node_visual.yaml')
+    with open(heading_file, 'w') as f:
+        yaml.dump({'heading_node_visual': {'ros__parameters': heading_params}}, f, Dumper=_QuotedStrings)
+    heading_visual = Node(package='erc_localization', executable='heading_node.py', name='heading_node_visual',
+                          output='screen', parameters=[heading_file],
+                          condition=IfCondition(LaunchConfiguration('visual_heading')))
     localization = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(get_package_share_directory('erc_localization'), 'launch',
@@ -230,6 +265,8 @@ def generate_launch_description():
             people,
             foxglove,
             markers,
+            visual_yaw,
+            heading_visual,
             TimerAction(period=LOCALIZATION_DELAY_S, actions=[localization]),
             reminder,
         ])
