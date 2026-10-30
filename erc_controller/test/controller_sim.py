@@ -323,6 +323,9 @@ class Scenario:
     # steps or parked bicycles. Empty means the clear-path world every scenario
     # assumed before obstacle avoidance existed.
     obstacles: list = field(default_factory=list)
+    # time allowed (s); None: 4x the straight route at max speed + 60 s, which assumes the route is close to
+    # the way -- not so when the way round is unknown and 3x longer (the walkway scenarios)
+    time_limit_s: float = None
 
 
 def mission_16sept_legs():
@@ -365,6 +368,24 @@ SCENARIOS = {
     # Stairs or a long wall across the route, passable only past one end.
     "wall": Scenario("wall", (0.0, 0.0, 0.0), [[(20.0, 0.0)]],
                      [obs.Segment((9.0, -6.0), (9.0, 2.0))]),
+    # --- unknown routes (Galileo plaza, 29-oct): OSM shows open ground, the way is a walkway ---------------
+    # A 2 m brick walkway, closed behind the rover, open only at its far end (12 m north); the checkpoint
+    # is east, behind the right-hand wall: the straight line goes through it.
+    "walkway": Scenario("walkway", (0.0, 0.0, math.radians(90.0)), [[(8.0, 0.0)]],
+                        [obs.Segment((-1.0, -2.0), (-1.0, 16.0)), obs.Segment((1.0, -2.0), (1.0, 10.0)),
+                         obs.Segment((-1.0, -2.0), (1.0, -2.0))], time_limit_s=420.0),
+    # ... then to the other side of the walkway: the second leg must not try the walls seen on the first.
+    "walkway_back": Scenario("walkway_back", (0.0, 0.0, math.radians(90.0)), [[(8.0, 0.0)], [(-8.0, 0.0)]],
+                             [obs.Segment((-1.0, -2.0), (-1.0, 16.0)), obs.Segment((1.0, -2.0), (1.0, 10.0)),
+                              obs.Segment((-1.0, -2.0), (1.0, -2.0))], time_limit_s=800.0),
+    # A long wall (18 m) across the line to the checkpoint, the way round only past its far end.
+    "wall_long": Scenario("wall_long", (0.0, 0.0, 0.0), [[(16.0, 0.0)]],
+                          [obs.Segment((8.0, -14.0), (8.0, 4.0))], time_limit_s=420.0),
+    # Two walkways: a dead end on the near side, the way through on the far side.
+    "dead_end": Scenario("dead_end", (0.0, 0.0, 0.0), [[(14.0, 0.0)]],
+                         [obs.Segment((6.0, -3.0), (6.0, 8.0)), obs.Segment((6.0, 8.0), (3.0, 8.0)),
+                          obs.Segment((6.0, -3.0), (3.0, -3.0)), obs.Segment((10.0, -12.0), (10.0, -3.0)),
+                          obs.Segment((10.0, 3.0), (10.0, 14.0))], time_limit_s=420.0),
 }
 
 
@@ -469,7 +490,7 @@ def simulate(scenario: Scenario, params: dict, model: RoverModel, seed: int, rec
 
     route_len = sum(float(np.hypot(*np.diff(np.array([scenario.start[:2]] + leg), axis=0).T).sum())
                     for leg in scenario.legs)
-    t_limit = 4.0 * route_len / params["max_linear_vel"] + 60.0
+    t_limit = scenario.time_limit_s or 4.0 * route_len / params["max_linear_vel"] + 60.0
 
     tick_period = 1.0 / params["tick_rate"]
     inference_latency = 0.17
@@ -530,7 +551,13 @@ def simulate(scenario: Scenario, params: dict, model: RoverModel, seed: int, rec
             route_segments = [(np.array(a), np.array(b)) for a, b in zip(points, points[1:])]
             s_proj, started, last_carrot = 0.0, False, -math.inf
             leg_started = t
-            planner = lp.LocalReplanner(pts, **local) if local is not None else None
+            if local is not None and local.get('keep_map') and planner is not None:
+                # the last leg's map comes along: where this leg's origin is in the last frame
+                off = node.latlon_to_local(prev_frame, frame[0], frame[1])
+                planner = lp.LocalReplanner(pts, previous=planner, offset=off, **local)
+            else:
+                planner = lp.LocalReplanner(pts, **local) if local is not None else None
+            prev_frame = frame
             phase = "follow"
         if phase == "follow":
             east, north = node.latlon_to_local(frame, est_lat, est_lon)

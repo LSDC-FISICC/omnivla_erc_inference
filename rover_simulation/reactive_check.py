@@ -11,6 +11,8 @@ Configurations (what the launch would run):
     reactive       ReactiveDrive on the carrot's bearing, no local map
     reactive+lp    + local_replan + recovery.explore (the A* detour gives the carrot)
     reactive+lp-corr  the same with the corridor rule (local.unseen_extend_m 0.1)
+    reactive+goal  reactive drive, A* to the checkpoint over a map kept for the whole mission (goal_mode,
+                   keep_map), corridor rule, recovery.explore: for routes nobody knows beforehand
     reactive-c4    reactive alone with the carrot 4 m ahead (instead of replanning, aim further
                    along the route)
 The reactive drive is the robot's own code (erc_controller/reactive_drive.py) through the same
@@ -30,11 +32,16 @@ from common import cs, obs  # noqa: E402
 from erc_controller.reactive_drive import ReactiveDrive  # noqa: E402
 
 SCENARIOS = 'hedge,planter,wall,kerb,chicane,post,straight,zigzag,mission_16sept'
+UNKNOWN = 'walkway,walkway_back,wall_long,dead_end'
+PROXIMITY = 4.0             # checkpoint_proximity_m as in the field (the node's default 8 m reaches through walls)
 # recommended 28-sept: rejoin with A*'s own unseen rule, explore when there is no path
 LP = dict(rejoin_respects_unseen=True, unseen_extend_m=2.5)
 # corridor rule (loop_patrol.LOCAL_INDOOR): in a 2 m walkway every unseen cell is near a wall; with 2.5 m all of
 # them are lethal and A* answers "no path" (Galileo plaza, 29-oct)
 LP_CORRIDOR = dict(rejoin_respects_unseen=True, unseen_extend_m=0.1)
+# unknown routes: plan to the checkpoint over a map kept for the whole mission (local_planner goal_mode)
+LP_GOAL = dict(rejoin_respects_unseen=True, unseen_extend_m=0.1, goal_mode=True, keep_map=True)
+LP_GOAL_U5 = dict(LP_GOAL, unseen_weight=5.0)     # seen-free ground preferred more strongly over unseen
 REC = dict(explore=True, look=False)
 
 PLANTS = {
@@ -51,8 +58,14 @@ class ReactiveOverride:
     drives = True
 
     def __init__(self, **kw):
+        self.kw = kw
         self.d = ReactiveDrive(**kw)
-        self.state = 'reactive'
+        # 'follow': never mid-manoeuvre, as carrot_controller_node reports it in reactive mode (no side-step):
+        # the blocked-route recovery may take the rover
+        self.state = 'follow'
+
+    def reset(self):
+        self.d = ReactiveDrive(**self.kw)
 
     def step(self, t, yaw, cur, bearings, free, v, w, bearing):
         caps = obs._range_cap(np.asarray(bearings, float))
@@ -74,14 +87,17 @@ def run(job):
     config, plant, scenario, seed = job
     model = cs.RoverModel(**PLANTS[plant])
     if config == 'polar':
-        res, _ = common.run(scenario, seed, 'lp+ss', 1.5, lp=LP, model=model, recovery=REC, record=True)
+        res, _ = common.run(scenario, seed, 'lp+ss', 1.5, lp=LP, model=model, recovery=REC, record=True,
+                            proximity_m=PROXIMITY)
     else:
         override = ReactiveOverride()
-        lp = LP_CORRIDOR if config.endswith('-corr') else LP
-        res, _ = common.run(scenario, seed, 'lp' if 'lp' in config else 'carrot',
+        lp = LP_GOAL_U5 if config.endswith('+goal-u5') else LP_GOAL if config.endswith('+goal') else LP_CORRIDOR if config.endswith('-corr') else LP
+        uses_lp = 'lp' in config or '+goal' in config
+        res, _ = common.run(scenario, seed, 'lp' if uses_lp else 'carrot',
                             4.0 if config.endswith('c4') else 1.5,
                             lp=lp, model=model, override=override,
-                            recovery=REC if 'lp' in config else None, record=True)
+                            recovery=REC if uses_lp else None, record=True,
+                            proximity_m=PROXIMITY)
     res.moving, res.stops_min = smoothness(res)
     res.trace = None                                  # not picklable back through the pool, not needed
     return config, plant, scenario, seed, res

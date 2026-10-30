@@ -75,6 +75,23 @@ DEFAULTS = dict(
                               # put it inside a planter whose back was not yet seen
     window_margin_m=8.0,      # A* window around rover + target
     ignore_within_m=0.6,      # a block nearer than this is the reflex's business
+    # Goal mode (unknown routes, 29-oct): instead of rejoining OSM's route past a blockage, plan from the rover
+    # to the leg's END (the checkpoint) over the whole map every goal_replan_s, unseen ground passable at the
+    # unseen_weight cost (the free-space assumption: the plan slides along the walls seen so far, and tries
+    # the other side when one closes). The new path replaces the route when the route ahead is blocked or the
+    # path is shorter than what is left of the route by more than goal_switch_m. With keep_map the next leg's
+    # map takes this one's evidence along (LocalReplanner(previous=...)): walls seen stay known.
+    goal_mode=False,
+    goal_replan_s=1.0,
+    goal_switch_m=1.5,
+    keep_map=False,
+    # no progress (goal mode): moved less than stuck_dist_m in stuck_window_s -> what is straight ahead is marked
+    # blocked (stuck_mark_m deep, the rover's width) and the plan redone. Behind a wall the map can hold
+    # free cells that are not (a ray past the wall's end, a heading error), and A* keeps aiming through them
+    # while the rover, pushed against the wall, sees nothing new (controller_sim walkway / dead_end, 29-oct).
+    stuck_window_s=12.0,
+    stuck_dist_m=0.4,
+    stuck_mark_m=0.8,
     rejoin_respects_unseen=False,  # choose the rejoin point with A*'s own rule: unseen ground
                               # within inflate_m + unseen_extend_m of a seen wall is not a
                               # rejoin point either. Without it the target landed inside the
@@ -244,7 +261,7 @@ class LocalCostmap:
         """
         p = self.p
         res = p['resolution_m']
-        wm = p['window_margin_m']
+        wm = 1e6 if p.get('goal_mode') else p['window_margin_m']      # goal mode: the whole map
         x0, x1 = min(start[0], goal[0]) - wm, max(start[0], goal[0]) + wm
         y0, y1 = min(start[1], goal[1]) - wm, max(start[1], goal[1]) + wm
         (r0, r1), (c0, c1) = self.cell([x0, x1], [y0, y1])
@@ -310,6 +327,19 @@ class LocalCostmap:
         path[0], path[-1] = tuple(start), tuple(goal)
         return self._shortcut(path)
 
+    def absorb(self, old, dx, dy):
+        """Copy the evidence of `old` (another map; a point (x, y) here is (x + dx, y + dy) there) into the
+        cells both cover: the next leg keeps what this one saw."""
+        rr, cc = np.mgrid[0:self.h, 0:self.w]
+        xs, ys = self.centre(rr, cc)
+        orow, ocol = old.cell(xs + dx, ys + dy)
+        ok = old._inside(orow, ocol)
+        self.L[ok] = old.L[orow[ok], ocol[ok]]
+        self.seen[ok] = old.seen[orow[ok], ocol[ok]]
+        self.travel[ok] = old.travel[orow[ok], ocol[ok]]
+        self.odometer = old.odometer
+        self._dist = None
+
     def _clear_segment(self, a, b, need):
         n = max(2, int(math.ceil(math.dist(a, b) / (0.4 * self.p['resolution_m']))))
         t = np.linspace(0.0, 1.0, n)
@@ -358,13 +388,26 @@ def route_points(pts, cum, s0, s1, step):
 class LocalReplanner:
     """The policy around LocalCostmap: when to integrate, when and where to replan."""
 
-    def __init__(self, pts, **kw):
+    def __init__(self, pts, previous=None, offset=(0.0, 0.0), **kw):
+        """previous: the last leg's LocalReplanner, whose map is carried over (keep_map); offset: where this
+        leg's origin is in previous's frame (east, north m)."""
         self.p = dict(DEFAULTS)
         self.p.update(kw)
         pts = np.asarray(pts, float)
-        self.map = LocalCostmap(pts[:, 0].min(), pts[:, 1].min(),
-                                pts[:, 0].max(), pts[:, 1].max(), **self.p)
+        x0, y0, x1, y1 = pts[:, 0].min(), pts[:, 1].min(), pts[:, 0].max(), pts[:, 1].max()
+        if previous is not None:
+            # cover what the last map covered too, so nothing seen is cut off
+            om = previous.map
+            dx, dy = offset
+            x0, y0 = min(x0, om.ox - dx + om.p['margin_m']), min(y0, om.oy - dy + om.p['margin_m'])
+            x1 = max(x1, om.ox - dx + om.w * om.p['resolution_m'] - om.p['margin_m'])
+            y1 = max(y1, om.oy - dy + om.h * om.p['resolution_m'] - om.p['margin_m'])
+        self.map = LocalCostmap(x0, y0, x1, y1, **self.p)
+        if previous is not None:
+            self.map.absorb(previous.map, *offset)
         self._yaws = []            # (t, yaw) for the turn-rate gate
+        self._progress = []        # (t, x, y) for the no-progress check (goal mode)
+        self.stuck_marks = 0
         self._last_check = -math.inf
         self._last_plan = -math.inf
         self.replans = 0
@@ -387,6 +430,8 @@ class LocalReplanner:
     def check(self, t, x, y, pts, cum, s_proj, extra_lethal=None):
         """-> (new_pts or None, note). new_pts starts at (x, y); arc length restarts at 0."""
         p = self.p
+        if p['goal_mode']:
+            return self._check_goal(t, x, y, pts, cum, s_proj, extra_lethal)
         if t - self._last_check < p['check_period_s']:
             return None, ''
         self._last_check = t
@@ -430,3 +475,55 @@ class LocalReplanner:
         return new, (f'[local-plan] blocked {s[first] - s_proj:.1f} m ahead; rejoin route '
                      f'{s_t - s_proj:.1f} m ahead via {len(path)} points '
                      f'({sum(math.dist(a, b) for a, b in zip(path, path[1:])):.1f} m)')
+
+    def mark_ahead(self, x, y, yaw, depth):
+        """Mark the ground straight ahead of the rover as an obstacle (it cannot go there)."""
+        m = self.map
+        for along in np.arange(0.3, depth + 1e-6, m.p['resolution_m']):
+            for side in (-0.3, -0.15, 0.0, 0.15, 0.3):
+                row, col = (int(v) for v in m.cell(x + along * math.cos(yaw) - side * math.sin(yaw),
+                                                   y + along * math.sin(yaw) + side * math.cos(yaw)))
+                if 0 <= row < m.h and 0 <= col < m.w:
+                    m.L[row, col] = m.p['max_logodds']
+                    m.seen[row, col] = True
+        m._dist = None
+
+    def _check_goal(self, t, x, y, pts, cum, s_proj, extra_lethal=None):
+        """Goal mode: A* to the leg's end over the whole map. -> (new_pts or None, note)."""
+        p = self.p
+        self._progress = [q for q in self._progress if t - q[0] <= p['stuck_window_s']] + [(t, x, y)]
+        stuck = ''
+        if self._progress[-1][0] - self._progress[0][0] >= 0.9 * p['stuck_window_s'] and self._yaws and \
+                max(math.hypot(qx - x, qy - y) for _t, qx, qy in self._progress) < p['stuck_dist_m']:
+            self.mark_ahead(x, y, self._yaws[-1][1], p['stuck_mark_m'])
+            self.stuck_marks += 1
+            self._progress = [(t, x, y)]
+            self._last_plan = -math.inf
+            stuck = f'no progress for {p["stuck_window_s"]:.0f} s, ahead marked blocked; '
+        if t - self._last_plan < p['goal_replan_s']:
+            return None, ''
+        self._last_plan = t
+        pts = np.asarray(pts, float)
+        goal = tuple(pts[-1])
+        ahead, s = route_points(pts, cum, s_proj, s_proj + p['check_ahead_m'], 0.1)
+        blocked = self.map.clearance_at(ahead[:, 0], ahead[:, 1]) <= p['inflate_m']
+        if blocked.any() and math.hypot(ahead[int(np.argmax(blocked)), 0] - x,
+                                        ahead[int(np.argmax(blocked)), 1] - y) < p['ignore_within_m']:
+            blocked[:] = False                    # the reflex's business
+        path = self.map.plan((x, y), goal, extra_lethal)
+        if path is None:
+            if blocked.any() or stuck:
+                return None, f'[local-plan] blocked; {stuck}no path to the checkpoint over the map'
+            return None, ''
+        new = np.asarray(path, float)
+        length = float(np.hypot(*np.diff(new, axis=0).T).sum()) if len(new) > 1 else 0.0
+        left = float(cum[-1]) - s_proj
+        if not blocked.any() and not stuck and length > left - p['goal_switch_m']:
+            return None, ''
+        keep = np.concatenate([[True], np.hypot(*np.diff(new, axis=0).T) > 1e-3])
+        new = new[keep]
+        if len(new) < 2:
+            return None, ''
+        self.replans += 1
+        why = stuck + ('route blocked' if blocked.any() else f'{left - length:.1f} m shorter')
+        return new, f'[local-plan] goal: {why}; {len(new)} points, {length:.1f} m to the checkpoint'

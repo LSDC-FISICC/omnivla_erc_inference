@@ -55,6 +55,10 @@ WORLDS = {
     'sidewalk_2_bench': ([obs.Segment((-2, 1.0), (28, 1.0)), obs.Segment((-2, -1.0), (28, -1.0)),
                           obs.Segment((10, 0.2), (11.5, 0.2)), obs.Segment((11.5, 0.2), (11.5, 1.0)),
                           obs.Segment((10, 0.2), (10, 1.0))], (28.0, 0.0)),
+    # Galileo plaza (29-oct): a 2 m walkway closed behind the rover, open only 12 m north; the checkpoint
+    # is east, behind the right-hand wall. Start with START_YAW_DEG=90 (facing up the walkway).
+    'walkway': ([obs.Segment((-1.0, -2.0), (-1.0, 16.0)), obs.Segment((1.0, -2.0), (1.0, 10.0)),
+                 obs.Segment((-1.0, -2.0), (1.0, -2.0))], (8.0, 0.0)),
 }
 STATE = {'done': False}
 

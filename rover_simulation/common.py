@@ -26,7 +26,7 @@ CONFIGS = ('carrot', 'ss', 'lp', 'lp+ss')
 
 
 def run(scenario, seed, config='lp+ss', carrot_m=1.5, ss=None, lp=None, model=None,
-        record=False, override=None, recovery=None):
+        record=False, override=None, recovery=None, proximity_m=None):
     """One mission. ss / lp: parameter overrides for SideStep / LocalReplanner.
 
     Returns (Result, SideStep or None). Result.trace['planner'] is the last leg's
@@ -35,6 +35,8 @@ def run(scenario, seed, config='lp+ss', carrot_m=1.5, ss=None, lp=None, model=No
     node = cs.load_checkpoint_node()
     defaults = dict(cs.checkpoint_node_defaults())
     defaults['carrot_distance_m'] = carrot_m
+    if proximity_m is not None:
+        defaults['checkpoint_proximity_m'] = proximity_m
     params = cs.controller_params({'polar.steering_source': 'carrot'})
     sidestep = override if override is not None else (SideStep(**(ss or {})) if 'ss' in config else None)
     local = dict(lp or {}) if 'lp' in config else None

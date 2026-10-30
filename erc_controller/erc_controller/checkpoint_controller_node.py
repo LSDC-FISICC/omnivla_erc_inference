@@ -868,8 +868,16 @@ class CheckpointControllerNode(Node):
         goal_e, goal_n = latlon_to_local(frame, checkpoint.latitude, checkpoint.longitude)
         replanner = None
         if self._param('local_replan'):
-            replanner = local_planner.LocalReplanner(
-                pts, **{n: self._param(f'local.{n}') for n in local_planner.DEFAULTS})
+            lp_params = {n: self._param(f'local.{n}') for n in local_planner.DEFAULTS}
+            prev = getattr(self, '_mission_map', None)
+            if lp_params['keep_map'] and prev is not None:
+                # the last leg's map comes along (walls seen stay known): this leg's origin in the last frame
+                old_replanner, old_frame = prev
+                offset = latlon_to_local(old_frame, frame[0], frame[1])
+                replanner = local_planner.LocalReplanner(pts, previous=old_replanner, offset=offset, **lp_params)
+            else:
+                replanner = local_planner.LocalReplanner(pts, **lp_params)
+            self._mission_map = (replanner, frame)
             extra_lethal = self._static_lethal(frame)
             with self._lock:
                 self._scans.clear()
@@ -906,6 +914,7 @@ class CheckpointControllerNode(Node):
                             # everything in it was placed with the heading before the jump
                             replanner = local_planner.LocalReplanner(
                                 pts, **{n: self._param(f'local.{n}') for n in local_planner.DEFAULTS})
+                            self._mission_map = (replanner, frame)
                             self._scans.clear()
                             self.get_logger().warn('Heading (re-)anchored mid-leg: local map cleared.')
                     if self._current_lat is not None and self._current_lon is not None:
@@ -1188,6 +1197,7 @@ class CheckpointControllerNode(Node):
         try:
             checkpoints, latest_scanned = self._fetch_checkpoints()
             start_sequence = latest_scanned + 1 if goal_handle.request.resume_from_latest_scanned else 1
+            self._mission_map = None            # local.keep_map: a new mission starts with an empty map
             checkpoint_index = next(
                 (index for index, item in enumerate(checkpoints) if item.sequence >= start_sequence),
                 len(checkpoints),
