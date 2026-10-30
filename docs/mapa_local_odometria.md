@@ -71,7 +71,14 @@ En `checkpoint_controller_node`:
 
 ## Uso en campo
 
-T5, con `-p local_map_pose:=odom` agregado:
+Comandos vigentes al cierre del 30-oct (`4b23b54`). T3 con detección de bordes:
+
+```bash
+ros2 launch erc_controller mission_carrot_unidepth.launch.py drive_mode:=reactive heading_source:=gyro_gps \
+  foxglove:=true drop_detection:=true
+```
+
+T5:
 
 ```bash
 source /opt/ros/jazzy/setup.bash && source ~/lsdc_ws/install/setup.bash
@@ -81,8 +88,12 @@ ros2 run erc_controller checkpoint_controller_node --ros-args \
   -p checkpoint_proximity_m:=4.0 -p carrot_distance_m:=1.5 \
   -p local_replan:=true -p local.goal_mode:=true -p local.keep_map:=true \
   -p local.rejoin_respects_unseen:=true -p local.unseen_extend_m:=0.1 \
-  -p recovery.explore:=true -p local_map_pose:=odom
+  -p recovery.explore:=true -p local_map_pose:=odom \
+  -p recovery.turnback_look:=true -p local.trail_m:=0.15 -p backoff:=true
 ```
+
+Holgura (`local.inflate_m`): 0.45, la de siempre. 0.30 sola empeora en el simulador; con 0.45 la salida de ~1 m de
+la plaza del puente queda cerrada. Valor intermedio (0.40) por probar en campo.
 
 Al empezar el tramo, el log dice
 `... rover pose from odometry (GPS - odometry so far: x, y m)`. Esos dos números son la corrección acumulada: si
@@ -99,9 +110,10 @@ En gris, lo no visto; en negro, lo ocupado; en celeste, el recorrido según el m
 
 ## Lo que no resuelve (abierto)
 
-- **Una corrida del simulador falla en modo odometría** con GPS bueno: `walkway`, semilla 1 (la misma en todas las
-  tandas). El robot queda arrinconado al fondo cerrado del pasillo, y la recuperación gira hacia la esquina una y otra
-  vez. Parece un punto débil del modo meta en callejones sin salida más que de la pose, pero no está demostrado.
+- ~~Una corrida del simulador falla en modo odometría con GPS bueno (`walkway`, semilla 1: arrinconado al fondo
+  cerrado del pasillo).~~ Resuelto con `recovery.turnback_look` (30/30, ver la última sección).
+- **E → F (zona alta):** el carrot reactivo esquiva cuando la ruta pide una dirección fuera de su perfil (±60°). El
+  rastro mantiene el camino de vuelta en el mapa, pero no cambia esa decisión del carrot.
 - **Cercanía a obstáculos:** en ambos modos, el 46–62 % del recorrido queda a menos de `inflate_m` (0.45 m) de algo
   ocupado según el propio mapa. O el perfil de UniDepth ve los muros más cerca de lo que están, o 0.45 m es mucho para
   un pasillo de 2 m. No se ha medido contra cinta.
@@ -154,8 +166,8 @@ cd ../../erc_controller && python3 -m pytest -q test/test_odom_pose.py
 | Cambio | Parámetro | Por defecto | Simulador (rutas desconocidas, GPS bueno, 30 corridas) |
 |---|---|---|---|
 | Aviso `Checkpoint N CONFIRMED by the SDK (k/n)` en el log | — | siempre | — |
-| Mirar hacia el checkpoint antes de un desvío largo: si la ruta nueva mide ≥ 1.5× la recta y ≥ 5 m más, y el checkpoint está a > 30° del rumbo, frena, gira hacia él, espera y replanifica (`local_recovery.BlockedRecovery.detour_look`) | `recovery.detour_look` | `false` | 29/30 → **30/30** (resuelve el arrinconamiento de `walkway` semilla 1); 143 → 177 s |
-| Retroceder ~0.45 m si hay algo a < 0.35 m al frente durante 4 s sin avanzar (`local_recovery.BackOff`) | `backoff` | `false` | 29/30 → 28/30: en la esquina sin salida retrocede y el carrot lo devuelve, 14 veces. **No recomendado aún.** |
+| Mirar hacia el checkpoint antes de un desvío largo: si la ruta nueva mide ≥ 1.5× la recta y ≥ 5 m más, y el checkpoint está a > 30° del rumbo, frena, gira hacia él, espera y replanifica (`local_recovery.BlockedRecovery.detour_look`) | `recovery.detour_look` | `false` | 29/30 → 30/30, pero con GPS errante 30/30 → 28/30. **No recomendado**; lo reemplaza `turnback_look` (última sección) |
+| Retroceder ~0.45 m si hay algo a < 0.35 m al frente durante 4 s sin avanzar (`local_recovery.BackOff`) | `backoff` | `false` | 29/30 → 28/30: en la esquina sin salida retrocede y el carrot lo devuelve, 14 veces. Corregido en la última sección (`front_share`, `tries`) |
 | La capa OSM tal como la usa A* (desplazada por la corrección), en `leg_local` | `/erc/local_static_costmap` | siempre que haya OSM | — |
 | Imágenes de `free_space_node` en la misión outdoor: piso verde y obstáculos rojos, y la profundidad | `debug_images` (launch) | `true` | — |
 
@@ -207,8 +219,11 @@ toma el camino directo que encuentra. Que la cámara vea despejada la abertura j
 |---|---|
 | Odometría + `heading_node` (lo de hoy) | 10.7 / **0.2** / **1.1** % |
 | GPS + `heading_node` (antes) | 8.5 / 6.6 / 5.1 % |
-| EKF B0 / C ZOH / C FOH | 37.1–26.3 / 0.5–1.6 / 2.4–8.2 % |
-| H∞ C ZOH / C FOH | 23.0 / **2.7** · 6.0 / 2.5 · 11.3 / 9.7 % |
+| EKF B0 ZOH | 37.1 / 1.6 / 8.2 % |
+| EKF C ZOH (= ZOH fino) | 37.1 / 0.5 / 2.4 % |
+| EKF C FOH | 26.3 / 0.9 / 7.2 % |
+| H∞ C ZOH | 23.0 / 6.0 / 11.3 % |
+| H∞ C FOH | **2.7** / 2.5 / 9.7 % |
 | Odometría + rumbo solo de la cámara | 28.0 / 1.4 / 3.9 % |
 | Odometría + rumbo híbrido (giroscopio + cámara en huecos) | **5.6** / 0.2 / 1.7 % |
 
