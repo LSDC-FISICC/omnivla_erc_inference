@@ -45,7 +45,6 @@ radius. Two things measured on mission_10sept forced that:
 
 import json
 import math
-import os
 import threading
 import time
 from dataclasses import dataclass
@@ -159,18 +158,6 @@ def project_forward(pts, cum, east, north, s_min, window_m=PROJECTION_WINDOW_M):
         if d < best_d:
             best_d, best_s = d, cum[i] + t * math.sqrt(seg2)
     return max(s_min, best_s)
-
-
-def taught_leg(points, start_lat, start_lon):
-    """Route of a TAUGHT leg (teach_route.py) from where the rover is: the rover, then the taught
-    polyline from its point nearest to the rover on. -> (route [(lat, lon), ...], join distance m)."""
-    frame = (start_lat, start_lon, _METERS_PER_DEG_LAT * math.cos(math.radians(start_lat)), _METERS_PER_DEG_LAT)
-    d = [math.hypot(*latlon_to_local(frame, la, lo)) for la, lo in points]
-    i = int(np.argmin(d))
-    rest = [tuple(p) for p in points[i:]]
-    if d[i] < 0.3:
-        rest = rest[1:] or rest
-    return [(start_lat, start_lon)] + rest, float(d[i])
 
 
 def point_at(pts, cum, s):
@@ -294,10 +281,6 @@ class CheckpointControllerNode(Node):
         # active -- up to anchor_drive_max_m. Any other source says true at once: nothing changes.
         # 0 disables the drive.
         self.declare_parameter('heading_anchored_topic', '/erc/heading_anchored')
-        # Teach and repeat (teach_route.py): legs driven by hand replace OSM's A* route where the
-        # file has them; the local map and the drive still act on top. '' = A* for every leg.
-        self.declare_parameter('taught_route_file', '')
-        self.declare_parameter('taught_join_warn_m', 6.0)
         self.declare_parameter('anchor_drive_max_m', 10.0)
         self.declare_parameter('anchor_drive_timeout_s', 60.0)
         # Tilt stop (20-oct). Outdoors the rover must drive up and down slopes -- the organisers' tracks
@@ -660,22 +643,6 @@ class CheckpointControllerNode(Node):
         except Exception as e:
             self.get_logger().warn(f'Service call raised: {e}')
             return None
-
-    def _taught_legs(self):
-        """{sequence: [(lat, lon), ...]} from taught_route_file, read once per file name."""
-        path = str(self._param('taught_route_file') or '')
-        if getattr(self, '_taught_path', None) != path:
-            self._taught_path, self._taught = path, {}
-            if path:
-                import yaml
-                try:
-                    doc = yaml.safe_load(open(os.path.expanduser(path)))
-                    self._taught = {int(k): [tuple(p) for p in v] for k, v in (doc.get('legs') or {}).items() if v}
-                    self.get_logger().info(f'Taught route {path}: legs {sorted(self._taught)} '
-                                           f'(the others: A* on OSM).')
-                except (OSError, ValueError, AttributeError, yaml.YAMLError) as e:
-                    self.get_logger().error(f'taught_route_file {path} unreadable ({e}): A* for every leg.')
-        return self._taught
 
     def _generate_route(self, start_lat: float, start_lon: float,
                         target_lat: float, target_lon: float) -> List[Tuple[float, float]]:
@@ -1266,17 +1233,6 @@ class CheckpointControllerNode(Node):
                     start_lon = self._current_lon if self._current_lon is not None else checkpoint.longitude
 
                 route = self._generate_route(start_lat, start_lon, checkpoint.latitude, checkpoint.longitude)
-                taught = self._taught_legs().get(int(checkpoint.sequence))
-                if taught:
-                    # the OSM costmap _generate_route left behind still guards the local replans
-                    route, join = taught_leg(taught, start_lat, start_lon)
-                    msg = (f'Taught route for checkpoint {checkpoint.sequence}: {len(route)} points, '
-                           f'joined {join:.1f} m from the rover (A* route not used).')
-                    if join > float(self._param('taught_join_warn_m')):
-                        self.get_logger().warn(msg + ' The rover is far from the taught path: it joins it '
-                                               'in a straight line.')
-                    else:
-                        self.get_logger().info(msg)
                 self.get_logger().info(
                     f'Navigating to checkpoint sequence {checkpoint.sequence} '
                     f'({checkpoint.latitude:.8f}, {checkpoint.longitude:.8f}) along a {len(route)}-point '
