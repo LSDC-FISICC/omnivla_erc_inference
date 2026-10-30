@@ -1,0 +1,196 @@
+{
+ "configById": {
+  "map!gps": {
+   "center": null,
+   "customTileUrl": "",
+   "disabledTopics": [],
+   "followTopic": "/erc/gps/filtered",
+   "layer": "map",
+   "zoomLevel": 19,
+   "maxNativeZoom": 18,
+   "topicColors": {
+    "/erc/mission/checkpoints": "#ff3b30",
+    "/erc/mission/next_checkpoint": "#ffd60a",
+    "/erc/gps": "#0a84ff",
+    "/erc/gps/filtered": "#30d158",
+    "/goal_gps": "#ff9f0a"
+   }
+  },
+  "3D!local": {
+   "cameraState": {
+    "perspective": false,
+    "distance": 10,
+    "phi": 0,
+    "thetaOffset": 90,
+    "target": [
+     0,
+     0,
+     0
+    ],
+    "targetOffset": [
+     0,
+     0,
+     0
+    ],
+    "targetOrientation": [
+     0,
+     0,
+     0,
+     1
+    ],
+    "fovy": 45,
+    "near": 0.1,
+    "far": 5000
+   },
+   "followMode": "follow-position",
+   "followTf": "rover_leg",
+   "scene": {
+    "enableStats": false,
+    "transforms": {
+     "showLabel": true,
+     "axisScale": 0.5
+    }
+   },
+   "transforms": {},
+   "topics": {
+    "/erc/local_costmap": {
+     "visible": true,
+     "colorMode": "costmap",
+     "alpha": 0.8,
+     "frameLocked": false
+    },
+    "/erc/free_space_leg": {
+     "visible": true,
+     "pointSize": 6,
+     "pointShape": "circle",
+     "colorMode": "flat",
+     "flatColor": "#ff3b30",
+     "decayTime": 0
+    },
+    "/erc/local_route": {
+     "visible": true,
+     "lineWidth": 0.08,
+     "gradient": [
+      "#ff9f0a",
+      "#ffd60a"
+     ]
+    },
+    "/erc/carrot": {
+     "visible": true
+    }
+   },
+   "publish": {
+    "type": "point"
+   },
+   "imageMode": {},
+   "layers": {
+    "grid": {
+     "layerId": "foxglove.Grid",
+     "visible": true,
+     "frameId": "rover_leg",
+     "size": 30,
+     "divisions": 30,
+     "lineWidth": 1,
+     "color": "#24ff8e30",
+     "position": [
+      0,
+      0,
+      0
+     ],
+     "rotation": [
+      0,
+      0,
+      0
+     ],
+     "order": 1
+    }
+   }
+  },
+  "Image!cam": {
+   "imageMode": {
+    "imageTopic": "/erc/front_camera/compressed"
+   },
+   "cameraState": {},
+   "followMode": "follow-pose",
+   "scene": {},
+   "transforms": {},
+   "topics": {},
+   "layers": {},
+   "publish": {}
+  },
+  "RawMessages!dbg": {
+   "topicPath": "/erc/controller/debug",
+   "diffEnabled": false,
+   "diffMethod": "custom",
+   "diffTopicPath": "",
+   "showFullMessageForDiff": false,
+   "expansion": "all"
+  },
+  "Plot!cmd": {
+   "paths": [
+    {
+     "value": "/cmd_vel.linear.x",
+     "enabled": true,
+     "timestampMethod": "receiveTime",
+     "label": "v"
+    },
+    {
+     "value": "/cmd_vel.angular.z",
+     "enabled": true,
+     "timestampMethod": "receiveTime",
+     "label": "w"
+    }
+   ],
+   "showLegend": true,
+   "legendDisplay": "floating",
+   "showXAxisLabels": true,
+   "showYAxisLabels": true,
+   "isSynced": true,
+   "xAxisVal": "timestamp",
+   "followingViewWidth": 30
+  },
+  "RosOut!log": {
+   "searchTerms": [
+    "checkpoint",
+    "[local-plan]",
+    "[recover]",
+    "Heading",
+    "arrival"
+   ],
+   "minLogLevel": 1,
+   "nameFilter": {}
+  }
+ },
+ "globalVariables": {},
+ "userNodes": {},
+ "playbackConfig": {
+  "speed": 1
+ },
+ "drawerConfig": {
+  "tracks": []
+ },
+ "layout": {
+  "direction": "row",
+  "splitPercentage": 50,
+  "first": {
+   "direction": "column",
+   "splitPercentage": 62,
+   "first": "map!gps",
+   "second": "Image!cam"
+  },
+  "second": {
+   "direction": "column",
+   "splitPercentage": 55,
+   "first": "3D!local",
+   "second": {
+    "direction": "row",
+    "first": {
+     "direction": "column",
+     "first": "RawMessages!dbg",
+     "second": "Plot!cmd"
+    },
+    "second": "RosOut!log"
+   }
+  }
+ }
+}

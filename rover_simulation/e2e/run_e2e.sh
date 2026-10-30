@@ -4,6 +4,8 @@
 #   ./run_e2e.sh <world> <seconds> <local_replan true|false> [carrot_m]
 # CP_EXTRA: extra checkpoint_controller_node args, e.g. blocked-route recovery:
 #   CP_EXTRA="-p local.rejoin_respects_unseen:=true -p local.unseen_extend_m:=2.5 -p recovery.explore:=true"
+# CARROT_EXTRA: extra carrot_controller_node args, e.g. the reactive drive:
+#   CARROT_EXTRA="-p drive_mode:=reactive"
 # TAG: suffix for the output files.
 # HEADING_SRC=gyro_gps|fused: the fake world publishes raw gyro/wheels/GPS/magnetometer instead of
 #   the heading and Earth-rover-ros2-bridge's heading_node.py estimates it (see fake_world.py).
@@ -29,7 +31,7 @@ if [ "$HEADING_SRC" = gyro_gps ] || [ "$HEADING_SRC" = fused ]; then
 fi
 sleep 2
 python3 -m erc_controller.carrot_controller_node --ros-args --params-file "$SRC/config/controller.yaml" \
-  -p obstacle_sidestep:=true > "$OUT.carrot.log" 2>&1 & CN=$!
+  -p obstacle_sidestep:=true $CARROT_EXTRA > "$OUT.carrot.log" 2>&1 & CN=$!
 python3 -m erc_controller.checkpoint_controller_node --ros-args \
   -p checkpoint_list_url:=http://127.0.0.1:8765/checkpoints-list \
   -p checkpoint_reached_url:=http://127.0.0.1:8765/checkpoint-reached \

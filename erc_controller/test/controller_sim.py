@@ -631,8 +631,9 @@ def simulate(scenario: Scenario, params: dict, model: RoverModel, seed: int, rec
                 waypoint = chunk[4]
                 mode, v, w, _ = controller.command(t + inference_latency, params, bearing, radius,
                                                    chunk, 4, True)
-                if override is not None and world:
-                    # erc_controller.sidestep.SideStep: fed estimated heading and
+                if override is not None and (world or getattr(override, 'drives', False)):
+                    # erc_controller.sidestep.SideStep (or a whole drive, `drives`: it runs with no
+                    # obstacles too, e.g. reactive_drive): fed estimated heading and
                     # position, as the node would be; perception from the truth
                     ob, of, _oc = obs.profile(rover.x, rover.y, rover.theta, world, rng)
                     v, w, _note, resumed = override.step(t, etheta, (cur[0], cur[1]),

@@ -35,10 +35,26 @@ Arguments:
                                profile sees something close straight ahead.
                                Brakes, never steers -- see its docstring. Needs
                                perception:=true. Never run in the field yet.
+    drive_mode:=polar|reactive  carrot_controller_node's drive. reactive: steers on the
+                               free-space profile towards the carrot while it moves
+                               (reactive_drive.py; the team's own Mini+, which turns while
+                               driving); replaces obstacle_stop / obstacle_sidestep.
+                               Needs perception:=true; with checkpoint_controller_node
+                               local_replan:=true (a long obstacle across the route needs
+                               the A* detour: rover_simulation/reactive_check.py).
     obstacle_sidestep:=false|true  instead of stopping for good: brake, turn ~60
                                deg in place (route's side if open), advance 1.3 m,
                                back to the carrot. Replaces obstacle_stop.
                                Needs perception:=true. Never run in the field.
+    foxglove:=true|false       also start foxglove_bridge on 127.0.0.1:foxglove_port (8766): forward the
+                               port (ssh -L 8766:127.0.0.1:8766 ...) and open ws://localhost:8766 as
+                               "Foxglove WebSocket"; layout share/erc_controller/foxglove/gps_mission.json
+                               (map with the checkpoints, the fixes and the carrot; local map; camera).
+                               The raw camera images are not offered: /erc/front_camera/compressed.
+    mission_url:=<url>         /checkpoints-list the map's checkpoints are read from (erc_bridge
+                               mission_checkpoints_node; read-only). Default local_mission_server's
+                               http://localhost:8001/checkpoints-list; the competition SDK: :8000.
+                               mission_markers:=false leaves it out.
     heading_source:=gyro_gps   heading from gyro + GPS, no magnetometer (units whose
                                magnetometer does not see the rover turn: mission_botswana).
                                Declared by erc_localization's localization_global.launch.py;
@@ -122,6 +138,15 @@ def generate_launch_description():
                               description='must cover the 1.3 s loop delay; 0.8 m hit in simulation'),
         DeclareLaunchArgument('obstacle_sidestep', default_value='false',
                               description='side-step around obstacles (sidestep.py); never field-tested'),
+        DeclareLaunchArgument('foxglove', default_value='false',
+                              description='also start foxglove_bridge (127.0.0.1 only)'),
+        DeclareLaunchArgument('foxglove_port', default_value='8766'),
+        DeclareLaunchArgument('mission_markers', default_value='true',
+                              description='publish the mission checkpoints for the Foxglove map (read-only)'),
+        DeclareLaunchArgument('mission_url', default_value='http://localhost:8001/checkpoints-list',
+                              description='/checkpoints-list for those markers'),
+        DeclareLaunchArgument('drive_mode', default_value='polar',
+                              description="carrot_controller_node: 'polar' or 'reactive' (reactive_drive.py)"),
     ]
 
     bridge = [
@@ -154,6 +179,7 @@ def generate_launch_description():
             'obstacle_stop': ParameterValue(LaunchConfiguration('obstacle_stop'), value_type=bool),
             'stop_distance_m': ParameterValue(LaunchConfiguration('stop_distance_m'), value_type=float),
             'obstacle_sidestep': ParameterValue(LaunchConfiguration('obstacle_sidestep'), value_type=bool),
+            'drive_mode': LaunchConfiguration('drive_mode'),
         }])
 
     perception = IncludeLaunchDescription(
@@ -174,6 +200,19 @@ def generate_launch_description():
              '-p', ['conf:=', LaunchConfiguration('yolo_conf')], '-p', "classes:=['person']"],
         output='screen', condition=IfCondition(LaunchConfiguration('people')))
 
+    foxglove = ExecuteProcess(
+        cmd=['ros2', 'launch', 'foxglove_bridge', 'foxglove_bridge_launch.xml',
+             ['port:=', LaunchConfiguration('foxglove_port')], 'address:=127.0.0.1',
+             # every topic but the raw camera images (1.77 MB a frame: through an SSH tunnel Foxglove
+             # ran ~20 s behind, 2026-10-09); their JPEGs are /erc/{front,rear}_camera/compressed
+             "topic_whitelist:=['^(?!/erc/(front|rear)_camera$).*']"],
+        output='log', condition=IfCondition(LaunchConfiguration('foxglove')))
+    # the SDK's dashboard cannot show a local mission (its own list is empty, and :8001 does not
+    # proxy its websocket): the checkpoints go to ROS for the Foxglove map
+    markers = Node(package='erc_bridge', executable='mission_checkpoints_node',
+                   name='mission_checkpoints_node', output='screen',
+                   parameters=[{'checkpoints_url': LaunchConfiguration('mission_url')}],
+                   condition=IfCondition(LaunchConfiguration('mission_markers')))
     localization = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(get_package_share_directory('erc_localization'), 'launch',
@@ -189,6 +228,8 @@ def generate_launch_description():
             controller,
             perception,
             people,
+            foxglove,
+            markers,
             TimerAction(period=LOCALIZATION_DELAY_S, actions=[localization]),
             reminder,
         ])

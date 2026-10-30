@@ -18,7 +18,7 @@ setup(
                                                                'config/goal_images/nyu/cp3.jpg', 'config/goal_images/nyu/cp4.jpg',
                                                                'config/goal_images/nyu/start_finish.jpg']),
         ('share/' + package_name + '/rviz', ['rviz/local_planning.rviz']),
-        ('share/' + package_name + '/foxglove', ['foxglove/planning_tabs.json', 'foxglove/robot_live.json', 'foxglove/plants_search.json', 'foxglove/excitation.json']),
+        ('share/' + package_name + '/foxglove', ['foxglove/planning_tabs.json', 'foxglove/robot_live.json', 'foxglove/plants_search.json', 'foxglove/excitation.json', 'foxglove/gps_mission.json']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,

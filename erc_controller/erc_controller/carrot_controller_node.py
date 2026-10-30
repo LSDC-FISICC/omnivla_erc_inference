@@ -44,6 +44,18 @@ What it adds, OFF by default -- obstacle_sidestep (sidestep.py):
   1.5 m, 8 seeds x 8 scenarios: alone 1 collision and 57/64 completed; with
   local_replan 0 collisions and 63/64.
 
+What it adds, OFF by default -- drive_mode reactive (reactive_drive.py):
+  The team's own Mini+ turns while it drives (k_w ~1.1 moving, config/rover_dynamics.yaml),
+  so the polar law and the side-step's stop-turn-advance are not the only options. With
+  drive_mode reactive the carrot only says WHERE to go (its bearing); ReactiveDrive picks,
+  every tick, a heading among those the /erc/free_space profile shows room along, near that
+  bearing, and a speed from the room -- the drive of the indoor plant mission (explore_search,
+  14-16 oct). The route itself still comes from checkpoint_controller_node: with local_replan
+  its carrot follows the A* detour around what the local map has seen, so the reactive drive
+  handles what is in front of the camera and the replanner what blocks the route. It replaces
+  the polar law, obstacle_stop and obstacle_sidestep (both ignored, with a warning). No fresh
+  profile -> stop. Simulated (rover_simulation/reactive_check.py); never run outdoors.
+
 The carrot distance is a parameter of checkpoint_controller_node, which the
 mission launch leaves to be started by hand -- pass carrot_distance_m there.
 """
@@ -63,6 +75,8 @@ from sensor_msgs.msg import LaserScan, NavSatFix
 from std_msgs.msg import Bool, Float32, String
 
 from erc_controller import sidestep as ss
+from erc_controller.reactive_drive import DEFAULTS as REACTIVE_DEFAULTS
+from erc_controller.reactive_drive import ReactiveDrive
 from erc_controller.motion_control import (
     DEFAULT_PARAMS,
     MotionController,
@@ -141,6 +155,11 @@ class CarrotControllerNode(Node):
         for name, default in ss.DEFAULTS.items():
             if name not in SIDESTEP_SHARED:
                 self.declare_parameter(f'sidestep.{name}', default)
+        # 'polar' (the law above) or 'reactive' (reactive_drive.py, see the module docstring)
+        self.declare_parameter('drive_mode', 'polar')
+        self.declare_parameter('reactive.profile_max_age_s', 1.0)
+        for name, default in REACTIVE_DEFAULTS.items():
+            self.declare_parameter(f'reactive.{name}', default)
 
         # controller.yaml's /** block sets steering_source: plan for the model
         # nodes, and it reaches this node too. Override it -- loudly, so nobody
@@ -162,10 +181,16 @@ class CarrotControllerNode(Node):
         self.enable_inference = False
         self._scan = None
         self._scan_t = None
+        self._scan_hdg = None
         self._blocked_n = 0
         self._clear_n = 0
         self._stopped = False
         self.sidestep = ss.SideStep(**self._sidestep_params())
+        self.reactive = self.get_parameter('drive_mode').value == 'reactive'
+        if self.get_parameter('drive_mode').value not in ('polar', 'reactive'):
+            raise ValueError("drive_mode must be 'polar' or 'reactive'")
+        self.driver = ReactiveDrive(**self._reactive_params())
+        self._yaws = []                # (receive time, compass deg): the heading when a profile was taken
 
         self.cmd_pub = self.create_publisher(Twist, self.get_parameter('cmd_vel_topic').value, 10)
         self.dbg_pub = self.create_publisher(String, self.get_parameter('debug_topic').value, 10)
@@ -181,10 +206,18 @@ class CarrotControllerNode(Node):
 
         stop = self.get_parameter('obstacle_stop').value
         side = self.get_parameter('obstacle_sidestep').value
+        if self.reactive:
+            self.get_logger().warn(
+                'drive_mode reactive: ReactiveDrive steers on /erc/free_space towards the carrot; '
+                'no fresh profile -> stop. Never run outdoors.'
+                + (' obstacle_stop / obstacle_sidestep are IGNORED in this mode.' if stop or side else ''))
+            stop = side = False
         self.get_logger().info(
             f'Carrot controller ready (no model) | obstacle_stop={stop} obstacle_sidestep={side}'
             + (f" at {self.get_parameter('stop_distance_m').value:.2f} m" if stop or side else ''))
-        if side:
+        if self.reactive:
+            pass
+        elif side:
             self.get_logger().warn(
                 'obstacle_sidestep is ON (replaces obstacle_stop). It has never run in the '
                 'field: watch /erc/controller/debug for "[side-step]"; a give-up holds until '
@@ -199,6 +232,9 @@ class CarrotControllerNode(Node):
         p = {n: self.get_parameter(n).value for n in DEFAULT_PARAMS}
         p.update(overrides or {})
         return p
+
+    def _reactive_params(self):
+        return {k: self.get_parameter(f'reactive.{k}').value for k in REACTIVE_DEFAULTS}
 
     def _sidestep_params(self):
         p = {k: self.get_parameter(f'sidestep.{k}').value
@@ -226,6 +262,8 @@ class CarrotControllerNode(Node):
     def _on_compass(self, m):
         with self.lock:
             self.current_compass_deg = m.data
+            now = self._now()
+            self._yaws = [(t, h) for t, h in self._yaws if now - t <= 3.0] + [(now, m.data)]
 
     def _on_goal(self, m):
         with self.lock:
@@ -241,12 +279,25 @@ class CarrotControllerNode(Node):
                 self.controller.reset()
                 # also the way out of a side-step give-up: operator toggles enable
                 self.sidestep = ss.SideStep(**self._sidestep_params())
+                self.driver = ReactiveDrive(**self._reactive_params())
             self.enable_inference = m.data
 
     def _on_scan(self, m):
         with self.lock:
             self._scan = m
             self._scan_t = self._now()
+            # the heading the frame was taken at: by the header stamp when it is on this clock and
+            # recent, else at reception (the profile is ~0.5 s old; ReactiveDrive corrects the turn
+            # made since the frame from this)
+            stamp = m.header.stamp.sec + 1e-9 * m.header.stamp.nanosec
+            t_frame = stamp if 0.0 <= self._scan_t - stamp <= 3.0 else self._scan_t
+            self._scan_hdg = self._heading_at(t_frame)
+
+    def _heading_at(self, t):
+        """Compass (deg, CW) at time t from the recent history: the sample nearest in time."""
+        if not self._yaws:
+            return self.current_compass_deg
+        return min(self._yaws, key=lambda th: abs(th[0] - t))[1]
 
     # -- obstacle stop --------------------------------------------------
     def _ahead_m(self):
@@ -336,10 +387,15 @@ class CarrotControllerNode(Node):
         # indexes waypoints[waypoint_select] unconditionally to log the model's
         # alpha, and [] would raise on the first tick. steering_source=carrot
         # never reads the plan for steering.
-        mode, v, w, detail = self.controller.command(
-            self._now(), params, bearing, float(radius), NULL_PLAN, 4, True)
+        if self.reactive:
+            mode, v, w, detail, note = self._reactive_step(hdg, bearing)
+        else:
+            mode, v, w, detail = self.controller.command(
+                self._now(), params, bearing, float(radius), NULL_PLAN, 4, True)
 
-        if self.get_parameter('obstacle_sidestep').value:
+        if self.reactive:
+            pass
+        elif self.get_parameter('obstacle_sidestep').value:
             v, w, note, resumed = self._sidestep_gate(v, w, hdg, cur, bearing)
             if resumed:
                 # its delay compensation recorded turns it never commanded
@@ -354,6 +410,28 @@ class CarrotControllerNode(Node):
         self.get_logger().info(msg)
         self.dbg_pub.publish(String(data=msg))
         self._publish(v, w)
+
+    def _reactive_step(self, hdg, bearing):
+        """ReactiveDrive towards the carrot's bearing. -> (mode, v, w, detail, note)."""
+        with self.lock:
+            scan, scan_t, scan_hdg = self._scan, self._scan_t, self._scan_hdg
+        now = self._now()
+        if scan is None or scan_t is None or scan_hdg is None or \
+                now - scan_t > float(self.get_parameter('reactive.profile_max_age_s').value):
+            self.get_logger().warn('drive_mode reactive: no fresh /erc/free_space -- holding',
+                                   throttle_duration_sec=5)
+            return 'reactive-hold', 0.0, 0.0, 'no fresh profile', ''
+        r = np.asarray(scan.ranges, float)
+        b = np.degrees(scan.angle_min + np.arange(len(r)) * scan.angle_increment)   # left-positive
+        hit = np.isfinite(r) & (r < scan.range_max - 1e-3)
+        r = np.where(np.isfinite(r), r, scan.range_max)
+        # ReactiveDrive's yaw is CCW, the compass CW; only differences matter
+        v, w = self.driver.step(now, -math.radians(hdg), (b, r, hit), -math.radians(scan_hdg),
+                                math.degrees(bearing))
+        i = self.driver.info
+        detail = (f"heading={i.get('heading', 0.0):+.1f}deg room={i.get('room', 0.0):.2f}m "
+                  f"err={i.get('err', 0.0):+.1f}deg profile_age={now - scan_t:.2f}s")
+        return f"reactive-{i.get('mode', '')}", v, w, detail, ''
 
     def _publish(self, v, w):
         t = Twist()
