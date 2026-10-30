@@ -117,6 +117,11 @@ GYRO_BURST_ERR = float(os.environ.get('GYRO_BURST_ERR', 0.25))
 GPS_SIGMA_M = float(os.environ.get('GPS_SIGMA_M', 0.4))
 GPS_LAG_S = float(os.environ.get('GPS_LAG_S', 1.5))
 MAG_MODE = os.environ.get('MAG_MODE', 'frozen')
+# /erc/gps/filtered off the truth by a Gauss-Markov error (m, s), like the Galileo plaza's, which wandered metres
+# over tens of seconds (30-oct); 0: the truth, as before. ODOM_SCALE: /erc/odometry/local's distance factor.
+GPS_WANDER_M = float(os.environ.get('GPS_WANDER_M', 0.0))
+GPS_WANDER_TAU_S = float(os.environ.get('GPS_WANDER_TAU_S', 20.0))
+ODOM_SCALE = float(os.environ.get('ODOM_SCALE', 1.03))
 RAW_SENSORS = HEADING_SRC in ('gyro_gps', 'fused')
 
 
@@ -130,6 +135,9 @@ class Fake(Node):
         self.buf = collections.deque([(0.0, 0.0)] * 26)   # 1.3 s at 20 Hz
         self.cmd = (0.0, 0.0)
         self.rng = np.random.default_rng(1)
+        self.gps_err = np.zeros(2)
+        self.odom_xyt = [0.0, 0.0, 0.0]
+        self._last_pose_t = None
         self.min_clear, self.hit, self.t = 9.0, False, 0.0
         self.events, self.replans = [], 0
         self.gps = self.create_publisher(NavSatFix, '/erc/gps/filtered', 10)
@@ -251,8 +259,18 @@ class Fake(Node):
         self.mags.publish(mg)
 
     def _pub_pose(self):
+        now = self.get_clock().now().nanoseconds * 1e-9
+        dt = 0.0 if self._last_pose_t is None else min(now - self._last_pose_t, 1.0)
+        self._last_pose_t = now
+        if GPS_WANDER_M > 0.0 and dt > 0.0:
+            a = math.exp(-dt / GPS_WANDER_TAU_S)
+            self.gps_err = a * self.gps_err + math.sqrt(1 - a * a) * GPS_WANDER_M * self.rng.standard_normal(2)
+        # odometry: the true motion, its distance off by ODOM_SCALE, its yaw its own (starts at 0)
+        self.odom_xyt[0] += ODOM_SCALE * self.v * dt * math.cos(self.odom_xyt[2])
+        self.odom_xyt[1] += ODOM_SCALE * self.v * dt * math.sin(self.odom_xyt[2])
+        self.odom_xyt[2] += self.w * dt
         f = NavSatFix()
-        f.latitude, f.longitude = latlon(self.x, self.y)
+        f.latitude, f.longitude = latlon(self.x + self.gps_err[0], self.y + self.gps_err[1])
         self.gps.publish(f)
         if not RAW_SENSORS:
             self.hdg.publish(Float32(data=float((90.0 - math.degrees(self.th)) % 360.0)))
@@ -262,6 +280,9 @@ class Fake(Node):
         o.header.stamp = self.get_clock().now().to_msg()
         o.header.frame_id, o.child_frame_id = 'odom', 'base_link'
         o.twist.twist.linear.x, o.twist.twist.angular.z = float(self.v), float(self.w)
+        o.pose.pose.position.x, o.pose.pose.position.y = float(self.odom_xyt[0]), float(self.odom_xyt[1])
+        o.pose.pose.orientation.z = math.sin(self.odom_xyt[2] / 2.0)
+        o.pose.pose.orientation.w = math.cos(self.odom_xyt[2] / 2.0)
         self.odom.publish(o)
 
     def _pub_scan(self):

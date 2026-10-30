@@ -15,6 +15,10 @@ Configurations (what the launch would run):
                    keep_map), corridor rule, recovery.explore: for routes nobody knows beforehand
     reactive-c4    reactive alone with the carrot 4 m ahead (instead of replanning, aim further
                    along the route)
+    <config>+odom  the same with the local map on dead reckoning (local_map_pose odom, OdomPose):
+                   e.g. reactive+goal+odom
+--gps-sigma/--gps-tau set the position estimate's error (Gauss-Markov; the plants' default 0.2 m / 3 s
+is a good RTK-less fix; the Galileo plaza's wandered metres over tens of seconds, 30-oct).
 The reactive drive is the robot's own code (erc_controller/reactive_drive.py) through the same
 inputs carrot_controller_node gives it; the profile here is instantaneous (no 0.5 s image lag).
 """
@@ -84,11 +88,13 @@ def smoothness(res):
 
 
 def run(job):
-    config, plant, scenario, seed = job
-    model = cs.RoverModel(**PLANTS[plant])
+    config, plant, scenario, seed, gps = job
+    model = cs.RoverModel(**PLANTS[plant], **gps)
+    map_pose = 'odom' if config.endswith('+odom') else 'gps'
+    config = config[:-len('+odom')] if config.endswith('+odom') else config
     if config == 'polar':
         res, _ = common.run(scenario, seed, 'lp+ss', 1.5, lp=LP, model=model, recovery=REC, record=True,
-                            proximity_m=PROXIMITY)
+                            proximity_m=PROXIMITY, map_pose=map_pose)
     else:
         override = ReactiveOverride()
         lp = LP_GOAL_U5 if config.endswith('+goal-u5') else LP_GOAL if config.endswith('+goal') else LP_CORRIDOR if config.endswith('-corr') else LP
@@ -97,10 +103,10 @@ def run(job):
                             4.0 if config.endswith('c4') else 1.5,
                             lp=lp, model=model, override=override,
                             recovery=REC if uses_lp else None, record=True,
-                            proximity_m=PROXIMITY)
+                            proximity_m=PROXIMITY, map_pose=map_pose)
     res.moving, res.stops_min = smoothness(res)
     res.trace = None                                  # not picklable back through the pool, not needed
-    return config, plant, scenario, seed, res
+    return job[0], plant, scenario, seed, res
 
 
 def main():
@@ -112,8 +118,11 @@ def main():
     ap.add_argument('--processes', type=int, default=16)
     ap.add_argument('--fails', action='store_true')
     ap.add_argument('--json', default='')
+    ap.add_argument('--gps-sigma', type=float, default=None)
+    ap.add_argument('--gps-tau', type=float, default=None)
     a = ap.parse_args()
-    jobs = [(c, p, s, i) for c in a.configs.split(',') for p in a.plants.split(',')
+    gps = {k: v for k, v in (('position_sigma_m', a.gps_sigma), ('position_tau_s', a.gps_tau)) if v is not None}
+    jobs = [(c, p, s, i, gps) for c in a.configs.split(',') for p in a.plants.split(',')
             for s in a.scenarios.split(',') for i in range(a.seeds)]
     with mp.Pool(a.processes) as pool:
         out = pool.map(run, jobs)

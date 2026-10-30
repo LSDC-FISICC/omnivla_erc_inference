@@ -28,8 +28,9 @@ Known limits, open:
   * The map is only as good as position and heading. The compass lags ~0.7-1.2 s
     (Mission17sept 4, and the 2.7 s turn onset of 22-sept); during a turn a
     lagged heading smears every hit sideways, so scans are NOT integrated while
-    the heading moves faster than max_turn_rate_dps. A GPS jump moves the rover
-    relative to everything already mapped; nothing here detects that.
+    the heading moves faster than max_turn_rate_dps. With the GPS as the position, a GPS
+    jump moves the rover relative to everything already mapped; nothing here detects that --
+    OdomPose (checkpoint_controller_node local_map_pose odom) keeps the GPS out of the map.
   * The profile's range comes from DA3 with a per-frame scale fit. Its
     distances have never been checked against a tape in the field.
 
@@ -373,6 +374,65 @@ class LocalCostmap:
             out.append(path[j_best])
             i = j_best
         return out
+
+
+class OdomPose:
+    """The rover's position for the local map by dead reckoning; the GPS only says where the goal is.
+
+    Why. Outdoors the map was pinned to /erc/gps/filtered, which wanders while the rover stands still
+    (mission_galileo_30oct_b, 30-oct: 8.6 m of pose motion with the wheels stopped, 31 m of pose path for 16 m
+    of wheel travel). Every profile was pasted where the GPS said, so a 2 m walkway's walls were painted
+    several times 0.3-1 m apart and closed it: "route blocked" for minutes on a ramp the rover had climbed the
+    day before. Indoors the map was built on odometry and held.
+
+    How. Each odometry message moves the position by its signed forward step (the odometry pose's own
+    displacement along its own yaw) along the ENU heading the map uses -- so the map, the position and the
+    heading agree, whatever the odometry's yaw drifted to. `corr` is a slow estimate of GPS - position (the
+    odometry's drift plus the GPS's slowly moving bias): goal positions are moved by -corr, and nothing
+    already in the map ever moves.
+    """
+
+    def __init__(self, gps_tau_s=20.0):
+        self.tau = float(gps_tau_s)
+        self.x = self.y = None           # ENU m, in the frame the caller works in
+        self.corr = np.zeros(2)          # GPS minus position, low-passed
+        self._odom = None                # last (x, y, yaw) of the odometry
+        self._t_gps = None
+
+    @property
+    def ready(self):
+        return self.x is not None
+
+    def reset(self, x, y):
+        """Start here (the GPS position at the start of a mission): position = GPS, no correction."""
+        self.x, self.y = float(x), float(y)
+        self.corr[:] = 0.0
+        self._t_gps = None
+
+    def odom(self, ox, oy, oyaw, yaw_enu):
+        """One odometry pose (its own frame) and the map's ENU yaw now (rad)."""
+        if self._odom is not None and self.x is not None:
+            px, py, pyaw = self._odom
+            mid = pyaw + 0.5 * ((oyaw - pyaw + math.pi) % (2 * math.pi) - math.pi)
+            ds = (ox - px) * math.cos(mid) + (oy - py) * math.sin(mid)
+            if abs(ds) < 1.0:            # an odometry reset is not a 1 m step at 30 Hz
+                self.x += ds * math.cos(yaw_enu)
+                self.y += ds * math.sin(yaw_enu)
+        self._odom = (ox, oy, oyaw)
+
+    def gps(self, t, gx, gy):
+        """One GPS position (same frame as reset's)."""
+        if self.x is None:
+            return
+        r = np.array([gx - self.x, gy - self.y])
+        if self._t_gps is not None and t > self._t_gps:
+            a = 1.0 - math.exp(-(t - self._t_gps) / self.tau) if self.tau > 0 else 1.0
+            self.corr += a * (r - self.corr)
+        self._t_gps = t
+
+    def to_map(self, x, y):
+        """A GPS-frame position (a checkpoint) -> where it is in the map."""
+        return x - float(self.corr[0]), y - float(self.corr[1])
 
 
 def route_points(pts, cum, s0, s1, step):

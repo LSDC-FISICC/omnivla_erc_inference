@@ -59,7 +59,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from geometry_msgs.msg import PointStamped, PoseStamped, TransformStamped, Twist
-from nav_msgs.msg import OccupancyGrid, Path
+from nav_msgs.msg import OccupancyGrid, Odometry, Path
 from sensor_msgs.msg import Imu, LaserScan, NavSatFix
 from std_msgs.msg import Bool, Float32, String
 
@@ -261,6 +261,17 @@ class CheckpointControllerNode(Node):
         self.declare_parameter('global_route_topic', '/erc/global_route')
         self.declare_parameter('carrot_point_topic', '/erc/carrot')
         self.declare_parameter('free_space_leg_topic', '/erc/free_space_leg')
+        # Where the local map puts the rover (local_planner.OdomPose). 'gps': /erc/gps/filtered, as before.
+        # 'odom': dead reckoning on odom_topic along the heading, the GPS only moving the checkpoint (slowly,
+        # odom_pose.gps_tau_s): mission_galileo_30oct_b's map, rebuilt from its own profiles, had the rover
+        # inside a wall 14 % of the time with the GPS pose and 2 % with this one. The legs of a mission then
+        # share one frame (the first leg's), so keep_map carries the map over as it is.
+        self.declare_parameter('local_map_pose', 'gps')
+        self.declare_parameter('odom_topic', '/erc/odometry/local')
+        self.declare_parameter('odom_pose.gps_tau_s', 20.0)
+        # leg_local's parent in TF, so the local map shows in any display frame (Foxglove's default is not
+        # rover_leg): '' keeps leg_local a tree of its own, as before.
+        self.declare_parameter('leg_tf_parent', 'odom')
         for name, default in local_planner.DEFAULTS.items():
             self.declare_parameter(f'local.{name}', default)
         # What to do when that map says the route ahead is blocked (local_recovery.py):
@@ -352,6 +363,14 @@ class CheckpointControllerNode(Node):
         )
         self._heading_sub = self.create_subscription(
             Float32, self._param('heading_topic'), self._heading_callback, 10)
+        if self._param('local_map_pose') not in ('gps', 'odom'):
+            raise ValueError(f"local_map_pose must be 'gps' or 'odom', not {self._param('local_map_pose')!r}")
+        self._odom_pose = local_planner.OdomPose(float(self._param('odom_pose.gps_tau_s')))
+        self._odom_frame = None        # the mission's frame for local_map_pose odom (the first leg's)
+        self._odom_last = None         # last odometry (x, y, yaw) in its own frame, for TF
+        if self._param('odom_topic'):
+            self._odom_sub = self.create_subscription(
+                Odometry, self._param('odom_topic'), self._odom_callback, 50)
         self._scan_sub = self.create_subscription(
             LaserScan, self._param('free_space_topic'), self._scan_callback, 10)
         self._debug_sub = self.create_subscription(
@@ -413,7 +432,18 @@ class CheckpointControllerNode(Node):
         with self._gps_condition:
             self._current_lat = msg.latitude
             self._current_lon = msg.longitude
+            if self._odom_frame is not None:
+                self._odom_pose.gps(time.monotonic(), *latlon_to_local(self._odom_frame, msg.latitude, msg.longitude))
             self._gps_condition.notify_all()
+
+    def _odom_callback(self, msg: Odometry):
+        q = msg.pose.pose.orientation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        p = msg.pose.pose.position
+        with self._lock:
+            self._odom_last = (p.x, p.y, yaw)
+            if self._heading_deg is not None:
+                self._odom_pose.odom(p.x, p.y, yaw, math.radians(90.0 - self._heading_deg))
 
     def _debug_callback(self, msg: String):
         if '[side-step]' in msg.data:
@@ -865,6 +895,17 @@ class CheckpointControllerNode(Node):
         arrival_threshold_m of the checkpoint, False if the mission is canceled.
         """
         frame, pts, cum = route_to_local(route)
+        odom = self._param('local_replan') and self._param('local_map_pose') == 'odom'
+        if odom:
+            # one frame for the whole mission; the route and the rover where the map has them (OdomPose)
+            with self._gps_condition:
+                if self._odom_frame is None:
+                    self._odom_frame = frame
+                    self._odom_pose.reset(*latlon_to_local(frame, *route[0]))
+                frame = self._odom_frame
+                pts = np.array([latlon_to_local(frame, lat, lon) for lat, lon in route], float) - self._odom_pose.corr
+                pts[0] = (self._odom_pose.x, self._odom_pose.y)
+            cum = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(pts, axis=0).T))])
         goal_e, goal_n = latlon_to_local(frame, checkpoint.latitude, checkpoint.longitude)
         replanner = None
         if self._param('local_replan'):
@@ -878,13 +919,15 @@ class CheckpointControllerNode(Node):
             else:
                 replanner = local_planner.LocalReplanner(pts, **lp_params)
             self._mission_map = (replanner, frame)
-            extra_lethal = self._static_lethal(frame)
+            extra_lethal = self._static_lethal(frame, shift=self._odom_pose.corr if odom else None)
             with self._lock:
                 self._scans.clear()
             self.get_logger().info(
                 f'Local replanning ON; leg frame origin ({frame[0]:.8f}, {frame[1]:.8f}), '
                 f'map {replanner.map.w}x{replanner.map.h} cells, static OSM costmap '
-                f'{"used" if extra_lethal else "not available"}.')
+                f'{"used" if extra_lethal else "not available"}, rover pose from '
+                + ('odometry (GPS - odometry so far: %.1f, %.1f m)' % tuple(self._odom_pose.corr) if odom
+                   else 'the GPS') + '.')
             self._publish_local_route(pts)
         recovery = None
         if replanner is not None and (self._param('recovery.look') or self._param('recovery.explore')):
@@ -923,11 +966,24 @@ class CheckpointControllerNode(Node):
                         self._current_distance_m = remaining
                         if remaining <= arrival_threshold_m:
                             return True
-                        s_proj = project_forward(pts, cum, east, north, s_proj)
+                        # the GPS says how far the checkpoint is (above); the map's pose says where the rover
+                        # and the checkpoint are for everything else (local_map_pose)
+                        mx, my, gx, gy = east, north, goal_e, goal_n
+                        if odom:
+                            mx, my = self._odom_pose.x, self._odom_pose.y
+                            gx, gy = self._odom_pose.to_map(goal_e, goal_n)
+                            if math.hypot(gx - pts[-1][0], gy - pts[-1][1]) > 0.5:
+                                # the GPS's view of the checkpoint moved: so does the route's end
+                                pts = np.array(pts, float)
+                                pts[-1] = (gx, gy)
+                                cum = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(pts, axis=0).T))])
+                                total = float(cum[-1])
+                                self._publish_local_route(pts)
+                        s_proj = project_forward(pts, cum, mx, my, s_proj)
                         now = time.monotonic()
-                        self._publish_rover_leg(east, north)
+                        self._publish_rover_leg(mx, my)
                         if replanner is not None:
-                            new_pts, note = self._local_step(replanner, now, east, north, pts, cum, s_proj,
+                            new_pts, note = self._local_step(replanner, now, mx, my, pts, cum, s_proj,
                                                              extra_lethal,
                                                              check=recovery is None or not recovery.active)
                             if new_pts is not None:
@@ -936,7 +992,7 @@ class CheckpointControllerNode(Node):
                                 total, s_proj, reported_quarter = float(cum[-1]), 0.0, 0
                                 self._publish_local_route(pts)
                             if recovery is not None and self._heading_deg is not None:
-                                new_pts = self._recovery_step(recovery, note, now, east, north, goal_e, goal_n,
+                                new_pts = self._recovery_step(recovery, note, now, mx, my, gx, gy,
                                                               replanner, pts, cum, s_proj, extra_lethal)
                                 if new_pts is not None:
                                     pts = new_pts
@@ -950,7 +1006,10 @@ class CheckpointControllerNode(Node):
                             last_publish = now
                             carrot_e, carrot_n, carrot_bearing = point_at(pts, cum, s_proj + lookahead)
                             self._publish_carrot_point(carrot_e, carrot_n)
-                            self._publish_carrot(*local_to_latlon(frame, carrot_e, carrot_n), carrot_bearing)
+                            # the carrot controller places /goal_gps against the GPS: hand it the carrot where
+                            # it is from the rover in the map, put next to where the GPS has the rover now
+                            self._publish_carrot(*local_to_latlon(frame, east + carrot_e - mx, north + carrot_n - my),
+                                                 carrot_bearing)
                             if not started:
                                 # Only once a goal is out: the inference node will
                                 # not drive a pose goal it has not received.
@@ -1097,10 +1156,11 @@ class CheckpointControllerNode(Node):
             self.get_logger().warn(note)
         return new_pts, note
 
-    def _static_lethal(self, frame):
+    def _static_lethal(self, frame, shift=None):
         """xs, ys in the leg frame -> lethal in this leg's OSM costmap (building
         footprints), so a local detour cannot go through a building. None if
-        the leg has no costmap (straight-line fallback)."""
+        the leg has no costmap (straight-line fallback). shift: OdomPose.corr, read at
+        each call (map + corr = the GPS's frame, which OSM is in)."""
         if self._static_map is None:
             return None
         import pyproj
@@ -1109,7 +1169,10 @@ class CheckpointControllerNode(Node):
         h, w = occ.shape
 
         def lethal(xs, ys):
-            lat, lon = local_to_latlon(frame, np.asarray(xs, float), np.asarray(ys, float))
+            xs, ys = np.asarray(xs, float), np.asarray(ys, float)
+            if shift is not None:
+                xs, ys = xs + float(shift[0]), ys + float(shift[1])
+            lat, lon = local_to_latlon(frame, xs, ys)
             ux, uy = to_utm.transform(lon, lat)
             c = np.floor((np.asarray(ux) - origin_x - ox) / res).astype(int)
             r = np.floor((np.asarray(uy) - origin_y - oy) / res).astype(int)
@@ -1143,7 +1206,21 @@ class CheckpointControllerNode(Node):
         t.transform.translation.x, t.transform.translation.y = float(east), float(north)
         yaw = math.radians(90.0 - self._heading_deg)
         t.transform.rotation.z, t.transform.rotation.w = math.sin(yaw / 2.0), math.cos(yaw / 2.0)
-        self._tf.sendTransform(t)
+        out = [t]
+        parent = self._param('leg_tf_parent')
+        if parent and self._odom_last is not None:
+            # parent -> leg_local such that rover_leg lands on base_link: the local map, its route and the
+            # carrot then show in any display frame of the map -> odom -> base_link tree
+            ox, oy, oyaw = self._odom_last
+            th = oyaw - yaw
+            p = TransformStamped()
+            p.header.stamp = t.header.stamp
+            p.header.frame_id, p.child_frame_id = parent, 'leg_local'
+            p.transform.translation.x = ox - (math.cos(th) * east - math.sin(th) * north)
+            p.transform.translation.y = oy - (math.sin(th) * east + math.cos(th) * north)
+            p.transform.rotation.z, p.transform.rotation.w = math.sin(th / 2.0), math.cos(th / 2.0)
+            out.append(p)
+        self._tf.sendTransform(out)
 
     def _publish_carrot_point(self, east, north):
         p = PointStamped()
@@ -1198,6 +1275,7 @@ class CheckpointControllerNode(Node):
             checkpoints, latest_scanned = self._fetch_checkpoints()
             start_sequence = latest_scanned + 1 if goal_handle.request.resume_from_latest_scanned else 1
             self._mission_map = None            # local.keep_map: a new mission starts with an empty map
+            self._odom_frame = None             # local_map_pose odom: a new mission, a new frame
             checkpoint_index = next(
                 (index for index, item in enumerate(checkpoints) if item.sequence >= start_sequence),
                 len(checkpoints),
