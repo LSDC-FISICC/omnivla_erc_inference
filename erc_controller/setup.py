@@ -39,6 +39,7 @@ setup(
             'indoor_mission_node = erc_controller.indoor_mission_node:main',
             'image_checkpoint_controller_node = erc_controller.image_checkpoint_controller_node:main',
             'local_map_node = erc_controller.local_map_node:main',
+            'teach_route = erc_controller.teach_route:main',
             'image_goal_offroad_node = erc_controller.image_goal_offroad_node:main',
             'flag_checkpoint_node = erc_controller.flag_checkpoint_node:main',
         ],
