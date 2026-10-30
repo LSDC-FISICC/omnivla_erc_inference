@@ -70,11 +70,20 @@ DEFAULTS = dict(
     explore_skip_m=6.0,      # after the frontier, rejoin the route this far past the rover
     episode_progress_m=3.0,  # this much closer to the goal ends a blockage episode
     # Look toward the checkpoint before taking a long detour (goal mode, 30-oct). At the top of the Galileo
-    # ramp the map (+-20 deg in front) had never looked left, where the way to C was: A* took a 33 m detour
+    # ramp the map (+-40 deg in front) had never looked left, where the way to C was: A* took a 33 m detour
     # for 14 m in a straight line, down the ramp and round it, and the rover ended pinned to a wall. When a
     # new route is detour_ratio times the straight line AND detour_extra_m longer, and the checkpoint is
     # more than detour_min_deg off the heading: stop, turn to face the checkpoint, settle, replan (and face
     # the route). Not again within detour_again_m of where it last looked.
+    # Turn-back look (30-oct evening, mission_galileo_30oct_drop): at the top of the ramp the map closed the
+    # corridor's end before the rover had seen its sides, and the next route TURNED THE ROVER BACK (down the
+    # ramp, to a hole in the mapped wall that was not there) -- the way on to C was at the end, to the left.
+    # When a new route's first turnback_lookahead_m point lies more than turnback_deg behind the heading:
+    # stop, look side_look_deg to each side (the checkpoint's side first), settle, replan.
+    turnback_look=False,
+    turnback_deg=120.0,
+    turnback_lookahead_m=1.5,
+    side_look_deg=90.0,
     detour_look=False,
     detour_ratio=1.5,
     detour_extra_m=5.0,
@@ -178,16 +187,36 @@ class BlockedRecovery:
         """A new route (goal mode) came out: if it is a long detour and the checkpoint's side has not been
         looked at from here, start a look toward the checkpoint. -> note or ''."""
         p = self.p
-        if not p['detour_look'] or self.active or t < self._cool_until or new_pts is None or len(new_pts) < 2:
-            return ''
-        straight = math.hypot(goal[0] - x, goal[1] - y)
-        length = float(np.hypot(*np.diff(np.asarray(new_pts, float), axis=0).T).sum())
-        if length < p['detour_ratio'] * straight or length < straight + p['detour_extra_m']:
-            return ''
-        bearing = math.atan2(goal[1] - y, goal[0] - x)
-        if abs(_wrap(bearing - yaw)) < math.radians(p['detour_min_deg']):
+        if not (p['detour_look'] or p['turnback_look']) or self.active or t < self._cool_until \
+                or new_pts is None or len(new_pts) < 2:
             return ''
         if any(math.hypot(x - a, y - b) < p['detour_again_m'] for a, b in self._looked_at):
+            return ''
+        pts = np.asarray(new_pts, float)
+        seg = np.hypot(*np.diff(pts, axis=0).T)
+        straight = math.hypot(goal[0] - x, goal[1] - y)
+        length = float(seg.sum())
+        bearing = math.atan2(goal[1] - y, goal[0] - x)
+        if p['turnback_look']:
+            cum = np.concatenate([[0.0], np.cumsum(seg)])
+            s = min(p['turnback_lookahead_m'], float(cum[-1]))
+            ax, ay = float(np.interp(s, cum, pts[:, 0])), float(np.interp(s, cum, pts[:, 1]))
+            off = _wrap(math.atan2(ay - y, ax - x) - yaw) if math.hypot(ax - x, ay - y) > 0.3 else 0.0
+            if abs(off) > math.radians(p['turnback_deg']):
+                side = 1.0 if _wrap(bearing - yaw) >= 0.0 else -1.0
+                a = math.radians(p['side_look_deg'])
+                self._looked_at.append((x, y))
+                self.detour_looks += 1
+                self._queue = [yaw + side * a, yaw - side * a]
+                self._after_settle = None
+                self.state, self._t0 = BRAKE, t
+                return (f'[recover] the new route turns back ({math.degrees(off):+.0f} deg): looking to both sides '
+                        f'first ({"left" if side > 0 else "right"} first)')
+        if not p['detour_look']:
+            return ''
+        if length < p['detour_ratio'] * straight or length < straight + p['detour_extra_m']:
+            return ''
+        if abs(_wrap(bearing - yaw)) < math.radians(p['detour_min_deg']):
             return ''
         self._looked_at.append((x, y))
         self.detour_looks += 1
@@ -308,6 +337,10 @@ BACKOFF_DEFAULTS = dict(
     v=0.15,            # m/s backwards
     s=3.0,             # for this long (~0.45 m)
     retry_s=6.0,       # not again before this
+    front_share=0.6,   # only when it blocks this share of the front bins (a wall across the nose, not a corner
+                       # post): controller_sim's dead-end corner backed off and was led back 14 times
+    tries=2,           # at most this many back-offs...
+    tries_radius_m=1.5,  # ...within this distance of each other (then the replanning has to do it)
 )
 
 
@@ -324,7 +357,8 @@ class BackOff:
     def __init__(self, **kw):
         self.p = dict(BACKOFF_DEFAULTS)
         self.p.update(kw)
-        self._front = (None, math.inf)     # (t, nearest range ahead)
+        self._front = (None, math.inf, 0.0)   # (t, nearest range ahead, share of front bins that near)
+        self._spots = []                   # where it backed off (x, y)
         self._near_since = None
         self._until = None
         self._next = -math.inf
@@ -338,25 +372,33 @@ class BackOff:
         b = np.asarray(bearings_deg, float)
         r = np.asarray(ranges, float)
         k = np.abs(b) <= self.p['front_deg']
-        r = r[k][np.isfinite(r[k])]
-        self._front = (t, float(r.min()) if len(r) else math.inf)
+        r = np.where(np.isfinite(r[k]), r[k], np.inf)
+        share = float(np.mean(r < self.p['near_m'])) if len(r) else 0.0
+        self._front = (t, float(r.min()) if len(r) else math.inf, share)
 
-    def step(self, t, v_cmd):
-        """v_cmd: the forward speed the drive asks for now. -> (backing v or None, note)."""
+    def step(self, t, v_cmd, x=None, y=None):
+        """v_cmd: the forward speed the drive asks for now; x, y: the rover in the map (for the tries limit).
+        -> (backing v or None, note)."""
         p = self.p
         if self._until is not None:
             if t < self._until:
                 return -p['v'], ''
             self._until, self._next = None, t + p['retry_s']
             return None, 'backed off: on'
-        tf, near = self._front
-        pinned = tf is not None and t - tf < 1.0 and near < p['near_m'] and v_cmd < 0.05
+        tf, near, share = self._front
+        pinned = tf is not None and t - tf < 1.0 and near < p['near_m'] and share >= p['front_share'] \
+            and v_cmd < 0.05
         if not pinned:
             self._near_since = None
             return None, ''
         if self._near_since is None:
             self._near_since = t
         if t - self._near_since >= p['after_s'] and t >= self._next:
+            if x is not None and sum(math.hypot(x - a, y - b) < p['tries_radius_m'] for a, b in self._spots) \
+                    >= p['tries']:
+                return None, ''
+            if x is not None:
+                self._spots.append((x, y))
             self._until, self._near_since = t + p['s'], None
             self.backs += 1
             return -p['v'], f'nose at {near:.2f} m for {p["after_s"]:.0f} s without moving: backing off'

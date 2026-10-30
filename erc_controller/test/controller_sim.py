@@ -382,7 +382,7 @@ SCENARIOS = {
     "wall_long": Scenario("wall_long", (0.0, 0.0, 0.0), [[(16.0, 0.0)]],
                           [obs.Segment((8.0, -14.0), (8.0, 4.0))], time_limit_s=420.0),
     # The Galileo ramp (30-oct): a 2 m walkway ending at a planter; the way on is a 1.2 m gap on the LEFT at its
-    # top (beside a tree), out of the map's +-20 deg until the rover turns; the checkpoint is north-west. The
+    # top (beside a tree), out of the map's +-40 deg until the rover turns; the checkpoint is north-west. The
     # other way out is a gap on the right lower down, round the planter: twice as long.
     "ramp_left": Scenario("ramp_left", (0.0, 0.0, math.radians(90.0)), [[(-6.0, 20.0)]],
                           [obs.Segment((-1.0, -2.0), (-1.0, 12.8)), obs.Segment((1.0, -2.0), (1.0, 9.0)),
@@ -736,7 +736,7 @@ def simulate(scenario: Scenario, params: dict, model: RoverModel, seed: int, rec
             if motion_allowed and rec is not None and rec.active and rec_cmd is not None:
                 target = rec_cmd
             if motion_allowed and bo is not None:
-                back, bnote = bo.step(t, target[0])
+                back, bnote = bo.step(t, target[0], ex, ey)
                 if back is not None:
                     target = (back, 0.0)
                 elif bnote:

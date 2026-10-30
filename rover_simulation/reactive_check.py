@@ -18,7 +18,9 @@ Configurations (what the launch would run):
     <config>+odom  the same with the local map on dead reckoning (local_map_pose odom, OdomPose):
                    e.g. reactive+goal+odom
     <config>+fix   ... + recovery.detour_look and the backoff reflex (30-oct): e.g. reactive+goal+odom+fix
-                   (+fix goes last; +look / +back: one of the two)
+                   (+look / +back: one of the two)
+    <config>+wide  local.inflate_m 0.30 and local.map_fov_deg 80 (LP_WIDE); flags combine in any order
+    <config>+turn  recovery.turnback_look; +trail local.trail_m 0.15 (30-oct evening); +i30 inflate_m 0.30
 --gps-sigma/--gps-tau set the position estimate's error (Gauss-Markov; the plants' default 0.2 m / 3 s
 is a good RTK-less fix; the Galileo plaza's wandered metres over tens of seconds, 30-oct).
 The reactive drive is the robot's own code (erc_controller/reactive_drive.py) through the same
@@ -49,6 +51,9 @@ LP_CORRIDOR = dict(rejoin_respects_unseen=True, unseen_extend_m=0.1)
 LP_GOAL = dict(rejoin_respects_unseen=True, unseen_extend_m=0.1, goal_mode=True, keep_map=True)
 LP_GOAL_U5 = dict(LP_GOAL, unseen_weight=5.0)     # seen-free ground preferred more strongly over unseen
 REC = dict(explore=True, look=False)
+# 30-oct (Galileo): the planter-plaza exit (~1 m) and the gap at the ramp's top closed in the map with
+# inflate_m 0.45 and the +-20 deg map; 0.30 and +-40 deg kept both open (map_pose_replay over the bags)
+LP_WIDE = dict(inflate_m=0.30, map_fov_deg=80.0)
 
 PLANTS = {
     # config/rover_dynamics.yaml (12-oct): dead time 0.65 s, tau 0.74 / 0.62 s, k_v 1.07, moves from
@@ -92,14 +97,15 @@ def smoothness(res):
 def run(job):
     config, plant, scenario, seed, gps = job
     model = cs.RoverModel(**PLANTS[plant], **gps)
-    look = back = False
-    for suffix in ('+fix', '+look', '+back'):
-        if config.endswith(suffix):
-            look, back = look or suffix in ('+fix', '+look'), back or suffix in ('+fix', '+back')
-            config = config[:-len(suffix)]
+    flags = {f for f in ('+fix', '+look', '+back', '+wide', '+turn', '+trail', '+i30') if f in config}
+    for f in flags:
+        config = config.replace(f, '')
+    look = bool(flags & {'+fix', '+look'})
+    back = bool(flags & {'+fix', '+back'})
+    wide = '+wide' in flags
     map_pose = 'odom' if config.endswith('+odom') else 'gps'
     config = config[:-len('+odom')] if config.endswith('+odom') else config
-    rec = dict(REC, detour_look=True) if look else REC
+    rec = dict(REC, detour_look=look, turnback_look='+turn' in flags)
     backoff = {} if back else None
     if config == 'polar':
         res, _ = common.run(scenario, seed, 'lp+ss', 1.5, lp=LP, model=model, recovery=REC, record=True,
@@ -107,6 +113,12 @@ def run(job):
     else:
         override = ReactiveOverride()
         lp = LP_GOAL_U5 if config.endswith('+goal-u5') else LP_GOAL if config.endswith('+goal') else LP_CORRIDOR if config.endswith('-corr') else LP
+        if wide:
+            lp = dict(lp, **LP_WIDE)
+        if '+i30' in flags:
+            lp = dict(lp, inflate_m=0.30)
+        if '+trail' in flags:
+            lp = dict(lp, trail_m=0.15)
         uses_lp = 'lp' in config or '+goal' in config
         res, _ = common.run(scenario, seed, 'lp' if uses_lp else 'carrot',
                             4.0 if config.endswith('c4') else 1.5,

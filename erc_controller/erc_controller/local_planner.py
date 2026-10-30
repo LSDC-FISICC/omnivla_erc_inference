@@ -93,6 +93,10 @@ DEFAULTS = dict(
     stuck_window_s=12.0,
     stuck_dist_m=0.4,
     stuck_mark_m=0.8,
+    # The rover's own trail (30-oct evening, mission_galileo_30oct_drop): cells within trail_m of where the map
+    # put the rover, if not occupied then, stay free -- later hits there are ignored. Up on a raised area, the
+    # way it came up read as a drop from above and the route back was closed. 0: off.
+    trail_m=0.0,
     rejoin_respects_unseen=False,  # choose the rejoin point with A*'s own rule: unseen ground
                               # within inflate_m + unseen_extend_m of a seen wall is not a
                               # rejoin point either. Without it the target landed inside the
@@ -119,6 +123,7 @@ class LocalCostmap:
         # along with the rover. Nothing else here reads them.
         self.travel = np.full((self.h, self.w), -np.inf, np.float32)
         self.odometer = 0.0
+        self.trail = np.zeros((self.h, self.w), bool)   # driven over (LocalReplanner trail_m)
 
     # -- geometry ----------------------------------------------------------
     def cell(self, x, y):
@@ -160,16 +165,36 @@ class LocalCostmap:
         self.L.flat[idx] += p['free_logodds']
         self.seen.flat[idx] = True
         self.travel.flat[idx] = self.odometer
-        # hit evidence
+        # hit evidence (never on the rover's own trail: it has been there)
         hx = x + np.cos(ang[hit]) * rng[hit]
         hy = y + np.sin(ang[hit]) * rng[hit]
         rows, cols = self.cell(hx, hy)
         ok = self._inside(rows, cols)
         idx = np.unique(rows[ok] * self.w + cols[ok])
+        idx = idx[~self.trail.flat[idx]]
         self.L.flat[idx] += p['hit_logodds']
         self.seen.flat[idx] = True
         self.travel.flat[idx] = self.odometer
         np.clip(self.L, p['min_logodds'], p['max_logodds'], out=self.L)
+        self._dist = None
+
+    def drive(self, x, y, radius):
+        """The rover is at (x, y): the cells within radius that are not occupied become its trail (free,
+        and kept free)."""
+        r = self.p['resolution_m']
+        k = int(math.ceil(radius / r))
+        (rc, cc) = (int(v) for v in self.cell(x, y))
+        r0, r1, c0, c1 = max(rc - k, 0), min(rc + k + 1, self.h), max(cc - k, 0), min(cc + k + 1, self.w)
+        if r1 <= r0 or c1 <= c0:
+            return
+        rows, cols = np.ogrid[r0:r1, c0:c1]
+        near = ((self.ox + (cols + 0.5) * r - x) ** 2 + (self.oy + (rows + 0.5) * r - y) ** 2) <= radius * radius
+        free = near & (self.L[r0:r1, c0:c1] < self.p['occupied_logodds'])
+        if not free.any():
+            return
+        self.trail[r0:r1, c0:c1] |= free
+        self.L[r0:r1, c0:c1][free] = self.p['min_logodds']
+        self.seen[r0:r1, c0:c1][free] = True
         self._dist = None
 
     def forget(self, before):
@@ -182,6 +207,7 @@ class LocalCostmap:
         if n:
             self.L[old] = 0.0
             self.seen[old] = False
+            self.trail[old] = False
             self._dist = None
         return n
 
@@ -197,6 +223,7 @@ class LocalCostmap:
         if n:
             self.L[old] = 0.0
             self.seen[old] = False
+            self.trail[old] = False
             self._dist = None
         return n
 
@@ -209,7 +236,7 @@ class LocalCostmap:
             return
         r0, r1 = max(0, -dr), min(self.h, self.h - dr)          # rows of the new grid that keep data
         c0, c1 = max(0, -dc), min(self.w, self.w - dc)
-        for name, fill in (('L', 0.0), ('seen', False), ('travel', -np.inf)):
+        for name, fill in (('L', 0.0), ('seen', False), ('travel', -np.inf), ('trail', False)):
             old = getattr(self, name)
             new = np.full_like(old, fill)
             if r1 > r0 and c1 > c0:
@@ -338,6 +365,7 @@ class LocalCostmap:
         self.L[ok] = old.L[orow[ok], ocol[ok]]
         self.seen[ok] = old.seen[orow[ok], ocol[ok]]
         self.travel[ok] = old.travel[orow[ok], ocol[ok]]
+        self.trail[ok] = old.trail[orow[ok], ocol[ok]]
         self.odometer = old.odometer
         self._dist = None
 
@@ -483,6 +511,8 @@ class LocalReplanner:
             if abs(math.degrees(d)) / (tb - ta) > self.p['max_turn_rate_dps']:
                 self.skipped_scans += 1
                 return False
+        if self.p['trail_m'] > 0.0:
+            self.map.drive(x, y, self.p['trail_m'])
         self.map.update(x, y, yaw, bearings_deg, ranges, hit)
         self.scans += 1
         return True

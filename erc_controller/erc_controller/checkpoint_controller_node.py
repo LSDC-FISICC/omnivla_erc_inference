@@ -360,6 +360,7 @@ class CheckpointControllerNode(Node):
         self._people_mask = PeopleMask()
         self._people_wait = PeopleWait(**{n: self._param(f'people.{n}') for n in PEOPLE_WAIT_DEFAULTS})
         self._people_hold = False
+        self._map_xy = None            # the rover where the local map has it (BackOff's tries limit)
         self._backoff = local_recovery.BackOff(
             **{n: self._param(f'backoff.{n}') for n in local_recovery.BACKOFF_DEFAULTS})
 
@@ -549,7 +550,7 @@ class CheckpointControllerNode(Node):
             if hold:
                 v, w = 0.0, 0.0
         if self._param('backoff') and not self._people_hold:
-            back, bnote = self._backoff.step(now, v)
+            back, bnote = self._backoff.step(now, v, *(self._map_xy or (None, None)))
             if bnote:
                 note = bnote
             if back is not None:
@@ -1001,6 +1002,7 @@ class CheckpointControllerNode(Node):
                                 cum = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(pts, axis=0).T))])
                                 total = float(cum[-1])
                                 self._publish_local_route(pts)
+                        self._map_xy = (mx, my)
                         s_proj = project_forward(pts, cum, mx, my, s_proj)
                         now = time.monotonic()
                         self._publish_rover_leg(mx, my)

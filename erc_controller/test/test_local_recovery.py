@@ -183,3 +183,29 @@ def test_backoff_leaves_a_rover_that_drives_forward_alone():
     for k in range(100):
         b.profile(0.1 * k, np.array([0.0]), np.array([0.3]))
         assert b.step(0.1 * k, 0.2)[0] is None
+
+
+def test_turnback_look_looks_to_both_sides_goal_side_first():
+    rec = lr.BlockedRecovery(explore=True, turnback_look=True)
+    # rover faces east; the new route starts by going back west; the checkpoint is north (left)
+    back = np.array([[0.0, 0.0], [-5.0, 0.0], [-5.0, 10.0]])
+    note = rec.detour_look(0.0, 0.0, 0.0, 0.0, (0.0, 10.0), back)
+    assert 'turns back' in note and 'left first' in note and rec.active
+    assert len(rec._queue) == 2 and rec._queue[0] > 0 > rec._queue[1]
+    # a route ahead does not trigger it
+    rec2 = lr.BlockedRecovery(explore=True, turnback_look=True)
+    assert rec2.detour_look(0.0, 0.0, 0.0, 0.0, (0.0, 10.0), np.array([[0, 0], [5, 0], [5, 10]])) == ''
+
+
+def test_backoff_ignores_a_post_at_the_side_and_stops_after_its_tries():
+    b = lr.BackOff()
+    for k in range(80):                                  # a post in one bin of nine, pinned: not a wall across
+        b.profile(0.1 * k, np.linspace(-20, 20, 9), np.r_[[0.3], np.full(8, 3.0)])
+        assert b.step(0.1 * k, 0.0, 0.0, 0.0)[0] is None
+    b = lr.BackOff(retry_s=0.5)
+    t, backs = 0.0, 0
+    while t < 60.0:                                      # a wall across, the rover led back to it every time
+        b.profile(t, np.linspace(-20, 20, 9), np.full(9, 0.3))
+        v, _n = b.step(t, 0.0, 0.2, 0.0)
+        t += 0.1
+    assert b.backs == 2                                  # tries, then the replanning has to do it

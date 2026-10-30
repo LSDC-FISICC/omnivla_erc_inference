@@ -143,7 +143,7 @@ cd ../../erc_controller && python3 -m pytest -q test/test_odom_pose.py
 - **El mapa en odometría:** funcionó. El pasillo de la rampa quedó limpio y la corrección GPS − odometría fue de
   4 m en B.
 - **B → C:** el paso real está **arriba de la rampa, a la izquierda, junto a un árbol**. Arriba, C quedaba ~80° a
-  la izquierda, y el mapa (±20° al frente) nunca miró hacia allá. Lo que vio de lado al acercarse (fin del muro,
+  la izquierda, y el mapa (±40° al frente: `map_fov_deg` es el ángulo a cada lado) nunca miró hacia allá. Lo que vio de lado al acercarse (fin del muro,
   planter) cerró esa esquina. A* tomó un desvío de 33 m para 14 m en línea recta: rampa abajo y por fuera. Terminó
   con la cámara contra el muro, girando en el sitio durante 100 s.
 - **Holgura:** reducir `local.inflate_m` (0.45 → 0.30) no reabre la esquina una vez vista de cerca. Comprobado
@@ -169,3 +169,54 @@ toma el camino directo que encuentra. Que la cámara vea despejada la abertura j
 **Foxglove** (`gps_mission.json`):
 - un panel con `/erc/perception/overlay/compressed` junto a la cámara;
 - `/erc/local_static_costmap` en el panel 3D.
+
+## Corrida de la tarde (`mission_galileo_30oct_drop`) y cambios de la noche
+
+**La corrida:** misión completa, 7/7. A, B, D y E sin ayuda; C, F y G necesitaron intervenciones.
+- **B → C:** el robot dio la vuelta antes del final del corredor. La ruta pasaba por un hueco del muro izquierdo
+  que no existe, y el robot se trepó al muro (inclinación de 26° y 37°).
+- **E → F:** se fue a la zona alta y no volvió. El carrot reactivo esquivaba hacia la derecha mientras la ruta
+  pedía +70–80°, fuera del campo del perfil (±60°).
+- **F → G:** 40 s con la cámara contra un muro bajo, sin retroceder (`backoff` apagado).
+
+**Cambios** (todos apagados por defecto, en `local_recovery.py` / `local_planner.py`):
+
+| Cambio | Parámetro |
+|---|---|
+| Si la ruta nueva obliga a dar la vuelta (> 120° detrás del rumbo), frenar y mirar ±90° a cada lado, primero hacia el checkpoint | `recovery.turnback_look` |
+| Rastro: las celdas por donde pasó el robot (si no estaban ocupadas) quedan libres y no aceptan obstáculos después | `local.trail_m` (0.15 en campo) |
+| Retroceso solo si el obstáculo cubre ≥ 60 % del frente, y como máximo 2 veces en 1.5 m | `backoff` (+ `backoff.front_share`, `backoff.tries`) |
+
+**Simulador** (Mini+; rutas desconocidas 30 corridas, estándar 36; sin choques en ninguna fila):
+
+| Configuración | Desconocidas, GPS bueno | Estándar, GPS bueno | Desconocidas, GPS errante | Estándar, GPS errante |
+|---|---|---|---|---|
+| odometría, holgura 0.45 | 29/30 · 143 s | 36/36 | 30/30 · 160 s | 36/36 |
+| **+ mirar al dar la vuelta + rastro + retroceso** | **30/30** · 171 s | **36/36** | **30/30** · 171 s | **36/36** |
+| odometría, holgura 0.30 | 21/30 · 143 s | 34/36 | 25/30 · 153 s | 36/36 |
+| 0.30 + los tres cambios | 30/30 · 190 s | 36/36 | 26/30 · 176 s | 36/36 |
+
+- **Aporte de cada cambio:** casi todo viene de mirar al dar la vuelta. El retroceso y el rastro no cambian el
+  resultado en el simulador, que no tiene zonas altas ni desniveles.
+- **Holgura 0.30:** sola empeora; la recomendación de esta tarde fue un error. Pero con 0.45 la salida de ~1 m de
+  la plaza del puente queda cerrada (comprobado en el bag), así que la holgura queda como compromiso abierto.
+
+**Localización** (`Etapa_Localizacion_Causal_LPV_2026/galileo_outdoor/eval_30oct.py` y `eval_30oct_yaw.py`):
+
+| Pose del mapa | Recorrido dentro de un muro (odom / look / drop) |
+|---|---|
+| Odometría + `heading_node` (lo de hoy) | 10.7 / **0.2** / **1.1** % |
+| GPS + `heading_node` (antes) | 8.5 / 6.6 / 5.1 % |
+| EKF B0 / C ZOH / C FOH | 37.1–26.3 / 0.5–1.6 / 2.4–8.2 % |
+| H∞ C ZOH / C FOH | 23.0 / **2.7** · 6.0 / 2.5 · 11.3 / 9.7 % |
+| Odometría + rumbo solo de la cámara | 28.0 / 1.4 / 3.9 % |
+| Odometría + rumbo híbrido (giroscopio + cámara en huecos) | **5.6** / 0.2 / 1.7 % |
+
+**Lectura:**
+- Ninguna interpolación (ZOH, ZOH fino, FOH) ni ningún filtro (EKF, H∞) gana en los tres bags.
+- ZOH y ZOH fino dan idéntico.
+- La odometría con `heading_node` gana o empata en dos de tres; el H∞ FOH y el rumbo híbrido ganan solo en el
+  bag `odom`.
+- El rumbo de la cámara solo es el peor para el mapa.
+- Contra los fixes GPS reservados, el ganador también cambia por bag, y en el bag largo (con intervenciones) los
+  filtros pierden el rumbo hasta 145°.

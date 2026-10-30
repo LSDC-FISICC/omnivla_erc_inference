@@ -62,3 +62,21 @@ def test_no_progress_marks_ahead_and_replans():
 
 def test_rejoin_mode_unchanged_by_default():
     assert lp.DEFAULTS['goal_mode'] is False and lp.DEFAULTS['keep_map'] is False
+
+
+def test_trail_stays_free_when_it_later_reads_as_an_obstacle():
+    pts, c = cum([(0, 0), (12, 0)])
+    r = lp.LocalReplanner(pts, **dict(GOAL, trail_m=0.2))
+    for k in range(10):                                  # drives east over x = 0..2
+        r.observe(float(k), 0.2 * k, 0.0, 0.0, np.array([0.0]), np.array([3.0]), np.array([False]))
+    # from further on, looking back, the profile reports the way it came as an edge
+    for k in range(5):
+        r.observe(20.0 + k, 4.0, 0.0, math.pi, np.array([0.0]), np.array([3.0]), np.array([True]))
+    assert float(r.map.L[r.map.cell(1.0, 0.0)]) < r.p['occupied_logodds']
+    # without the trail the same reads as a wall
+    q = lp.LocalReplanner(pts, **GOAL)
+    for k in range(10):
+        q.observe(float(k), 0.2 * k, 0.0, 0.0, np.array([0.0]), np.array([3.0]), np.array([False]))
+    for k in range(5):
+        q.observe(20.0 + k, 4.0, 0.0, math.pi, np.array([0.0]), np.array([3.0]), np.array([True]))
+    assert float(q.map.L[q.map.cell(1.0, 0.0)]) >= q.p['occupied_logodds']
