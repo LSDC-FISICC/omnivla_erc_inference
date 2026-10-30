@@ -381,6 +381,14 @@ SCENARIOS = {
     # A long wall (18 m) across the line to the checkpoint, the way round only past its far end.
     "wall_long": Scenario("wall_long", (0.0, 0.0, 0.0), [[(16.0, 0.0)]],
                           [obs.Segment((8.0, -14.0), (8.0, 4.0))], time_limit_s=420.0),
+    # The Galileo ramp (30-oct): a 2 m walkway ending at a planter; the way on is a 1.2 m gap on the LEFT at its
+    # top (beside a tree), out of the map's +-20 deg until the rover turns; the checkpoint is north-west. The
+    # other way out is a gap on the right lower down, round the planter: twice as long.
+    "ramp_left": Scenario("ramp_left", (0.0, 0.0, math.radians(90.0)), [[(-6.0, 20.0)]],
+                          [obs.Segment((-1.0, -2.0), (-1.0, 12.8)), obs.Segment((1.0, -2.0), (1.0, 9.0)),
+                           obs.Segment((-1.0, -2.0), (1.0, -2.0)), obs.Segment((-1.0, 14.0), (3.5, 14.0)),
+                           obs.Segment((-1.0, 14.0), (-1.0, 14.6)), obs.Disc((-2.4, 15.0), 0.3),
+                           obs.Segment((1.0, 11.0), (3.5, 11.0))], time_limit_s=420.0),
     # Two walkways: a dead end on the near side, the way through on the far side.
     "dead_end": Scenario("dead_end", (0.0, 0.0, 0.0), [[(14.0, 0.0)]],
                          [obs.Segment((6.0, -3.0), (6.0, 8.0)), obs.Segment((6.0, 8.0), (3.0, 8.0)),
@@ -472,10 +480,11 @@ def plan_for_deviation(delta, goal_bearing, params):
 
 def simulate(scenario: Scenario, params: dict, model: RoverModel, seed: int, record=False,
              dt=0.02, node=None, node_defaults=None, avoid=None, stop=None, override=None,
-             local=None, recovery=None, map_pose='gps', odom_scale_sigma=0.03):
+             local=None, recovery=None, map_pose='gps', odom_scale_sigma=0.03, backoff=None):
     """map_pose: where the local map puts the rover, as checkpoint_controller_node's local_map_pose --
     'gps' the position estimate, 'odom' local_planner.OdomPose on a simulated odometry (the true motion,
     its distance off by a per-run scale drawn with odom_scale_sigma) along the estimated heading.
+    backoff: None, or a dict of local_recovery.BACKOFF_DEFAULTS -> the node's backoff reflex.
     local: None, or a dict of local_planner parameters -> a LocalReplanner per leg,
     fed the perception profile at the carrot rate, exactly where
     checkpoint_controller_node runs it.
@@ -530,6 +539,7 @@ def simulate(scenario: Scenario, params: dict, model: RoverModel, seed: int, rec
     local_notes = []
     rec = lrec.BlockedRecovery(**recovery) if (recovery is not None and local is not None) else None
     rec_cmd = None
+    bo = lrec.BackOff(**backoff) if backoff is not None else None
     odom = map_pose == 'odom' and local is not None
     dr = lp.OdomPose()
     odom_frame = None
@@ -615,6 +625,8 @@ def simulate(scenario: Scenario, params: dict, model: RoverModel, seed: int, rec
                         # the map is built from the ESTIMATED pose, perception
                         # from the true one -- as on the rover
                         pb, pf, pc = obs.profile(rover.x, rover.y, rover.theta, world, rng)
+                        if bo is not None:
+                            bo.profile(t, pb, np.where(pf < pc - 1e-3, pf, np.inf))
                         planner.observe(t, mx, my, etheta, pb, pf, pf < pc - 1e-3)
                         new_pts, note = (None, '') if (rec is not None and rec.active) else \
                             planner.check(t, mx, my, pts, cum, s_proj)
@@ -625,6 +637,10 @@ def simulate(scenario: Scenario, params: dict, model: RoverModel, seed: int, rec
                             cum = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(pts, axis=0).T))])
                             s_proj = 0.0
                             replans += 1
+                            if rec is not None:
+                                dn = rec.detour_look(t, mx, my, etheta, (gx, gy), new_pts)
+                                if dn:
+                                    local_notes.append((round(t, 1), dn))
                         if rec is not None:
                             # the checkpoint controller owns the map, the route and /cmd_vel
                             if note.startswith('[local-plan] blocked'):
@@ -719,6 +735,16 @@ def simulate(scenario: Scenario, params: dict, model: RoverModel, seed: int, rec
             target = model_cmd if motion_allowed else (0.0, 0.0)
             if motion_allowed and rec is not None and rec.active and rec_cmd is not None:
                 target = rec_cmd
+            if motion_allowed and bo is not None:
+                back, bnote = bo.step(t, target[0])
+                if back is not None:
+                    target = (back, 0.0)
+                elif bnote:
+                    controller.reset()
+                    if override is not None:
+                        override.reset()
+                if bnote:
+                    local_notes.append((round(t, 1), '[reflex] ' + bnote))
             out = shaper.step(target[0], target[1], output_period)
             rover.command(t, *out)
             log_t.append(t)

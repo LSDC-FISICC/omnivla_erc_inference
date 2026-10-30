@@ -69,6 +69,17 @@ DEFAULTS = dict(
     explore_spacing_m=1.5,   # a frontier this close to one already tried is skipped
     explore_skip_m=6.0,      # after the frontier, rejoin the route this far past the rover
     episode_progress_m=3.0,  # this much closer to the goal ends a blockage episode
+    # Look toward the checkpoint before taking a long detour (goal mode, 30-oct). At the top of the Galileo
+    # ramp the map (+-20 deg in front) had never looked left, where the way to C was: A* took a 33 m detour
+    # for 14 m in a straight line, down the ramp and round it, and the rover ended pinned to a wall. When a
+    # new route is detour_ratio times the straight line AND detour_extra_m longer, and the checkpoint is
+    # more than detour_min_deg off the heading: stop, turn to face the checkpoint, settle, replan (and face
+    # the route). Not again within detour_again_m of where it last looked.
+    detour_look=False,
+    detour_ratio=1.5,
+    detour_extra_m=5.0,
+    detour_min_deg=30.0,
+    detour_again_m=3.0,
 )
 
 
@@ -131,6 +142,8 @@ class BlockedRecovery:
         self._t0 = 0.0
         self._after_settle = None
         self._episode = None       # (start distance to goal, tried frontiers)
+        self._looked_at = []       # where detour looks were taken (x, y)
+        self.detour_looks = 0
 
     @property
     def active(self):
@@ -160,6 +173,29 @@ class BlockedRecovery:
             return False
         self.state, self._t0 = BRAKE, t
         return True
+
+    def detour_look(self, t, x, y, yaw, goal, new_pts):
+        """A new route (goal mode) came out: if it is a long detour and the checkpoint's side has not been
+        looked at from here, start a look toward the checkpoint. -> note or ''."""
+        p = self.p
+        if not p['detour_look'] or self.active or t < self._cool_until or new_pts is None or len(new_pts) < 2:
+            return ''
+        straight = math.hypot(goal[0] - x, goal[1] - y)
+        length = float(np.hypot(*np.diff(np.asarray(new_pts, float), axis=0).T).sum())
+        if length < p['detour_ratio'] * straight or length < straight + p['detour_extra_m']:
+            return ''
+        bearing = math.atan2(goal[1] - y, goal[0] - x)
+        if abs(_wrap(bearing - yaw)) < math.radians(p['detour_min_deg']):
+            return ''
+        if any(math.hypot(x - a, y - b) < p['detour_again_m'] for a, b in self._looked_at):
+            return ''
+        self._looked_at.append((x, y))
+        self.detour_looks += 1
+        self._queue = [bearing]
+        self._after_settle = None
+        self.state, self._t0 = BRAKE, t
+        return (f'[recover] detour {length:.0f} m for {straight:.0f} m straight: looking toward the '
+                f'checkpoint first ({math.degrees(_wrap(bearing - yaw)):+.0f} deg)')
 
     def _face_target(self, x, y, pts, cum, s_proj):
         s = min(float(cum[-1]), s_proj + self.p['face_lookahead_m'])
@@ -263,3 +299,65 @@ class BlockedRecovery:
         keep = np.concatenate([[True], np.hypot(*np.diff(new, axis=0).T) > 1e-3])
         return new[keep], (f'[recover] no path; exploring frontier {len(tried)}/{p["explore_max"]} at '
                            f'({f[0]:.1f}, {f[1]:.1f}), {math.hypot(f[0] - x, f[1] - y):.1f} m away')
+
+
+BACKOFF_DEFAULTS = dict(
+    near_m=0.35,       # something this close straight ahead (+-front_deg of the profile)...
+    front_deg=25.0,
+    after_s=4.0,       # ...for this long while the drive is not moving forward: back off
+    v=0.15,            # m/s backwards
+    s=3.0,             # for this long (~0.45 m)
+    retry_s=6.0,       # not again before this
+)
+
+
+class BackOff:
+    """Back away from what the rover's nose is against.
+
+    Why. 30-oct, the Galileo ramp: the carrot's route went through a wall the rover stood 0.22-0.29 m from;
+    the reactive drive said "blocked" and turned in place left and right for 100 s, the camera on the bricks,
+    never moving back -- and from there the camera sees nothing that would change the plan. Nothing
+    reversed except the tilt reflex. This does, the way it came, a short distance; the stuck mark and the
+    replanning do the rest. No ROS.
+    """
+
+    def __init__(self, **kw):
+        self.p = dict(BACKOFF_DEFAULTS)
+        self.p.update(kw)
+        self._front = (None, math.inf)     # (t, nearest range ahead)
+        self._near_since = None
+        self._until = None
+        self._next = -math.inf
+        self.backs = 0
+
+    @property
+    def active(self):
+        return self._until is not None
+
+    def profile(self, t, bearings_deg, ranges):
+        b = np.asarray(bearings_deg, float)
+        r = np.asarray(ranges, float)
+        k = np.abs(b) <= self.p['front_deg']
+        r = r[k][np.isfinite(r[k])]
+        self._front = (t, float(r.min()) if len(r) else math.inf)
+
+    def step(self, t, v_cmd):
+        """v_cmd: the forward speed the drive asks for now. -> (backing v or None, note)."""
+        p = self.p
+        if self._until is not None:
+            if t < self._until:
+                return -p['v'], ''
+            self._until, self._next = None, t + p['retry_s']
+            return None, 'backed off: on'
+        tf, near = self._front
+        pinned = tf is not None and t - tf < 1.0 and near < p['near_m'] and v_cmd < 0.05
+        if not pinned:
+            self._near_since = None
+            return None, ''
+        if self._near_since is None:
+            self._near_since = t
+        if t - self._near_since >= p['after_s'] and t >= self._next:
+            self._until, self._near_since = t + p['s'], None
+            self.backs += 1
+            return -p['v'], f'nose at {near:.2f} m for {p["after_s"]:.0f} s without moving: backing off'
+        return None, ''

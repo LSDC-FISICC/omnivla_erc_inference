@@ -77,6 +77,12 @@
     },
     "/erc/carrot": {
      "visible": true
+    },
+    "/erc/local_static_costmap": {
+     "visible": true,
+     "colorMode": "raw",
+     "alpha": 0.35,
+     "frameLocked": false
     }
    },
    "publish": {
@@ -159,6 +165,18 @@
    ],
    "minLogLevel": 1,
    "nameFilter": {}
+  },
+  "Image!overlay": {
+   "imageMode": {
+    "imageTopic": "/erc/perception/overlay/compressed"
+   },
+   "cameraState": {},
+   "followMode": "follow-pose",
+   "scene": {},
+   "transforms": {},
+   "topics": {},
+   "layers": {},
+   "publish": {}
   }
  },
  "globalVariables": {},
@@ -176,7 +194,12 @@
    "direction": "column",
    "splitPercentage": 62,
    "first": "map!gps",
-   "second": "Image!cam"
+   "second": {
+    "direction": "row",
+    "splitPercentage": 50,
+    "first": "Image!cam",
+    "second": "Image!overlay"
+   }
   },
   "second": {
    "direction": "column",

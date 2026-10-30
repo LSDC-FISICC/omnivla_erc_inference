@@ -17,6 +17,8 @@ Configurations (what the launch would run):
                    along the route)
     <config>+odom  the same with the local map on dead reckoning (local_map_pose odom, OdomPose):
                    e.g. reactive+goal+odom
+    <config>+fix   ... + recovery.detour_look and the backoff reflex (30-oct): e.g. reactive+goal+odom+fix
+                   (+fix goes last; +look / +back: one of the two)
 --gps-sigma/--gps-tau set the position estimate's error (Gauss-Markov; the plants' default 0.2 m / 3 s
 is a good RTK-less fix; the Galileo plaza's wandered metres over tens of seconds, 30-oct).
 The reactive drive is the robot's own code (erc_controller/reactive_drive.py) through the same
@@ -36,7 +38,7 @@ from common import cs, obs  # noqa: E402
 from erc_controller.reactive_drive import ReactiveDrive  # noqa: E402
 
 SCENARIOS = 'hedge,planter,wall,kerb,chicane,post,straight,zigzag,mission_16sept'
-UNKNOWN = 'walkway,walkway_back,wall_long,dead_end'
+UNKNOWN = 'walkway,walkway_back,wall_long,dead_end,ramp_left'
 PROXIMITY = 4.0             # checkpoint_proximity_m as in the field (the node's default 8 m reaches through walls)
 # recommended 28-sept: rejoin with A*'s own unseen rule, explore when there is no path
 LP = dict(rejoin_respects_unseen=True, unseen_extend_m=2.5)
@@ -90,8 +92,15 @@ def smoothness(res):
 def run(job):
     config, plant, scenario, seed, gps = job
     model = cs.RoverModel(**PLANTS[plant], **gps)
+    look = back = False
+    for suffix in ('+fix', '+look', '+back'):
+        if config.endswith(suffix):
+            look, back = look or suffix in ('+fix', '+look'), back or suffix in ('+fix', '+back')
+            config = config[:-len(suffix)]
     map_pose = 'odom' if config.endswith('+odom') else 'gps'
     config = config[:-len('+odom')] if config.endswith('+odom') else config
+    rec = dict(REC, detour_look=True) if look else REC
+    backoff = {} if back else None
     if config == 'polar':
         res, _ = common.run(scenario, seed, 'lp+ss', 1.5, lp=LP, model=model, recovery=REC, record=True,
                             proximity_m=PROXIMITY, map_pose=map_pose)
@@ -102,8 +111,8 @@ def run(job):
         res, _ = common.run(scenario, seed, 'lp' if uses_lp else 'carrot',
                             4.0 if config.endswith('c4') else 1.5,
                             lp=lp, model=model, override=override,
-                            recovery=REC if uses_lp else None, record=True,
-                            proximity_m=PROXIMITY, map_pose=map_pose)
+                            recovery=rec if uses_lp else None, record=True,
+                            proximity_m=PROXIMITY, map_pose=map_pose, backoff=backoff)
     res.moving, res.stops_min = smoothness(res)
     res.trace = None                                  # not picklable back through the pool, not needed
     return job[0], plant, scenario, seed, res

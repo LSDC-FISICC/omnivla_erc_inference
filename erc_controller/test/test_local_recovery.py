@@ -129,3 +129,57 @@ def test_exploration_budget_is_spent():
         notes += n
     assert rec.explores == 2
     assert any('budget spent' in n for n in notes)
+
+
+def test_detour_look_turns_to_the_checkpoint_then_takes_the_shorter_way_it_saw():
+    # 30-oct, top of the Galileo ramp: a 33 m detour for 14 m straight, the checkpoint 80 deg to the left
+    rec = lr.BlockedRecovery(look=False, explore=True, detour_look=True)
+    goal = (0.0, 14.0)                                   # north; the rover faces east (yaw 0)
+    detour = np.array([[0.0, 0.0], [-10.0, -5.0], [5.0, 20.0], [0.0, 14.0]])
+    note = rec.detour_look(0.0, 0.0, 0.0, 0.0, goal, detour)
+    assert 'looking toward the checkpoint' in note and rec.active
+    # after the look the planner finds the direct way: it replaces the detour
+    direct = np.array([[0.0, 0.0], [0.0, 14.0]])
+    t, yaw, got = 0.0, 0.0, None
+    planner = _Planner((direct, '[local-plan] goal: 19.0 m shorter; 2 points, 14.0 m to the checkpoint'))
+    while t < 40.0 and rec.active:
+        cmd, new_pts, _n = rec.step(t, 0.0, 0.0, yaw, planner, detour, np.array([0.0, 11.2, 40.0, 47.8]), 0.0, goal)
+        got = new_pts if new_pts is not None else got
+        if cmd is not None:
+            yaw += cmd[1] * 0.1
+        t += 0.1
+    assert not rec.active and got is not None and np.allclose(got[-1], goal)
+    # it turned left, toward the checkpoint; it stops commanding rate x lead_s early (the rover's delay carries
+    # it the rest of the way), and this integration has no delay
+    assert 45.0 < math.degrees(yaw) < 100.0
+    # not again from the same place
+    assert rec.detour_look(t + 20.0, 0.5, 0.0, 0.0, goal, detour) == ''
+
+
+def test_detour_look_ignores_short_detours_and_a_goal_ahead():
+    rec = lr.BlockedRecovery(explore=True, detour_look=True)
+    goal = (14.0, 0.0)
+    assert rec.detour_look(0.0, 0.0, 0.0, 0.0, goal, np.array([[0, 0], [7, 3], [14, 0]])) == ''   # 1.1x
+    long_ahead = np.array([[0.0, 0.0], [5.0, 10.0], [14.0, 10.0], [14.0, 0.0]])
+    assert rec.detour_look(0.0, 0.0, 0.0, 0.0, goal, long_ahead) == ''                           # ahead
+
+
+def test_backoff_backs_away_from_a_pinned_nose_then_waits():
+    b = lr.BackOff()
+    t, out = 0.0, []
+    while t < 12.0:
+        b.profile(t, np.array([-10.0, 0.0, 10.0]), np.array([0.3, 0.25, 0.3]))
+        v, _n = b.step(t, 0.0)                           # the drive is turning in place, not moving forward
+        out.append((t, v))
+        t += 0.1
+    backing = [tt for tt, v in out if v is not None and v < 0]
+    assert backing and abs(backing[0] - 4.0) < 0.15      # after after_s pinned
+    assert 2.8 < backing[-1] - backing[0] < 3.1          # for s
+    assert b.backs == 1                                  # retry_s holds the next one
+
+
+def test_backoff_leaves_a_rover_that_drives_forward_alone():
+    b = lr.BackOff()
+    for k in range(100):
+        b.profile(0.1 * k, np.array([0.0]), np.array([0.3]))
+        assert b.step(0.1 * k, 0.2)[0] is None

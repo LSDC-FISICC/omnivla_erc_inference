@@ -134,3 +134,38 @@ CP_EXTRA="-p checkpoint_proximity_m:=4.0 -p local.goal_mode:=true -p local.keep_
 # 4. Pruebas unitarias
 cd ../../erc_controller && python3 -m pytest -q test/test_odom_pose.py
 ```
+
+## Después de la primera corrida en campo (30-oct, `mission_galileo_30oct_odom`)
+
+**Lo que pasó:**
+- **A y B:** se alcanzaron y el servidor los confirmó (`latest_scanned_checkpoint: 2`). El nodo no lo decía de forma
+  visible.
+- **El mapa en odometría:** funcionó. El pasillo de la rampa quedó limpio y la corrección GPS − odometría fue de
+  4 m en B.
+- **B → C:** el paso real está **arriba de la rampa, a la izquierda, junto a un árbol**. Arriba, C quedaba ~80° a
+  la izquierda, y el mapa (±20° al frente) nunca miró hacia allá. Lo que vio de lado al acercarse (fin del muro,
+  planter) cerró esa esquina. A* tomó un desvío de 33 m para 14 m en línea recta: rampa abajo y por fuera. Terminó
+  con la cámara contra el muro, girando en el sitio durante 100 s.
+- **Holgura:** reducir `local.inflate_m` (0.45 → 0.30) no reabre la esquina una vez vista de cerca. Comprobado
+  reconstruyendo el mapa desde el bag.
+
+**Cambios:**
+
+| Cambio | Parámetro | Por defecto | Simulador (rutas desconocidas, GPS bueno, 30 corridas) |
+|---|---|---|---|
+| Aviso `Checkpoint N CONFIRMED by the SDK (k/n)` en el log | — | siempre | — |
+| Mirar hacia el checkpoint antes de un desvío largo: si la ruta nueva mide ≥ 1.5× la recta y ≥ 5 m más, y el checkpoint está a > 30° del rumbo, frena, gira hacia él, espera y replanifica (`local_recovery.BlockedRecovery.detour_look`) | `recovery.detour_look` | `false` | 29/30 → **30/30** (resuelve el arrinconamiento de `walkway` semilla 1); 143 → 177 s |
+| Retroceder ~0.45 m si hay algo a < 0.35 m al frente durante 4 s sin avanzar (`local_recovery.BackOff`) | `backoff` | `false` | 29/30 → 28/30: en la esquina sin salida retrocede y el carrot lo devuelve, 14 veces. **No recomendado aún.** |
+| La capa OSM tal como la usa A* (desplazada por la corrección), en `leg_local` | `/erc/local_static_costmap` | siempre que haya OSM | — |
+| Imágenes de `free_space_node` en la misión outdoor: piso verde y obstáculos rojos, y la profundidad | `debug_images` (launch) | `true` | — |
+
+En ROS de punta a punta (`walkway`, GPS errante), con mirar y retroceder activados: completa en 253 s, contra 363 s
+sin ellos.
+
+**Lo que no prueba el simulador:** allí la abertura se ve de frente y nunca queda marcada como cerrada, así que la
+falla del campo no se reproduce. Mirar hacia el checkpoint se probó con una prueba unitaria: gira a la izquierda y
+toma el camino directo que encuentra. Que la cámara vea despejada la abertura junto al árbol solo se sabrá en campo.
+
+**Foxglove** (`gps_mission.json`):
+- un panel con `/erc/perception/overlay/compressed` junto a la cámara;
+- `/erc/local_static_costmap` en el panel 3D.

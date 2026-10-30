@@ -283,6 +283,12 @@ class CheckpointControllerNode(Node):
         # 30-40 s per mission and, on the older plant, led the side-step into a bench gap.
         for name, default in local_recovery.DEFAULTS.items():
             self.declare_parameter(f'recovery.{name}', False if name in ('look', 'explore') else default)
+        # Back off what the rover's nose is pinned against (local_recovery.BackOff): off by default.
+        self.declare_parameter('backoff', False)
+        for name, default in local_recovery.BACKOFF_DEFAULTS.items():
+            self.declare_parameter(f'backoff.{name}', default)
+        # The OSM layer as the local planner uses it (in leg_local, moved with OdomPose's correction).
+        self.declare_parameter('local_static_costmap_topic', '/erc/local_static_costmap')
         # the carrot's side-step says what it is doing here; recovery waits while it manoeuvres
         self.declare_parameter('debug_topic', '/erc/controller/debug')
         # heading_node's source gyro_gps (heading = gyro + GPS, for units whose magnetometer does
@@ -354,6 +360,8 @@ class CheckpointControllerNode(Node):
         self._people_mask = PeopleMask()
         self._people_wait = PeopleWait(**{n: self._param(f'people.{n}') for n in PEOPLE_WAIT_DEFAULTS})
         self._people_hold = False
+        self._backoff = local_recovery.BackOff(
+            **{n: self._param(f'backoff.{n}') for n in local_recovery.BACKOFF_DEFAULTS})
 
         self._model_cmd_sub = self.create_subscription(
             Twist, self._param('model_cmd_vel_topic'), self._model_cmd_callback, 10
@@ -383,6 +391,7 @@ class CheckpointControllerNode(Node):
             self._objects_sub = self.create_subscription(
                 String, self._param('objects_topic'), self._objects_callback, 10)
         self._local_map_pub = self.create_publisher(OccupancyGrid, self._param('local_costmap_topic'), 1)
+        self._static_layer_pub = self.create_publisher(OccupancyGrid, self._param('local_static_costmap_topic'), 1)
         self._local_route_pub = self.create_publisher(Path, self._param('local_route_topic'), LATCHED_QOS)
         self._global_route_pub = self.create_publisher(Path, self._param('global_route_topic'), LATCHED_QOS)
         self._carrot_pub = self.create_publisher(PointStamped, self._param('carrot_point_topic'), 10)
@@ -465,6 +474,9 @@ class CheckpointControllerNode(Node):
         with self._lock:
             active = self._mission_active
             self._people_wait.profile(self._frame_time(msg.header.stamp))
+            if self._param('backoff'):
+                b = np.degrees(msg.angle_min + np.arange(len(msg.ranges)) * msg.angle_increment)
+                self._backoff.profile(time.monotonic(), b, np.asarray(msg.ranges, float))
         if active:
             leg = LaserScan()
             leg.header.stamp, leg.header.frame_id = msg.header.stamp, 'rover_leg'
@@ -536,6 +548,16 @@ class CheckpointControllerNode(Node):
             self._people_hold = hold
             if hold:
                 v, w = 0.0, 0.0
+        if self._param('backoff') and not self._people_hold:
+            back, bnote = self._backoff.step(now, v)
+            if bnote:
+                note = bnote
+            if back is not None:
+                v, w = back, 0.0
+            elif bnote:
+                # done backing: the carrot's controller recorded commands that never went out -- reset it
+                self._enable_pub.publish(Bool(data=False))
+                self._reenable_at = now + 0.3
         p = self._safety_params()
         if not p['safety.tilt_enabled']:
             return v, w, False, note
@@ -991,6 +1013,11 @@ class CheckpointControllerNode(Node):
                                 cum = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(pts, axis=0).T))])
                                 total, s_proj, reported_quarter = float(cum[-1]), 0.0, 0
                                 self._publish_local_route(pts)
+                                if recovery is not None and self._heading_deg is not None:
+                                    dnote = recovery.detour_look(now, mx, my, math.radians(90.0 - self._heading_deg),
+                                                                 (gx, gy), new_pts)
+                                    if dnote:
+                                        self.get_logger().info(dnote)
                             if recovery is not None and self._heading_deg is not None:
                                 new_pts = self._recovery_step(recovery, note, now, mx, my, gx, gy,
                                                               replanner, pts, cum, s_proj, extra_lethal)
@@ -1002,6 +1029,8 @@ class CheckpointControllerNode(Node):
                             if now - last_map_publish >= 1.0 / float(self._param('local_costmap_rate_hz')):
                                 last_map_publish = now
                                 self._publish_local_map(replanner.map)
+                                if extra_lethal is not None:
+                                    self._publish_static_layer(replanner.map, extra_lethal)
                         if now - last_publish >= period:
                             last_publish = now
                             carrot_e, carrot_n, carrot_bearing = point_at(pts, cum, s_proj + lookahead)
@@ -1196,6 +1225,19 @@ class CheckpointControllerNode(Node):
         g.data = data.ravel().tolist()
         self._local_map_pub.publish(g)
 
+    def _publish_static_layer(self, cmap, lethal):
+        """The OSM layer (buildings) on the local map's grid, as A* sees it: 100 lethal, 0 not."""
+        rr, cc = np.mgrid[0:cmap.h, 0:cmap.w]
+        xs, ys = cmap.centre(rr, cc)
+        g = OccupancyGrid()
+        g.header.stamp = self.get_clock().now().to_msg()
+        g.header.frame_id = 'leg_local'
+        g.info.resolution = float(cmap.p['resolution_m'])
+        g.info.width, g.info.height = cmap.w, cmap.h
+        g.info.origin.position.x, g.info.origin.position.y = float(cmap.ox), float(cmap.oy)
+        g.data = np.where(lethal(xs.ravel(), ys.ravel()), 100, 0).astype(np.int8).tolist()
+        self._static_layer_pub.publish(g)
+
     def _publish_rover_leg(self, east, north):
         """leg_local -> rover_leg: the position the carrot projects, the compass yaw."""
         if self._heading_deg is None:
@@ -1355,6 +1397,10 @@ class CheckpointControllerNode(Node):
                     continue
 
                 result.last_checkpoint_sequence = checkpoint.sequence
+                last_sequence = max(item.sequence for item in checkpoints)
+                self.get_logger().info(
+                    f'Checkpoint {checkpoint.sequence} CONFIRMED by the SDK ({checkpoint.sequence}/{last_sequence})'
+                    + (': mission completed.' if mission_completed else '.'))
                 if mission_completed:
                     goal_handle.succeed()
                     result.success = True

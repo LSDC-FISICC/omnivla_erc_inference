@@ -31,6 +31,9 @@ Arguments:
                                abruptly -- raised edges, stairs going down -- as
                                an obstacle. Stops at the top of descents and
                                hills too: for parks/plazas, not rolling grass.
+    debug_images:=true|false  (default true) free_space_node also publishes what it saw, for Foxglove:
+                               /erc/perception/overlay/compressed (the ground green, obstacles red) and
+                               /erc/perception/depth/compressed (distance along the ground)
     obstacle_stop:=false|true  let carrot_controller_node BRAKE when that
                                profile sees something close straight ahead.
                                Brakes, never steers -- see its docstring. Needs
@@ -129,6 +132,9 @@ def generate_launch_description():
         DeclareLaunchArgument('depth_backend', default_value='da3',
                               description="free_space_node depth model: 'da3' or 'unidepth' "
                                           "(UniDepthV2; see mission_*_unidepth.launch.py)"),
+        DeclareLaunchArgument('debug_images', default_value='true',
+                              description='free_space_node: publish the overlay (ground green, obstacles '
+                                          'red) and depth images for Foxglove'),
         DeclareLaunchArgument('drop_detection', default_value='false',
                               description='free_space_node (unidepth): report drop-offs / stairs '
                                           'going down; also stops at descents and hill tops'),
@@ -206,7 +212,8 @@ def generate_launch_description():
                           'depth_backend': LaunchConfiguration('depth_backend'),
                           'drop_detection': LaunchConfiguration('drop_detection'),
                           'ground_model': LaunchConfiguration('ground_model'),
-                          'ground_fit_from': LaunchConfiguration('ground_fit_from')}.items(),
+                          'ground_fit_from': LaunchConfiguration('ground_fit_from'),
+                          'debug_images': LaunchConfiguration('debug_images')}.items(),
         condition=IfCondition(LaunchConfiguration('perception')))
 
     # people only (no plants outdoors); ranged from free_space_node's distance image (unidepth), or
